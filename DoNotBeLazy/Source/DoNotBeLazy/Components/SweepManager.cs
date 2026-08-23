@@ -23,14 +23,16 @@ namespace DoNotBeLazy.Components
         public List<LocalTargetInfo> SharedPool { get; }
         public Thing WorkstationTarget { get; }
 
-        // Where the pool was scanned from, kept so a rescannable order can
-        // build a fresh one. Fires spread, so a fire sweep with a pool
-        // frozen at BeginSweep time goes stale almost immediately - it's the
-        // first sweep type where "until done" means more than "until this
-        // list is empty". Nothing else rescans.
+        // Where the pool was scanned from, kept so the order can build a
+        // fresh one when a pawn runs out. Fires were the first case that
+        // needed this - they spread, so a pool frozen at BeginSweep time is
+        // stale almost immediately - but "until done" means more than "until
+        // this list is empty" for every sweep type, and a pawn resuming from
+        // a need-pause into a pool the others drained is the case that made
+        // that obvious. So the Rescannable flag is gone and AssignNextTask
+        // rescans for everything.
         public IntVec3 ScanCenter { get; }
         public int ScanRadius { get; }
-        public bool Rescannable { get; }
 
         // Targets already put back in the pool once after the WorkGiver
         // answered with blocker-clearing work instead of the task itself.
@@ -39,14 +41,13 @@ namespace DoNotBeLazy.Components
         public HashSet<LocalTargetInfo> Requeued { get; } = new HashSet<LocalTargetInfo>();
 
         public SweepOrder(WorkGiverDef workGiverDef, List<LocalTargetInfo> sharedPool, Thing workstationTarget = null,
-            IntVec3 scanCenter = default(IntVec3), int scanRadius = 0, bool rescannable = false)
+            IntVec3 scanCenter = default(IntVec3), int scanRadius = 0)
         {
             WorkGiverDef = workGiverDef;
             SharedPool = sharedPool;
             WorkstationTarget = workstationTarget;
             ScanCenter = scanCenter;
             ScanRadius = scanRadius;
-            Rescannable = rescannable;
         }
     }
 
@@ -250,6 +251,7 @@ namespace DoNotBeLazy.Components
                 Job job = scanner.JobOnThing(pawn, billGiver, true);
                 if (job == null)
                 {
+                    Logger.Message($"BeginSweep {workGiverDef.defName}: no job on {billGiver.LabelShort} for {pawn.LabelShort}, trying next");
                     continue;
                 }
 
@@ -259,9 +261,19 @@ namespace DoNotBeLazy.Components
                 // pause state from a previous order
                 pausedForNeed.Remove(pawn);
                 activeSweeps[pawn] = new SweepOrder(workGiverDef, new List<LocalTargetInfo>(), billGiver);
+
+                // whole workstation path used to emit nothing at all - a
+                // bill order's only trace was one "job ended" line with no
+                // context, which is why the 08-22 log couldn't say whether
+                // an order had even started. job.def matters here: DoBill
+                // means the bill itself, anything else means the WorkGiver
+                // wants a haul-off or a refuel first.
+                Logger.Message($"BeginSweep {workGiverDef.defName} at {billGiver.LabelShort}: {pawn.LabelShort} of {ranked.Count} ranked, first job {job.def.defName}");
                 GiveJob(pawn, job);
                 return;
             }
+
+            Logger.Message($"BeginSweep {workGiverDef.defName}: no job on {billGiver.LabelShort} for any of {ranked.Count} pawns, no sweep started");
         }
 
         // Skill level on the WorkGiver's work type first, WorkSpeedGlobal to
@@ -336,15 +348,17 @@ namespace DoNotBeLazy.Components
 
             Logger.Message($"BeginSweep {workGiverDef.defName}: {pool.Count} targets, {eligiblePawns.Count} pawns");
 
-            // fire sweeps rescan when the pool runs dry, nothing else does
-            var order = new SweepOrder(workGiverDef, pool, null, clickCell, radius, FireCompat.IsFirefighting(workGiverDef));
+            // every area sweep rescans when a pawn runs the pool dry now, not
+            // just fire
+            var order = new SweepOrder(workGiverDef, pool, null, clickCell, radius);
 
+            // was: break out of this loop the moment the pool emptied, which
+            // is why "* haul until done" with 36 selected sent exactly one
+            // pawn - a 1-target pool dropped the other 35 without a word.
+            // AssignNextTask rescans now, so let every pawn ask; the ones
+            // with genuinely nothing to do drop out there instead.
             foreach (Pawn pawn in eligiblePawns)
             {
-                if (order.SharedPool.Count == 0)
-                {
-                    break;
-                }
                 pausedForNeed.Remove(pawn);
                 activeSweeps[pawn] = order;
                 AssignNextTask(pawn, order);
@@ -495,36 +509,62 @@ namespace DoNotBeLazy.Components
             bool firefighting = FireCompat.IsFirefighting(order.WorkGiverDef);
             bool rescanned = false;
 
+            // Targets this pawn has already been refused for on THIS call.
+            // They stay in the shared pool now (see the RemoveAt note below),
+            // so without this we'd hand the same rejected target straight
+            // back to the same pawn and spin.
+            var refused = new HashSet<LocalTargetInfo>();
+
             while (true)
             {
-                if (order.SharedPool.Count == 0)
+                // was: RemoveAt(i) up here, before asking for a job, so a
+                // target that merely wasn't workable *by this pawn right
+                // now* got destroyed for the whole group. With 9 pawns
+                // hauling into one stockpile that's most of the pool - one
+                // log had 37 discards against 32 assignments, and a meal one
+                // pawn was refused was hauled fine by another a minute
+                // later. Only claim a target once we actually have a job for
+                // it; everything else is skipped, not consumed.
+                int i = NearestTargetIndex(pawn.Position, order.SharedPool, refused);
+                if (i < 0)
                 {
-                    // fires spread - a pool frozen at BeginSweep time is out
-                    // of date by the time the first one is out. Once per
-                    // call, so an order that genuinely has nothing left
-                    // still ends instead of spinning.
-                    if (!order.Rescannable || rescanned)
+                    // nothing left that this pawn hasn't already been refused.
+                    // Rescan once per call: the pool is a snapshot from click
+                    // time and a sweep runs for a long while, so work that
+                    // appeared since - or that freed up while this pawn was
+                    // paused for a need - is invisible otherwise. Used to be
+                    // firefighting-only because fires spread. Turns out every
+                    // sweep type needs it, most obviously a pawn coming back
+                    // from a break into a pool the others already emptied.
+                    if (rescanned)
                     {
                         break;
                     }
 
                     rescanned = true;
-                    order.SharedPool.AddRange(TaskScanner.FindTargets(order.ScanCenter, order.ScanRadius, map, order.WorkGiverDef, pawn));
-                    if (order.SharedPool.Count == 0)
-                    {
-                        break;
-                    }
+                    AddNewTargets(order, TaskScanner.FindTargets(order.ScanCenter, order.ScanRadius, map, order.WorkGiverDef, pawn));
+                    continue;
                 }
 
-                // pull by index - Remove(target) on a struct list was doing a
-                // linear equality scan for something we'd just found the
-                // position of
-                int i = NearestTargetIndex(pawn.Position, order.SharedPool);
                 LocalTargetInfo target = order.SharedPool[i];
-                order.SharedPool.RemoveAt(i);
 
-                if (!TargetStillValid(pawn, target, scanner, firefighting))
+                // gone for good (hauled by someone else, mined out, filth
+                // swept up by another pawn's batch job) vs merely not
+                // available to this pawn this second (reserved, forbidden,
+                // outside their allowed area, unreachable). Only the first
+                // kind leaves the pool - conflating the two is what the
+                // discard bug was.
+                if (TargetIsGone(target))
                 {
+                    order.SharedPool.RemoveAt(i);
+                    continue;
+                }
+
+                string refusal = TargetRefusalReason(pawn, target, scanner, firefighting);
+                if (refusal != null)
+                {
+                    Logger.Message($"{pawn.LabelShort}: skipping {target} ({order.WorkGiverDef.defName}) - {refusal}");
+                    refused.Add(target);
                     continue;
                 }
 
@@ -537,9 +577,15 @@ namespace DoNotBeLazy.Components
                 Job job = target.HasThing ? scanner.JobOnThing(pawn, target.Thing, true) : scanner.JobOnCell(pawn, target.Cell, true);
                 if (job == null)
                 {
-                    Logger.Message($"{pawn.LabelShort}: no job for {target} ({order.WorkGiverDef.defName}), {order.SharedPool.Count} left");
+                    // transient nearly every time - WorkGiver_Haul comes back
+                    // null when every destination cell is reserved by a
+                    // teammate. Leave it for whoever's free next.
+                    Logger.Message($"{pawn.LabelShort}: no job for {target} ({order.WorkGiverDef.defName}), left in pool, {order.SharedPool.Count} total");
+                    refused.Add(target);
                     continue;
                 }
+
+                order.SharedPool.RemoveAt(i);
 
                 // plantDefToSow is the field the whole GrowerSow static-state
                 // bug turned on, so name it explicitly - "which crop did we
@@ -562,7 +608,12 @@ namespace DoNotBeLazy.Components
                 return;
             }
 
-            // pool's empty - pawn's done, nothing left in this sweep for them
+            // Pool's empty even after a rescan - this pawn is done. Said
+            // nothing at all until now, so a sweep ending looked exactly
+            // like a pawn wandering off for no reason; seven pawns in the
+            // 08-22 log ended here with a bare "job ended Succeeded" as
+            // their last line.
+            Logger.Message($"{pawn.LabelShort}: nothing left within {order.ScanRadius} of {order.ScanCenter}, ending sweep ({order.WorkGiverDef.defName})");
             RemoveSweep(pawn);
         }
 
@@ -571,7 +622,15 @@ namespace DoNotBeLazy.Components
         // (allowed area, reachability) or drift while the sweep runs (the
         // target getting destroyed, forbidden, reserved, or its zone's sow
         // toggle being switched off mid-sweep).
-        private bool TargetStillValid(Pawn pawn, LocalTargetInfo target, WorkGiver_Scanner scanner, bool firefighting)
+        // Returns null when the pawn can work this target, otherwise the
+        // name of the check that said no.
+        //
+        // (was a bare bool. Refusals used to consume the target, so a wrong
+        // one only cost you that target and nothing was traced; now they
+        // leave it in the pool for someone else, and "nobody will take this
+        // and no line says why" is a worse hole than the noise. Constant
+        // strings - nothing allocates on the happy path.)
+        private string TargetRefusalReason(Pawn pawn, LocalTargetInfo target, WorkGiver_Scanner scanner, bool firefighting)
         {
             Area allowed = pawn.playerSettings?.AreaRestrictionInPawnCurrentMap;
 
@@ -581,7 +640,7 @@ namespace DoNotBeLazy.Components
             // Obviously exempt when the fire is the point.
             if (!firefighting && TaskScanner.TargetIsBurning(target, map))
             {
-                return false;
+                return "burning";
             }
 
             if (target.HasThing)
@@ -589,21 +648,21 @@ namespace DoNotBeLazy.Components
                 Thing thing = target.Thing;
                 if (thing == null || thing.Destroyed || thing.Map != map)
                 {
-                    return false;
+                    return "gone";
                 }
                 if (thing.IsForbidden(pawn))
                 {
-                    return false;
+                    return "forbidden";
                 }
                 if (allowed != null && !allowed[thing.Position])
                 {
-                    return false;
+                    return "outside allowed area";
                 }
                 if (!GrowerCompat.CanReachTarget(pawn, thing, scanner))
                 {
-                    return false;
+                    return "unreachable";
                 }
-                return map.reservationManager.CanReserve(pawn, thing);
+                return map.reservationManager.CanReserve(pawn, thing) ? null : "reserved";
             }
 
             // cell target (e.g. an empty tile waiting to be sown) - no
@@ -612,32 +671,77 @@ namespace DoNotBeLazy.Components
             IntVec3 cell = target.Cell;
             if (!cell.InBounds(map))
             {
-                return false;
+                return "out of bounds";
             }
             if (allowed != null && !allowed[cell])
             {
-                return false;
+                return "outside allowed area";
             }
             if (!GrowerCompat.SowSettingsAllow(scanner, cell, map))
             {
-                return false;
+                return "sow settings";
             }
             if (!GrowerCompat.CanReachTarget(pawn, cell, scanner))
             {
-                return false;
+                return "unreachable";
             }
-            return map.reservationManager.CanReserve(pawn, target);
+            return map.reservationManager.CanReserve(pawn, target) ? null : "reserved";
         }
 
-        private static int NearestTargetIndex(IntVec3 from, List<LocalTargetInfo> pool)
+        // Only the target actually ceasing to exist. Everything else that
+        // can stop a pawn working a target - reserved, forbidden, out of
+        // area, unreachable, sow toggle flipped - can come back, and lives
+        // in TargetRefusalReason instead. Split out when the pool stopped
+        // being consumed on failure: something has to still prune the
+        // corpses or a long sweep walks past dead entries forever.
+        private bool TargetIsGone(LocalTargetInfo target)
         {
-            int nearest = 0;
-            float nearestDistSq = (pool[0].Cell - from).LengthHorizontalSquared;
-
-            for (int i = 1; i < pool.Count; i++)
+            if (!target.HasThing)
             {
+                return !target.Cell.InBounds(map);
+            }
+
+            Thing thing = target.Thing;
+            return thing == null || thing.Destroyed || !thing.Spawned || thing.Map != map;
+        }
+
+        // Rescans used to be append-only, which was safe when a target left
+        // the pool the moment it was handed out. It isn't now - a rescan
+        // finds everything still sitting there and would double it every
+        // time. Only take what we don't already have.
+        private static void AddNewTargets(SweepOrder order, List<LocalTargetInfo> found)
+        {
+            if (found == null || found.Count == 0)
+            {
+                return;
+            }
+
+            var have = new HashSet<LocalTargetInfo>(order.SharedPool);
+            foreach (LocalTargetInfo target in found)
+            {
+                if (have.Add(target))
+                {
+                    order.SharedPool.Add(target);
+                }
+            }
+        }
+
+        // skip = targets this pawn has already been refused this call. -1
+        // means the pool holds nothing left for them.
+        private static int NearestTargetIndex(IntVec3 from, List<LocalTargetInfo> pool, HashSet<LocalTargetInfo> skip)
+        {
+            int nearest = -1;
+            float nearestDistSq = 0f;
+
+            for (int i = 0; i < pool.Count; i++)
+            {
+                if (skip.Contains(pool[i]))
+                {
+                    continue;
+                }
+
                 float distSq = (pool[i].Cell - from).LengthHorizontalSquared;
-                if (distSq < nearestDistSq)
+                if (nearest < 0 || distSq < nearestDistSq)
                 {
                     nearest = i;
                     nearestDistSq = distSq;

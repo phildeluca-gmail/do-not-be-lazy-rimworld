@@ -2,7 +2,139 @@
 
 # Do Not Be Lazy - RimWorld 1.5 Mod Architecture
 
-## 0. Current Status (2026-08-22)
+## 0. Current Status (2026-08-22, evening)
+
+**STANDING STILL IS ANSWERED, AND IT WAS OURS.** The three instruments
+built this morning never ran (the `jobDiagnostics` checkbox was never
+ticked - the settings file held only `<verboseLogging>True</verboseLogging>`).
+They were not needed. The 08-22 evening log named the cause on its own:
+
+| WorkGiver   | pool | selected | got work | `no job` discards |
+|-------------|-----:|---------:|---------:|------------------:|
+| HaulGeneral |    1 |   **36** |    **1** |                 0 |
+| HaulGeneral |    6 |       35 |        4 |                 2 |
+| HaulGeneral |   17 |   **34** |    **2** |                16 |
+| HaulGeneral |   76 |       34 |       30 |            **72** |
+| HaulGeneral |   59 |        1 |        1 |                26 |
+| CleanFilth  |  644 |        4 |        5 |                 0 |
+| CleanFilth  |  667 |       32 |       40 |                 0 |
+
+Two bugs, both ours, both now fixed:
+
+1. **`BeginAreaSweep` broke out of the pawn loop the moment the pool
+   emptied.** A 1-target pool served one pawn and dropped the other 35
+   without a word; they fell back to the think tree and stood there.
+   This was logged as review finding 6 and dismissed as a "minor
+   fire-rescan effect". It was the larger half of the report.
+2. **`AssignNextTask` removed a target from the shared pool *before*
+   asking for a job**, so a refusal that was transient and specific to
+   one pawn destroyed the target for the whole group. 151 `no job`
+   discards against ~97 haul assignments across the session - more
+   targets thrown away than hauled.
+
+The mechanism is pinned by a contrast in the same log: **CleanFilth has
+zero discards, HaulGeneral is full of them.** Cleaning has no
+destination to reserve; hauling does, and with nine pawns feeding one
+stockpile `StoreUtility.TryFindBestBetterStorageFor` fails because every
+candidate cell is reserved by a teammate. Vanilla's own
+`Could not reserve ... Existing reservers: [0] Inga` lines say it
+outright. Proof the refusals were transient rather than bad targets:
+`Thing_MealSurvivalPack14825207` was discarded by The Zealous and hauled
+without trouble by Tamas in a later sweep.
+
+**Ruled out, by evidence rather than argument:**
+
+- No job-pipeline exceptions of any kind in that log - no
+  `Exception in WorkGiver`, no error-recover jobs, no think-tree throws.
+- **Automatic Hunting throws 232 times and is innocent.**
+  `MissingMethodException` on
+  `TraverseParms.For(Pawn, Danger, TraverseMode, bool, bool, bool, bool)`
+  out of `ARY_AutomaticHunting.AnimalHuntingManager.GameComponentTick` -
+  compiled against a different RimWorld build, so the mod does nothing
+  at all. It cannot cause standing still:
+  `GameComponentUtility.GameComponentTick` wraps each component in its
+  own try/catch (verified in the decompile), so it cannot take down our
+  `NeedMonitor` either.
+- **The need pause/resume loop works.** Four pause/resume pairs in the
+  log (snake, Tamas, Boom, Remy), all resumed, no `MaxPauseTicks`
+  give-ups. The 2026-08-18 fix is confirmed in a real game.
+
+**Generalise this:** before blaming a throwing mod for a symptom, check
+*where* it throws. Vanilla catches per GameComponent, per WorkGiver
+(`JobGiver_Work.TryIssueJobPackage` wraps both the scan loop and
+`GiverTryGiveJobPrioritized`), and around the think tree
+(`DetermineNextJob` -> `JobUtility.TryStartErrorRecoverJob`). A mod
+throwing inside any of those is loud and contained. Three sessions were
+spent on mods that were throwing somewhere harmless.
+
+### Shipped 2026-08-22 evening
+
+All in `Components/SweepManager.cs` unless noted. **None of it has run in
+a game.**
+
+- **Fix 1 - targets are not consumed on failure.** `RemoveAt(i)` moved to
+  after a job is successfully created. Failures split three ways: a new
+  `TargetIsGone` (destroyed, despawned, off-map, out of bounds) prunes
+  the target from the pool, because something still has to stop a long
+  sweep walking past corpses; everything else - reserved, forbidden,
+  outside allowed area, unreachable, sow toggle - goes into a per-call
+  `refused` set and **stays in the pool** for another pawn.
+  `NearestTargetIndex` takes that set and returns `-1` when nothing is
+  left for this pawn.
+- **Fix 2 - every area sweep rescans.** The `SweepOrder.Rescannable`
+  flag is gone. `AssignNextTask` rescans once per call when a pawn runs
+  out. New `AddNewTargets` dedups against the existing pool - the old
+  append-only `AddRange` was only safe because targets used to leave the
+  pool immediately, and would now double it on every rescan.
+- **The `break` in `BeginAreaSweep` is gone** (review finding 6). Every
+  selected pawn gets an `AssignNextTask` call and drops out there.
+- **Logging.** `TargetStillValid` became `TargetRefusalReason`, returning
+  the name of the failing check instead of a bool (constant strings, so
+  nothing allocates on the happy path). The empty-pool `RemoveSweep`
+  emits a line. `BeginWorkstationSweep`, which emitted nothing at all,
+  now logs its start, each ranked pawn it skips, and total failure.
+- **`/pull-logs`** captures ` at Namespace.Class.Method` stack frames and
+  `Could not reserve` / `Existing reservers`. An exception line never
+  names the mod that threw it, and RimWorld prints the frames only once
+  before collapsing repeats to `[Ref ...] Duplicate stacktrace`.
+
+### Two deliberate behaviour changes to watch
+
+- **An area sweep no longer has a natural end.** `* Clean until done`
+  will keep rescanning and finding new filth for as long as pawns track
+  it in. This is what "until done" was asked to mean, but drafting or a
+  manual order is now the only thing that ends such a sweep. Decide
+  after the next playtest whether it needs a cap.
+- **A rescan uses the requesting pawn as driver**, so a pawn with a
+  restricted allowed area rescans a smaller area than the original click
+  did. Pre-existing caveat of the pawn-scoped scan, more visible now.
+
+### Diagnosed 2026-08-22 evening, NOT implemented
+
+Full detail in `NEXT_SESSION.md` "Open items 3-5". Summary:
+
+3. **Workstation sweeps drop after one bill.**
+   `WorkGiver_DoBill.TryStartNewDoBillJob` returns a **`HaulToCell`** job
+   rather than `DoBill` whenever product is on the bench, and
+   `JobTrackerPatch`'s continuation branch requires `DoBill`, so the
+   haul-off's end falls through to `Notify_JobEnded` and removes the
+   order. Same via the `CompRefuelable` -> `RefuelJob` branch. Plus
+   vanilla's 500-600 tick `nextTickToSearchForIngredients` cooldown,
+   which one transient ingredient miss turns into a permanent removal.
+4. **Drafted right-click can no longer move pawns.** Our non-`autoTakeable`
+   options cancel `TryMakeFloatMenu`'s auto-take, and on multi-select they
+   flip `TryMakeMultiSelectFloatMenu` from `false` to `true`, suppressing
+   the squad move - into a menu that has no goto entry, because
+   `ChoicesAtForMultiSelect` never adds one.
+5. **Nonsense entries on a workbench.**
+   `WorkGiver_DoBill.PotentialWorkThingRequest` only narrows when
+   `fixedBillGiverDefs.Count == 1`; otherwise it is
+   `ForGroup(PotentialBillGiver)`, which accepts any bench. Scope with
+   vanilla's `ThingIsUsableBillGiver`.
+
+---
+
+## 0.1 Previous status (2026-08-22, morning)
 
 **ANSWERED (2026-08-22): the 2026-08-18 build HAS been under test since
 2026-08-18.** The installed copy at
@@ -308,7 +440,9 @@ returns `VehicleReservationManager.VehicleListers(LoadVehicle)` - the
 back holding a single entry, the vehicle itself. Then:
 
 - `BeginAreaSweep` (`SweepManager.cs:344`) breaks out of the pawn loop
-  the moment the pool empties, so only the *first* colonist is ever
+  the moment the pool empties (**removed 2026-08-22 evening** - re-check
+  this half of the diagnosis before implementing the vehicle fix), so
+  only the *first* colonist was ever
   assigned and the rest of the selection is silently dropped.
 - Each `JobOnThing` yields one `LoadVehicle` job carrying one item. When
   it ends, `AssignNextTask` finds an empty, non-rescannable pool and
@@ -410,8 +544,11 @@ concrete consequence attached:
   map-wide lister and drops anything past the same distance. Type is
   honoured because the same `WorkGiverDef` builds the pool and issues
   every job drawn from it.
-- **It is a snapshot, not a standing order.** The pool is built once at
-  `BeginSweep`, and only fire sweeps rescan. Work that becomes available
+- **It was a snapshot, not a standing order** - corrected 2026-08-22
+  evening: every area sweep now rescans when a pawn runs the pool dry,
+  so this no longer holds. Left in place because the reasoning below
+  still explains what the snapshot cost. The pool was built once at
+  `BeginSweep`, and only fire sweeps rescanned. Work that becomes available
   inside the radius *after* the click - a plant matures, haulables get
   dropped, a frame finally has its resources - is never picked up.
   "Until done" means "until the list from the moment you clicked is
@@ -1199,7 +1336,7 @@ A RimWorld 1.5 mod that adds area-sweep task commands to the right-click context
 
 **Need interrupts:** A tick-level check monitors hunger, recreation, sleep (`needThreshold`, default 5%) and mood (`moodThreshold`, its own separate default 10%). When any drops to threshold or below, the pawn's forced job is cleared and they path to satisfy that need. **Updated 2026-08-15, reversing the original design below:** they now DO return to the last-ordered work automatically once that need-driven job finishes on its own (`SweepManager.PauseForNeed` / section 3.2) - a cooking pawn who gets tired pauses, sleeps, and resumes cooking. Interrupt-loop risk (the original reason for not auto-resuming) doesn't reappear because resumption only fires on a genuine job-end event, not a repeated need poll - a pawn can't get stuck bouncing between "resume" and "immediately re-interrupt" every tick. **This last sentence is WRONG - corrected 2026-08-17, see section 0.** The bouncing does happen: a genuine job-end event is not the same as the need being satisfied, and a real log shows a pawn paused after every task of a sweep. **Fixed 2026-08-18:** a job end is now only the *trigger* to re-check; the pawn stays paused until the need is genuinely back above threshold plus a 5-point margin, and a sweep that stays paused past `MaxPauseTicks` (half an in-game day) ends rather than hanging. See section 0.
 
-**Firefighting (added 2026-08-18):** right-clicking a `Fire` offers `* Fight fires until done` and nothing else - every other sweep type is suppressed on a burning tile, which is the pre-existing rule, but firefighting itself is now offered rather than the whole click being dropped. Vanilla's home-area restriction on firefighting is deliberately overridden for this explicit player order; drafted pawns are still excluded, as they are from every other sweep. Fire sweeps re-scan once when their pool empties, since fires spread. Details in section 0 and `FireCompat` in 3.2.
+**Firefighting (added 2026-08-18):** right-clicking a `Fire` offers `* Fight fires until done` and nothing else - every other sweep type is suppressed on a burning tile, which is the pre-existing rule, but firefighting itself is now offered rather than the whole click being dropped. Vanilla's home-area restriction on firefighting is deliberately overridden for this explicit player order; drafted pawns are still excluded, as they are from every other sweep. Fire sweeps re-scan once when their pool empties, since fires spread - **as of 2026-08-22 evening so does every other sweep type**, so this is no longer a firefighting special case. Details in section 0 and `FireCompat` in 3.2.
 
 **Feedback when nothing is available (added 2026-08-18):** if a sweep-eligible WorkGiver plausibly applies to the clicked thing but has no job for it, a **disabled** `* ...` entry is added stating the reason vanilla itself gives (`JobFailReason`), e.g. hauling with no stockpile that accepts the item. Capped at three such entries, and only when a reason actually exists. If a sweep starts but the radius scan finds nothing, a rejected-input message says so.
 
@@ -1255,7 +1392,7 @@ Deliberately does **not** exclude drafted pawns (unlike the WorkGiver-based swee
 
 `CanConsume` branches on `thing.def.ingestible.drugCategory` (fixed 2026-08-15): non-drug food goes through `FoodUtility.WillEat` as before, but anything with a real drug category skips `WillEat` entirely (it's a food-appetite check and rejected every drug outright, which was the original bug - no `* Consume` was ever appearing for drugs) and instead only excludes Teetotalers (`pawn.story.traits.HasTrait(TraitDefOf.DrugDesire, -1)`), per explicit user request.
 
-**SweepManager.cs** - A `MapComponent` maintaining `Dictionary<Pawn, SweepOrder>`. `SweepOrder` holds a `WorkGiverDef` and a `SharedPool` (`List<LocalTargetInfo>`) - for area sweeps, every pawn assigned in the same `BeginSweep` call shares the same pool instance, so claiming a target for one pawn removes it for the rest of the group (implements "nearest unassigned task first" via a linear nearest-in-pool scan per assignment). Workstation orders carry an empty pool since bill continuation doesn't use it (see JobTrackerPatch below). `LocalTargetInfo` transparently covers both Thing and cell targets, so the pool/nearest-scan logic didn't need to change to support `GrowerSow` - only the two spots that branch on target type explicitly did: `AssignNextTask` calls `scanner.JobOnCell` instead of `JobOnThing` when `!target.HasThing`, and `TargetStillValid` checks cell bounds/area/reservation instead of Thing-specific checks (Destroyed, forbidden) for the same case.
+**SweepManager.cs** - A `MapComponent` maintaining `Dictionary<Pawn, SweepOrder>`. `SweepOrder` holds a `WorkGiverDef` and a `SharedPool` (`List<LocalTargetInfo>`) - for area sweeps, every pawn assigned in the same `BeginSweep` call shares the same pool instance, so claiming a target for one pawn removes it for the rest of the group (implements "nearest unassigned task first" via a linear nearest-in-pool scan per assignment). **A target only leaves the pool when a job is actually created for it, or when `TargetIsGone` says it no longer exists** (2026-08-22 evening) - a pawn refused for a transient reason skips it via a per-call `refused` set and leaves it for someone else. The pool also **rescans** from `ScanCenter`/`ScanRadius`, once per `AssignNextTask` call, whenever a pawn runs it dry; this applies to every area sweep, not just firefighting. Workstation orders carry an empty pool since bill continuation doesn't use it (see JobTrackerPatch below). `LocalTargetInfo` transparently covers both Thing and cell targets, so the pool/nearest-scan logic didn't need to change to support `GrowerSow` - only the two spots that branch on target type explicitly did: `AssignNextTask` calls `scanner.JobOnCell` instead of `JobOnThing` when `!target.HasThing`, and `TargetRefusalReason` (a bool `TargetStillValid` until 2026-08-22) checks cell bounds/area/sow-settings/reservation instead of Thing-specific checks (Destroyed, forbidden) for the same case, returning the name of the failing check so the trace can say why a target was skipped.
 
 Job-to-job chaining is **event-driven**, not tick-polled: `JobTrackerPatch`'s postfix on `Pawn_JobTracker.EndCurrentJob` calls `SweepManager.Notify_JobEnded(pawn, condition)` when a swept pawn's job ends, and that pulls the next target off the shared pool. A non-`Succeeded` condition does not necessarily end the sweep - see `TargetFailureIsRecoverable` and the 2026-08-16 status entry for how target-scoped failures are separated from pawn-scoped interrupts, and for the per-pawn `MaxConsecutiveFailures` bound that keeps the retry path from recursing.
 

@@ -1,17 +1,18 @@
-<!-- Pickup context for a fresh session. Updated 2026-08-22. Read this first, then CLAUDE.md's referenced docs as usual. -->
+<!-- Pickup context for a fresh session. Updated 2026-08-22 (evening). Read this first, then CLAUDE.md's referenced docs as usual. -->
 
 # Pickup: Do Not Be Lazy
 
-Resume **this** conversation (findings 1+2 fixed, Urgency cleared, job
-diagnostics built, `/pull-logs`) with:
+Resume **this** conversation (standing-still ANSWERED from a real log,
+pool-discard + rescan fixed, logging gaps closed) with:
 
 ```
-claude --resume 6ed5db2f-8d09-4435-ab6c-2fb321b5823c
+claude --resume 7254dd70-3fd5-4c55-a0f6-fcab3652315a
 ```
 
 Earlier sessions, for reference only:
 
 ```
+OLD: claude --resume 6ed5db2f-8d09-4435-ab6c-2fb321b5823c   (menu findings 1+2, job diagnostics, /pull-logs)
 OLD: claude --resume 4b475e1d-24b5-48e9-94e4-f6ce4865faa9   (vehicle-packing diagnosis, TEST_PLAN conversion)
 OLD: claude --resume 5e862c7c-fa2b-40a6-b221-e0174424c01f   (08-18 review: six findings, radius, standing-still)
 OLD: claude --resume 9fe56f23-dbd5-4515-818c-6170fe4921d1   (fire sweeps / need-pause fix / menu feedback)
@@ -52,48 +53,59 @@ critical needs (hunger/rest/joy/mood).
 
 - Builds clean: `cd DoNotBeLazy/Source/DoNotBeLazy && dotnet build`
   (0 errors, 0 warnings).
-- **Everything was committed and pushed at the end of 2026-08-22** -
-  the findings 1+2 fix, the job diagnostics, `/pull-logs`, `TEST_PLAN.md`
-  and all doc corrections. Run `git log -1` and `git status` anyway
-  rather than trusting this line: it has been stale twice and cost time
-  both times.
-- **2026-08-22 shipped real code** after four doc-only sessions:
-  `FloatMenuPatch` + `PawnValidator` (review findings 1 and 2), and
-  three new diagnostic files (`PipelineCensus`, `JobSourcePatch`,
-  `IdleProbe`) behind a new `jobDiagnostics` setting. **None of it has
-  run in a game yet.**
+- **Everything was committed and pushed at the end of 2026-08-22
+  (evening).** Run `git log -1` and `git status` anyway rather than
+  trusting this line: it has been stale twice and cost time both times.
+- **2026-08-22 evening: the standing-still report is ANSWERED, from a
+  real log, and the cause was ours.** See "Open item 2" below - it is
+  now a closed item kept for the record. The two fixes for it are
+  written and building; **neither has run in a game.**
 - **The installed DLL is older than the repo build.** Copy
   `DoNotBeLazy/Assemblies/DoNotBeLazy.dll` (+ `.pdb`) into
   `E:\SteamLibrary\steamapps\common\RimWorld\Mods\DoNotBeLazy\Assemblies\`
-  and restart RimWorld before testing anything from 08-21/22. The user
-  does this step manually.
-- **RESOLVED 2026-08-22: the 08-18 build has been under test since
-  2026-08-18.** The installed DLL in
-  `RimWorld\Mods\DoNotBeLazy\Assemblies\` is dated 08-18 22:07, so
-  every session since ran the fire-sweep / need-pause / menu-feedback
-  code. Three sessions of "ask the user whether it was copied" answered
-  by one `ls`. **The corollary: the 08-21/22 work is NOT installed** -
-  copy the DLL before testing any of it. `/pull-logs` now checks this
-  first.
-- Still untested from before: **the sow fixes** (`cc502c9`). Phase 1 of
-  the playtest plan has still not been run.
-- **What IS verified in game (2026-08-17):** verbose logging works, and
-  a `HaulMerge` sweep runs end to end. Still the only confirmed working
-  sweep from a real save.
+  and restart RimWorld before testing. The user does this step manually,
+  and `/pull-logs` step 1 checks it. It has been wrong on three separate
+  pulls now; do not skip it.
+- **What shipped 2026-08-22 evening, all untested in game:**
+  - `SweepManager.AssignNextTask` no longer consumes a pool target on
+    failure (fix 1) - `RemoveAt` moved to after a job is created, with a
+    per-call `refused` set and a new `TargetIsGone` split for permanent
+    vs transient.
+  - Every area sweep rescans when a pawn runs the pool dry (fix 2); the
+    `Rescannable` flag is gone and `AddNewTargets` dedups the rescan.
+  - The `break` in `BeginAreaSweep` is gone (review finding 6).
+  - Logging: `TargetRefusalReason` replaces the bool `TargetStillValid`
+    and names the failing check; the empty-pool `RemoveSweep` says so;
+    `BeginWorkstationSweep` finally emits a start line.
+  - `/pull-logs` now captures ` at Namespace.Class.Method` stack frames
+    and `Could not reserve` / `Existing reservers`.
+- **What IS verified in game:** verbose logging works (2026-08-17), a
+  `HaulMerge` sweep runs end to end (2026-08-17), and as of the 08-22
+  evening log the **need pause/resume loop works** - four pause/resume
+  pairs, all resumed, no `MaxPauseTicks` give-ups.
+- Still untested from before: **the sow fixes** (`cc502c9`) and the menu
+  findings 1+2 fix. Phase 1 of the playtest plan has still not been run.
 
 ## Start here next session
 
-1. **Copy the DLL over and restart the game** (above). Nothing from the
-   last two days has been in front of RimWorld yet.
-2. **Tick both checkboxes** - "Verbose logging" *and* the new "Job
-   diagnostics" - then reproduce the standing-still report and say
-   `/pull-logs standing still`. The instruments were built specifically
-   for that repro and have never emitted a line.
-3. **While you're in there:** the findings 1+2 fix means a right-click
-   that used to do nothing should now show a greyed `* ... until done -
-   <pawn>: is not assigned to hauling`-style entry, and a burning tile
-   should always open *some* menu. Both are easy to check in passing.
-4. Then `TEST_PLAN.md` Phase 1, which has still never been run.
+1. **Copy the DLL over and restart the game.** Nothing from 08-21 or
+   08-22 has been in front of RimWorld.
+2. **Re-run the standing-still repro**: select ~34 pawns, right-click a
+   pile, `* Haul general things until done`. Before the fix, a 17-target
+   pool gave work to **2** pawns and discarded 16 targets. After it,
+   pawns should spread across the pool and the discards should be
+   skips-with-a-reason that stay available. `/pull-logs standing still`.
+3. **Watch for the two deliberate behaviour changes** the rescan
+   introduced: sweeps can now run indefinitely (`* Clean until done`
+   will keep finding new filth - drafting or a manual order still ends
+   it), and a rescan uses the *requesting* pawn as driver, so a pawn
+   with a restricted allowed area rescans a smaller area than the
+   original click did.
+4. **While you're in there:** the menu findings 1+2 fix means a
+   right-click that used to do nothing should now show a greyed
+   `* ... until done - <pawn>: is not assigned to hauling`-style entry,
+   and a burning tile should always open *some* menu.
+5. Then `TEST_PLAN.md` Phase 1, which has still never been run.
 
 ## Open item 1: vehicle packing offers no `* pack until done`
 
@@ -133,44 +145,64 @@ the multi-cell footprint; there is no `HasJobOnThing` override so our
 probe is faithful; and `PotentialWorkThingRequest` is a plain property
 that cannot throw.
 
-## Open item 2: colonists standing still
+## CLOSED 2026-08-22 evening: colonists standing still
 
-Reported from play, 2026-08-18: **"workers are back to standing still
-when hunt is not assigned."** **"Back to"** is the important word: a
-returning symptom, not a first sighting.
+**Answered from a real log. The cause was ours, and there was no
+exception behind it.** Kept here because three sessions were spent
+theorising about other mods; the record is worth more than the space.
 
-**2026-08-21: retested with Sense of Urgency disabled and it still
-happens**, to pawns assigned to Hunting. That mod is ruled out twice
-over now - by this test and by its own files. Three instruments to name
-the real cause are designed in architecture doc section 0 and **not
-built**; the free one to run first is a second log extraction that greps
-vanilla's errors rather than only our `[DoNotBeLazy]` lines, which no
-extraction has ever done.
+`logs/20260822-225440-dnbl.log`, produced by the 00:01 build:
 
-Check in this order:
+| WorkGiver   | pool | selected | got work | `no job` discards |
+|-------------|-----:|---------:|---------:|------------------:|
+| HaulGeneral |    1 |   **36** |    **1** |                 0 |
+| HaulGeneral |    6 |       35 |        4 |                 2 |
+| HaulGeneral |   17 |   **34** |    **2** |                16 |
+| HaulGeneral |   76 |       34 |       30 |            **72** |
+| HaulGeneral |   59 |        1 |        1 |                26 |
+| CleanFilth  |  644 |        4 |        5 |                 0 |
+| CleanFilth  |  667 |       32 |       40 |                 0 |
 
-1. **Disable Automatic Hunting and retest.**
-   `Arylice.Rimworld.AutomaticHunting` (Workshop 3340648302) is the mod
-   that throws on `Toils_General.WaitWith` - corrected 2026-08-21, this
-   was blamed on Sense of Urgency for three sessions and was never true
-   of it (see below). It also throws every tick in `GameComponentTick`.
-   Something throwing inside `TryFindAndStartJob` can leave a pawn with
-   no job at all, which looks exactly like standing still.
-2. **Disable Do Not Be Lazy entirely and retest.** That single test
-   separates our bug from the modlist's, and nothing else does.
-3. **TKS Priority Treatment** patches `Pawn_JobTracker.TryFindAndStartJob`
-   directly - the same method this whole symptom class runs through.
-4. **Our one plausible contribution:** `JobTrackerPatch.Postfix` runs on
-   every `EndCurrentJob` for every pawn. It early-returns unless the
-   pawn is in an active sweep, so the blast radius is small - but the
-   `scanner.JobOnThing(pawn, billGiver, true)` bill-continuation call is
-   **not** wrapped in try/catch, so a throwing modded WorkGiver would
-   propagate out of `EndCurrentJob` and could leave that pawn jobless.
-   Only affects pawns already in a sweep.
+Two of our own bugs, both now fixed:
 
-**Do not build the section 5.4 idle-pawn nudge as the fix.** It is the
-obvious-looking countermeasure and it would mask the cause: nudging a
-pawn whose think tree is throwing just re-throws every two seconds.
+1. **`BeginAreaSweep` broke out of the pawn loop on an empty pool**, so a
+   1-target pool served one pawn and dropped the other 35 without a
+   word. They fell back to the think tree and stood there. That is the
+   whole report.
+2. **`AssignNextTask` consumed a target before asking for a job**, so a
+   transient refusal destroyed it for the entire group. 151 `no job`
+   discards against ~97 haul assignments - more targets thrown away than
+   hauled.
+
+**The tell that pins the mechanism:** CleanFilth has **zero** discards
+and HaulGeneral is full of them. Cleaning has no destination to reserve;
+hauling does. Vanilla's own `Could not reserve Thing_Meat_Bear_Grizzly...
+Existing reservers: [0] Inga` lines say the same thing directly.
+
+**What it was NOT, each ruled out by evidence rather than argument:**
+
+- **No job-pipeline exceptions at all** in that log - no
+  `Exception in WorkGiver`, no error-recover jobs, no think-tree throws.
+- **Automatic Hunting is broken but innocent.** 232 ×
+  `MissingMethodException: TraverseParms.For(Pawn, Danger, TraverseMode,
+  bool, bool, bool, bool)` out of
+  `ARY_AutomaticHunting.AnimalHuntingManager.GameComponentTick`. The mod
+  does nothing at all. It **cannot** cause standing still:
+  `GameComponentUtility.GameComponentTick` wraps each component in its
+  own try/catch (checked in the decompile), so it can't take down our
+  `NeedMonitor` either. Recommend disabling it for the noise, not the
+  symptom.
+- **Sense of Urgency** was cleared on 2026-08-21 and stays cleared.
+- **Job diagnostics never ran.** The settings file held only
+  `<verboseLogging>True</verboseLogging>`, so `PipelineCensus`,
+  `JobSourcePatch` and `IdleProbe` have *still* never emitted a line.
+  They are built and available if a future idle report needs them.
+
+**The general lesson, worth keeping:** before blaming a throwing mod for
+a symptom, check *where* it throws. Vanilla catches per GameComponent,
+per WorkGiver (`JobGiver_Work.TryIssueJobPackage`), and around the think
+tree (`DetermineNextJob` -> `TryStartErrorRecoverJob`). A mod throwing
+inside any of those is loud and contained.
 
 ## Review findings from 2026-08-18 evening - open, unfixed
 
@@ -203,16 +235,112 @@ architecture doc section 0.
    `SweepManager.cs:381`. Also the log line prints the constant, not the
    elapsed ticks, so it can claim "after 30000 ticks" when it was far
    longer. One-line fix.
-6. **Minor fire-rescan effects** - a rescan can re-admit a fire another
-   pawn is walking to; `BeginAreaSweep` (`SweepManager.cs:344`) breaks
-   out of the pawn loop on an empty pool, so extra pawns never join a
-   rescannable sweep. **That same `break` is half of vehicle-packing
-   cause 2** - fixing one should fix the other.
+6. **FIXED 2026-08-22 evening, untested in game.** The `break` in
+   `BeginAreaSweep` is gone - every selected pawn now gets an
+   `AssignNextTask` call and drops out there if it genuinely has nothing
+   to do. This turned out to be the larger half of the standing-still
+   report, not a minor effect. The other half of the finding (a rescan
+   re-admitting a fire another pawn is walking to) is unchanged and now
+   applies to **every** sweep type, since they all rescan;
+   `TargetRefusalReason` returns "reserved" for it, so it is at least
+   traced. **This `break` was also half of vehicle-packing cause 2** -
+   check that side when the vehicle work resumes.
 
 1 and 2 are done as of 2026-08-21 and **need a look during the
 playtest** - neither has been seen in a running game. 3-6 are still
 open. `TEST_PLAN.md` has no tests for either, since it predates the
 whole feedback change.
+
+## Open items 3-5: diagnosed 2026-08-22 evening, NOT implemented
+
+All three are fully traced to a vanilla mechanism. Nothing is written.
+They were ranked as items 3-8 of the fix list; 1, 2 and the logging ones
+are done.
+
+### 3. Workstation sweeps drop after one bill (butchering, drug synthesis)
+
+**Proven, with the vanilla source line.**
+`WorkGiver_DoBill.TryStartNewDoBillJob` opens with:
+
+```csharp
+haulOffJob = WorkGiverUtility.HaulStuffOffBillGiverJob(pawn, giver, null);
+if (haulOffJob != null && dontCreateJobIfHaulOffRequired) return haulOffJob;
+```
+
+So `JobOnThing` returns a **`HaulToCell`** job, not `DoBill`, whenever
+finished product is sitting on the bench - the normal state of a butcher
+table or drug lab right after a bill. `JobTrackerPatch`'s continuation
+branch requires `endedJob.def == JobDefOf.DoBill`, so when that haul-off
+ends it falls through to `Notify_JobEnded`, hits
+`order.WorkGiverDef.Worker is WorkGiver_DoBill`, and `RemoveSweep`s. The
+refuel branch (`CompRefuelable` -> `RefuelWorkGiverUtility.RefuelJob`)
+kills it the same way.
+
+The 08-22 log matches exactly: every workstation order in it is **one**
+`job ended Succeeded (DoBills...)` line and nothing more. That line is
+the haul-off end - the `DoBill` end returns early inside `JobTrackerPatch`
+and never logs.
+
+Second killer, same area: on ingredient-search failure vanilla sets
+`bill.nextTickToSearchForIngredients = now + ReCheckFailedBillTicksRange`
+(500-600 ticks). One transient miss - a teammate holding the stack for a
+moment - makes `JobOnThing` null for ~9 seconds and we remove the order
+permanently. `MaxConsecutiveFailures` is never applied to workstation
+orders.
+
+**Fix:** re-ask the bill giver on any `Succeeded` job while a
+`WorkGiver_DoBill` order is active, not only on `DoBill`; drop the
+unconditional `RemoveSweep`; give a null `JobOnThing` a strike against
+`MaxConsecutiveFailures` with a retry rather than ending the order. Same
+for the resume path in `AssignNextTask`.
+
+### 4. Drafted right-click can no longer move pawns
+
+`FloatMenuMakerMap.TryMakeFloatMenu` auto-executes the menu when *every*
+option is `autoTakeable` and enabled - that is how a drafted right-click
+moves a pawn with no menu ("Go here" is `autoTakeable`, priority 10).
+Our appended `*` entries are never `autoTakeable`, and feedback entries
+are `Disabled`, so the first one we add sets `flag = false` and the
+auto-take is cancelled.
+
+Worse on multi-select: `TryMakeMultiSelectFloatMenu` returns `false` when
+the option list is empty, and that `false` is what lets the squad move
+happen. Our option makes it return `true`. And
+`ChoicesAtForMultiSelect` **never adds a goto option at all** - it builds
+only from `Thing.GetMultiSelectFloatMenuOptions` - so the menu we force
+open genuinely has no "move here" entry.
+
+**Fix:** suppress `*` options entirely when the selection is drafted
+(`PawnValidator.CanSweep` rejects drafted pawns anyway, so every entry we
+add there is a useless grey one), **and** add a "Move here" option
+running `FloatMenuMakerMap.PawnGotoAction` per pawn whenever we are the
+reason a multi-select menu opened.
+
+### 5. Nonsense entries on a workbench (the stonecutter screenshot)
+
+Right-clicking a stonecutter's table offered `* Cook meals at stove`,
+`* Butcher creatures` and `* Fix broken-down buildings`, and did **not**
+offer stonecutting.
+
+`WorkGiver_DoBill.PotentialWorkThingRequest` narrows to a specific def
+**only when `fixedBillGiverDefs.Count == 1`**; otherwise it returns
+`ThingRequest.ForGroup(ThingRequestGroup.PotentialBillGiver)`.
+`CookMeals` lists three stoves and `ButcherCreatures` lists two, so both
+fall back to the broad group and `FloatMenuPatch.WantsSomethingHere`
+says yes for *any* workbench. `FixBrokenDownBuilding` is the same shape
+via `ThingRequestGroup.BuildingArtificial`.
+
+**Fix:** scope `WorkGiver_DoBill` feedback entries with vanilla's own
+`WorkGiver_DoBill.ThingIsUsableBillGiver(thing)`, which checks
+`fixedBillGiverDefs.Contains(thing.def)`. For broad-request non-DoBill
+defs, require `HasJobOnThing` or a written `JobFailReason` rather than
+accepting the request group alone.
+
+Separately: `* Cut stone blocks` was **absent** rather than greyed, so
+`FindTargetWithJob` got no job from the table - most likely
+`!BillStack.AnyShouldDoNow` (bill suspended or its target count met).
+Legitimate, but we say nothing at all about the one def the player
+actually clicked. Worth a `- no bills ready` entry.
 
 ## Verified in earlier sessions (don't re-derive)
 
@@ -345,6 +473,15 @@ Select-String -Path "$env:USERPROFILE\AppData\LocalLow\Ludeon Studios\RimWorld b
 
 RimWorld truncates `Player.log` on launch - extract before restarting.
 
+**An exception line never names the mod that threw it.** The owning
+assembly is only in the ` at Namespace.Class.Method ()` frames beneath
+it, and RimWorld collapses repeats to `[Ref ABCD1234] Duplicate
+stacktrace, see ref for original` - so the frames appear exactly **once**,
+on the first occurrence. `/pull-logs` captures those frames as of
+2026-08-22 evening; before that it didn't, which is why the 232
+`MissingMethodException` lines in that pull had to be traced back to
+Automatic Hunting by hand in the raw log.
+
 Diagnostic lines emitted when "Job diagnostics" is on (new 2026-08-22,
 all untested in game): `pipeline <method>: prefix=<owner>, ...` once at
 startup / `job <pawn>: <JobDef> from <ThinkNode> [<assembly>] (tree X)`
@@ -354,19 +491,45 @@ in a `job` line names the mod outright**, and an `idle` pawn with no
 `job` lines at all means `DetermineNextJob` returned NoJob - a different
 bug from a pawn looping on wait jobs.
 
-Sweep trace lines emitted: `BeginSweep <def>: N targets, M pawns` /
-`scan <def> r=N at <cell> for <pawn>: N targets` /
-`<pawn>: <JobDef> on <target> plant=<def> (N left)` /
-`<pawn>: no job for <target>` / `<pawn>: job ended <condition>` /
-`<pawn> paused from sweep: ...` /
-`<pawn>: needs satisfied, resuming sweep (<def>)` /
-`<pawn>: still under threshold after N ticks paused, ending sweep.`
+Sweep trace lines emitted:
 
-The last two are the ones to grep when checking the pause/resume fix -
-the old bug showed as a pause line after *every* task with no resume
-line between them. For "did the radius scan find anything", the `scan
-... : N targets` and `BeginSweep ... : N targets, M pawns` pair is the
-direct evidence.
+```
+scan <def> r=N at <cell> for <pawn>: N targets
+BeginSweep <def>: N targets, M pawns
+BeginSweep <def> at <bench>: <pawn> of N ranked, first job <JobDef>      (new 08-22 pm)
+BeginSweep <def>: no job on <bench> for <pawn>, trying next              (new 08-22 pm)
+BeginSweep <def>: no job on <bench> for any of N pawns, no sweep started (new 08-22 pm)
+<pawn>: <JobDef> on <target> plant=<def> (N left)
+<pawn>: skipping <target> (<def>) - <reason>                             (new 08-22 pm)
+<pawn>: no job for <target> (<def>), left in pool, N total
+<pawn>: nothing left within N of <cell>, ending sweep (<def>)            (new 08-22 pm)
+<pawn>: job ended <condition>
+<pawn> paused from sweep: ...
+<pawn>: needs satisfied, resuming sweep (<def>)
+<pawn>: still under threshold after N ticks paused, ending sweep.
+```
+
+Reading them:
+
+- `scan ... : N targets` paired with `BeginSweep ... : N targets, M
+  pawns` answers "did the radius scan find anything".
+- **`M pawns` much larger than `N targets` used to mean M-N pawns were
+  silently dropped.** That was the standing-still bug; it should not
+  happen any more, and if it does, the fix regressed.
+- `skipping ... - <reason>` names the check that refused: `reserved`,
+  `forbidden`, `outside allowed area`, `unreachable`, `burning`,
+  `sow settings`, `out of bounds`, `gone`. A pile of `reserved` on one
+  sweep is pawns fighting each other for the same targets.
+- `no job for ... left in pool` is the WorkGiver itself declining -
+  usually a full or reserved haul destination. The target stays
+  available for another pawn now, so these are no longer a leak.
+- `nothing left within N of <cell>` is a sweep ending cleanly. Before
+  08-22 pm this was silent, which is why a finished sweep looked
+  identical to a pawn wandering off.
+- The pause/resume pair is the one to grep when checking the need
+  fix - the old bug showed as a pause line after *every* task with no
+  resume line between them. **Confirmed working in the 08-22 evening
+  log**: four pause/resume pairs, all resumed.
 
 ## Modlist
 
@@ -403,10 +566,15 @@ On our code paths:
 file named for three sessions.**
 
 - **Automatic Hunting** (`Arylice.Rimworld.AutomaticHunting`, Workshop
-  3340648302) - `TraverseParms.For`, throwing every tick in
-  `GameComponentTick`, **and** `Toils_General.WaitWith`. It is the only
-  mod in the installed workshop folder that references `WaitWith` at
-  all. Prime suspect for the standing-still report. Recommend disabling.
+  3340648302) - `MissingMethodException` on `TraverseParms.For`, thrown
+  every tick out of
+  `ARY_AutomaticHunting.AnimalHuntingManager.GameComponentTick`; 232 of
+  them in the 08-22 evening log. Compiled against a different RimWorld
+  build; the mod does nothing at all. **Cleared as a cause of standing
+  still on 2026-08-22** - `GameComponentUtility.GameComponentTick` wraps
+  each component in its own try/catch, so the throw is contained. It
+  was "prime suspect" in this file for two sessions on the strength of
+  the stack trace alone. Recommend disabling it for the log noise.
 - **Sense of Urgency** (`ZombiePhil.Urgency`, Workshop 3001253573) is
   **cleared**. It ships a real 1.5 assembly
   (`1.5/Assemblies/ZombiePhil.Urgency.v15.dll`, April 2025) which
@@ -437,7 +605,18 @@ file named for three sessions.**
   but untested beyond sow.
 - The pool is scanned against one driver pawn; per-pawn filters
   (allowed area, reachability, reservation) therefore apply the driver's
-  answer to the whole group. See the radius note above.
+  answer to the whole group. See the radius note above. **Partly
+  mitigated 2026-08-22**: a refused target now stays in the pool for
+  another pawn instead of being destroyed, and the rescan re-runs the
+  scan against whichever pawn asked - but the rescan then inherits *that*
+  pawn's restrictions, so it cuts both ways.
+- **New 2026-08-22, from the rescan:** an area sweep no longer has a
+  natural end. `* Clean until done` will keep rescanning and keep
+  finding new filth for as long as pawns track it in. Deliberate - it is
+  what "until done" was asked to mean - but it is a behaviour change,
+  and drafting or a manual order is now the only thing that ends such a
+  sweep. Watch it in the next playtest before deciding whether it needs
+  a cap.
 - Perf watch: `CanReachTarget` now runs per cell in the radial scan
   (~800 at default radius 16, ~7,800 at the max of 50).
 

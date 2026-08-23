@@ -1,6 +1,6 @@
 # Do Not Be Lazy - Install Guide
 
-Status as of this writing: builds clean, reviewed, **not yet tested in a running game**. Install at your own risk on a save you don't mind backing up first.
+Status as of this writing: builds clean and has been played, but the current build is **not yet tested in a running game** - the 2026-08-22 evening sweep-pool fixes have never run. Install at your own risk on a save you don't mind backing up first.
 
 ## Requirements
 

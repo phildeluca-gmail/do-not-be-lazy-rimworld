@@ -1,4 +1,4 @@
-<!-- Converted from the published artifact to markdown 2026-08-20 so it can be read without a browser. Three entries carry CORRECTION notes where the plan had gone stale against shipped code - see T0.1, T3.5, T3.6. -->
+<!-- Converted from the published artifact to markdown 2026-08-20 so it can be read without a browser. Three entries carry CORRECTION notes where the plan had gone stale against shipped code - see T0.1, T3.5, T3.6. Phase 6 added 2026-08-22 evening for the pool-discard and rescan fixes. -->
 
 # Sow Fix Shakedown
 
@@ -9,10 +9,13 @@ that - ordered so each phase only runs once the one above it has proven
 its own instruments.
 
 - **Target:** RimWorld 1.5.4409, no DLC, ~60 mods
-- **Entries:** 28, across phases 0-5 (`T0.1` through `T5.2`)
+- **Entries:** 35, across phases 0-6 (`T0.1` through `T6.7`)
 - **Status:** Phase 0 passed 2026-08-17, and T0.3 passed again
   2026-08-21 on a fresh save (sow trace carried `plant=Plant_Rice`, no
   reflection warning). **Phase 1 has never been run.**
+- **Run Phase 6 first if time is short.** It covers the bug that was
+  actually reported from play and answered on 2026-08-22 - Phase 1 is
+  still the sow work, which nobody has complained about since.
 
 > **Read before starting.** Every pass/fail signature below is read off
 > `[DoNotBeLazy]` log lines. Those lines were a no-op from Phase 1 of
@@ -22,11 +25,13 @@ its own instruments.
 > proves nothing at all, and no result from any later phase is worth
 > recording.
 
-> **Coverage gap.** This plan predates the fire sweeps, the need
-> pause/resume fix, the menu-feedback entries (all `9dc8717`) and the
-> vehicle work. Apart from the corrections marked below, there are no
-> tests for any of it. Worth writing a phase 6 before the next full
-> pass.
+> **Coverage gap, narrowed 2026-08-22 evening.** This plan predates the
+> fire sweeps, the need pause/resume fix, the menu-feedback entries (all
+> `9dc8717`) and the vehicle work. **Phase 6 now covers the pool-discard
+> and rescan fixes.** The need pause/resume loop was confirmed working
+> in a real game on 2026-08-22 (four pause/resume pairs, all resumed),
+> so T2.7 is the lower priority it looks. Still no tests for the menu
+> feedback entries or anything vehicle-related.
 
 ---
 
@@ -136,7 +141,10 @@ in Phase 1.
 | `scan <def> r=N at <cell> for <pawn>: N targets` | The radial scan finished. **The count is a measurement, not decoration** - for sow it should track the number of empty sowable zone cells, not the ~800 cells a radius-16 scan touches. |
 | `BeginSweep <def>: N targets, M pawns` | Pool accepted, pawns assigned. Logged just after the scan line. |
 | `<pawn>: <JobDef> on <target> plant=<def> (N left)` | A task was handed out. `plant=` only appears when the job carries a `plantDefToSow` - this is the field the entire root-cause bug turned on. |
-| `<pawn>: no job for <target> (<def>), N left` | Target survived revalidation but the WorkGiver declined it. Skipped, sweep continues. |
+| `<pawn>: no job for <target> (<def>), left in pool, N total` | Target survived revalidation but the WorkGiver declined it *for this pawn*. **Since 2026-08-22 evening it stays in the pool** for another pawn to try; before that it was destroyed for the whole group, which was the standing-still bug. |
+| `<pawn>: skipping <target> (<def>) - <reason>` | Revalidation refused it. Reasons: `reserved`, `forbidden`, `outside allowed area`, `unreachable`, `burning`, `sow settings`, `out of bounds`, `gone`. Only `gone` removes the target from the pool. New 2026-08-22 evening. |
+| `<pawn>: nothing left within N of <cell>, ending sweep (<def>)` | The sweep finished cleanly for this pawn, after a rescan also came up empty. New 2026-08-22 evening - before this, a finished sweep was silent and looked identical to a pawn wandering off. |
+| `BeginSweep <def> at <bench>: <pawn> of N ranked, first job <JobDef>` | A workstation order started. New 2026-08-22 evening; this path emitted nothing at all before, which is why bill orders had no start trace. If `first job` is not `DoBill`, the WorkGiver wants a haul-off or refuel first. |
 | `<pawn>: job ended <condition> (<def>)` | The condition decides continue-vs-stop. Almost every "the pawn wandered off" report is answered by this one line. |
 | `<pawn>: N sweep tasks failed in a row` | The per-pawn bound of 8 tripped and the sweep was ended deliberately. |
 
@@ -145,6 +153,12 @@ in Phase 1.
 > fires, the counter can stall or repeat between consecutive lines
 > instead of strictly decreasing. That happens at most once per target,
 > by design - see T2.4.
+
+> **A second counting change, 2026-08-22 evening.** `(N left)` now only
+> decreases when a job is actually handed out or a target is found to be
+> gone. Refusals leave the count alone. It also **goes up** when a
+> rescan finds new work. Treat it as "size of the shared pool", not
+> "work remaining".
 
 ---
 
@@ -549,6 +563,114 @@ or never showed at all?
 **Then.** Note that Sense of Urgency is *not* a candidate explanation,
 despite what this plan said before 2026-08-21 - none of its defs is
 sweep-eligible, so it cannot add or remove a `*` option.
+
+---
+
+## Phase 6 - The 2026-08-22 evening fixes
+
+These are the pool-discard and rescan changes. **Nothing here has ever
+run in a game.** Run this phase before Phase 1 if time is short - it
+covers the bug that was actually reported from play.
+
+### T6.1 - A big selection spreads across the pool · **CORE**
+
+**Why.** The reported bug. In `logs/20260822-225440-dnbl.log`, a
+17-target pool with **34 pawns selected** gave work to **2** of them and
+discarded 16 targets; a 1-target pool with 36 selected served one pawn
+and dropped 35. Those pawns stood still.
+
+**Do.** Select ~30 colonists. Right-click a scattered pile of haulables
+with roughly 15-20 items in range and take
+`* Haul general things until done`.
+
+**Pass.** `BeginSweep HaulGeneral: N targets, M pawns` is followed by
+assignments to **many distinct pawns**, not one or two. No pawn in the
+selection is left standing with no job and no `skipping`/`no job` line
+explaining itself.
+
+**Fail shape to watch for.** `M pawns` much larger than the number of
+pawns that ever appear in a `<pawn>: <JobDef> on ...` line. That is the
+old `break` behaviour returning.
+
+### T6.2 - A refused target is not destroyed · **CORE**
+
+**Why.** 151 `no job` discards against ~97 haul assignments in one
+session. A target one pawn couldn't take was thrown away for everyone.
+
+**Do.** Same sweep as T6.1, into a stockpile that is nearly full or has
+a narrow accepted-items filter, so `TryFindBestBetterStorageFor` fails
+for some pawns.
+
+**Pass.** `no job for ... left in pool, N total` lines appear **without**
+the pool count dropping for them, and the same target id later appears
+in a successful `<pawn>: HaulToCell on <that id>` line. Total items
+hauled should be close to the pool size, not half of it.
+
+**Contrast worth logging.** A `* Clean until done` sweep should produce
+**zero** `no job` lines. Cleaning has no destination to reserve; that
+contrast is what identified the mechanism in the first place.
+
+### T6.3 - A pawn coming back from a break still has work · **CORE**
+
+**Why.** In the 08-22 log `snake` paused for a need, resumed correctly,
+and was then dropped one line later because the other eight pawns had
+emptied the pool while she ate. The pause/resume fix worked; there was
+nothing left to resume into.
+
+**Do.** Start a large sweep with several pawns, one of them close to a
+need threshold (needs default to 5%, mood 10%). Let them pause and
+return.
+
+**Pass.** `needs satisfied, resuming sweep` is followed by an actual
+`<pawn>: <JobDef> on <target>` line, not silence. If the pool really is
+empty, the rescan runs and either finds work or logs
+`nothing left within N of <cell>, ending sweep`.
+
+### T6.4 - A finished sweep says so
+
+**Do.** Sweep a small, fully completable pile - five haulables, nothing
+else in range.
+
+**Pass.** Each pawn's last line is
+`nothing left within 16 of (x, y, z), ending sweep (HaulGeneral)`, not a
+bare `job ended Succeeded`.
+
+### T6.5 - Rescan does not duplicate the pool · **REGRESSION RISK**
+
+**Why.** Rescans used to be append-only, which was safe only because
+targets left the pool immediately. `AddNewTargets` dedups; if that
+broke, the pool would double on every rescan.
+
+**Do.** Any sweep large enough that a pawn empties its share and
+triggers a rescan. Watch the `(N left)` counter across the run.
+
+**Pass.** The count rises only by however much genuinely new work
+appeared. A sudden near-doubling is the dedup failing.
+
+### T6.6 - Sweeps that never end · **BEHAVIOUR CHANGE, DECIDE AFTER**
+
+**Why.** Deliberate consequence of the rescan: an area sweep no longer
+has a natural end. This needs a judgement call, not a pass/fail.
+
+**Do.** `* Clean until done` in a busy, high-traffic room. Leave it
+running for an in-game hour.
+
+**Observe.** Pawns should keep cleaning as new filth appears, and only
+stop when drafted or given another order. **Decide whether that is
+wanted.** If it is too sticky, the fix is a cap on rescans per order -
+do not add one without asking.
+
+### T6.7 - A restricted pawn's rescan · **KNOWN CAVEAT**
+
+**Why.** A rescan is driven by whichever pawn asked, so it inherits that
+pawn's allowed area and reachability - a narrower scan than the original
+click made.
+
+**Do.** Put one pawn in a restricted allowed area, include them in a
+sweep that spans outside it, and let them run the pool dry.
+
+**Pass.** They end their own sweep without shrinking anyone else's pool.
+The other pawns keep working targets outside that area.
 
 ---
 

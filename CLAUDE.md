@@ -10,7 +10,7 @@ This file governs how Claude Code operates in this project. Read it fully before
 
 Load all referenced documents at the start of every session and before any implementation work begins.
 
-- `./NEXT_SESSION.md` - Session pickup file. **Read this first, before the other two.** Fast orientation on current state: what is and is not committed, what is and is not verified in game, open bugs, the log-extraction workflow, and traps that have already cost time once. Rewritten at the end of most sessions. The `claude --resume <id>` command for the most recent conversation sits at the very top of that file, with older session ids listed below it - resume rather than starting fresh if a session was cut short. Current session: `6ed5db2f-8d09-4435-ab6c-2fb321b5823c`.
+- `./NEXT_SESSION.md` - Session pickup file. **Read this first, before the other two.** Fast orientation on current state: what is and is not committed, what is and is not verified in game, open bugs, the log-extraction workflow, and traps that have already cost time once. Rewritten at the end of most sessions. The `claude --resume <id>` command for the most recent conversation sits at the very top of that file, with older session ids listed below it - resume rather than starting fresh if a session was cut short. Current session: `7254dd70-3fd5-4c55-a0f6-fcab3652315a`.
 - `./DoNotBeLazy_Architecture.md` - Mod architecture document. Defines intent, core behaviors, component structure, edge cases, Claude Code execution plan with model assignments, and dependency setup.
 - `./human-style-coding-260327.md` - Human-style coding guide. Defines comment style, naming conventions, abstraction rules, and stylistic drift. Written for JS/Python examples but applies to C# with the overrides below.
 
