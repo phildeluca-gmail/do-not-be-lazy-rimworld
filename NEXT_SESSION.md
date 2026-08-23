@@ -1,9 +1,11 @@
-<!-- Pickup context for a fresh session. Updated 2026-08-22 (evening). Read this first, then CLAUDE.md's referenced docs as usual. -->
+<!-- Pickup context for a fresh session. Session closed 2026-08-23. Read this first, then CLAUDE.md's referenced docs as usual. -->
 
 # Pickup: Do Not Be Lazy
 
-Resume **this** conversation (standing-still ANSWERED from a real log,
-pool-discard + rescan fixed, logging gaps closed) with:
+**This session is closed.** Everything below is current as of the close
+and everything named as committed is pushed. Resume it (standing-still
+ANSWERED from a real log, pool-discard + rescan fixed, logging gaps
+closed, wishlist started) with:
 
 ```
 claude --resume 7254dd70-3fd5-4c55-a0f6-fcab3652315a
@@ -53,9 +55,17 @@ critical needs (hunger/rest/joy/mood).
 
 - Builds clean: `cd DoNotBeLazy/Source/DoNotBeLazy && dotnet build`
   (0 errors, 0 warnings).
-- **Everything was committed and pushed at the end of 2026-08-22
-  (evening).** Run `git log -1` and `git status` anyway rather than
-  trusting this line: it has been stale twice and cost time both times.
+- **Everything was committed and pushed at the close of the session,
+  2026-08-23.** Two commits: `420588d` (the sweep-pool fixes and the
+  logging work) and the close-up commit carrying `RW-Wishlist.md`, open
+  item 6 and these doc updates. Run `git log -1` and `git status`
+  anyway rather than trusting this line: it has been stale twice and
+  cost time both times.
+- **New file: `RW-Wishlist.md`** - capture for ideas that have not been
+  architected. Two entries so far (ConfigureKeys / interface changes;
+  Do Not Be Lazy focus from centre out). **Nothing in it is a
+  go-ahead**; an entry graduates by being written up in an architecture
+  doc first. Registered in `CLAUDE.md` as non-required reading.
 - **2026-08-22 evening: the standing-still report is ANSWERED, from a
   real log, and the cause was ours.** See "Open item 2" below - it is
   now a closed item kept for the record. The two fixes for it are
@@ -106,6 +116,13 @@ critical needs (hunger/rest/joy/mood).
    `* ... until done - <pawn>: is not assigned to hauling`-style entry,
    and a burning tile should always open *some* menu.
 5. Then `TEST_PLAN.md` Phase 1, which has still never been run.
+
+**Not in that list on purpose:** open items 3-6 are all diagnosed and
+none is built. Item 3 (workstation sweeps dropping after one bill) is
+the one with a real player complaint behind it and is the natural next
+piece of code. Items 4 and 5 are float-menu interface bugs and pair
+naturally with each other. Item 6 needs a decision, not typing.
+`RW-Wishlist.md` is further out than any of them.
 
 ## Open item 1: vehicle packing offers no `* pack until done`
 
@@ -251,11 +268,11 @@ playtest** - neither has been seen in a running game. 3-6 are still
 open. `TEST_PLAN.md` has no tests for either, since it predates the
 whole feedback change.
 
-## Open items 3-5: diagnosed 2026-08-22 evening, NOT implemented
+## Open items 3-6: diagnosed 2026-08-22 evening, NOT implemented
 
 All three are fully traced to a vanilla mechanism. Nothing is written.
 They were ranked as items 3-8 of the fix list; 1, 2 and the logging ones
-are done.
+are done. Item 6 was reported from play after that list was written.
 
 ### 3. Workstation sweeps drop after one bill (butchering, drug synthesis)
 
@@ -341,6 +358,52 @@ Separately: `* Cut stone blocks` was **absent** rather than greyed, so
 `!BillStack.AnyShouldDoNow` (bill suspended or its target count met).
 Legitimate, but we say nothing at all about the one def the player
 actually clicked. Worth a `- no bills ready` entry.
+
+### 6. The menu offers a sweep the radius scan can't fill
+
+**Reported from play 2026-08-22 evening: `* Haul general things until
+done` appears when there is nothing haulable within 16 tiles.**
+Already visible in `logs/20260822-225440-dnbl.log` - `BeginSweep
+HaulGeneral: scan found nothing, no sweep started` fires **four times**
+in that one session.
+
+**The menu and the sweep ask different questions, and nothing reconciles
+them.**
+
+- `FloatMenuPatch.FindTargetWithJob` asks: does anything *on the clicked
+  cell* return `HasJobOnThing` for *any* of the selected pawns? No
+  radius, no pool.
+- `SweepManager.BeginAreaSweep` then asks `TaskScanner.FindTargets`: what
+  does `PotentialWorkThingsGlobal` return *within the radius*, for
+  `eligiblePawns[0]` alone?
+
+Four ways those disagree, in rough order of likelihood:
+
+1. **`ListerHaulables` vs `HasJobOnThing`.**
+   `WorkGiver_Haul.PotentialWorkThingsGlobal` is
+   `listerHaulables.ThingsPotentiallyNeedingHauling()`, which **excludes
+   anything already sitting in valid storage**. `HasJobOnThing` doesn't
+   consult the lister at all - it just asks
+   `StoreUtility.TryFindBestBetterStorageFor`. So an item in a stockpile
+   that has a *better* stockpile available passes the menu check and is
+   invisible to the scan. This is the one to test first: click something
+   that is already stored.
+2. **Driver pawn vs any pawn.** The menu accepts a job for any selected
+   pawn; the scan runs entirely against `eligiblePawns[0]`.
+3. **Filters the scan applies and the menu doesn't.** `ScanThings` also
+   gates on `IsForbidden(forPawn)`, `allowedArea`, `CanReserve(forPawn,
+   thing)` and `CanReachTarget`. The menu path checks none of them.
+4. **The `CanReserve` pre-filter omits `ignoreOtherReservations`** while
+   the job it gates passes `forced` through - already listed under
+   still-open bugs, and it makes the pre-filter stricter than the job.
+
+**Fix direction, not yet decided.** The honest options are to make the
+menu run the same radius scan it is advertising (correct, but pays for a
+radial scan per eligible def on every right-click - see the T4.1 perf
+entry), or to keep the cheap check and make the failure graceful, since
+`BeginAreaSweep` already messages `"* X: nothing to do within N tiles."`
+and logs it. **Ask before building either.** The perf question is real:
+`EligibleDefs()` is ~200 defs on this modlist.
 
 ## Verified in earlier sessions (don't re-derive)
 
@@ -630,6 +693,19 @@ file named for three sessions.**
 2. **"The `* forced delivery to (ITEM)` is gone."** Needs a repro.
    Sense of Urgency is no longer a candidate explanation - none of its
    defs is sweep-eligible (2026-08-21).
+
+## Wishlist - further out than "planned"
+
+`RW-Wishlist.md` (new 2026-08-23) holds ideas that have not been
+architected at all, one rung below the section that follows this one.
+Currently: **ConfigureKeys / interface changes** (captured but not
+understood - needs the requester to expand it before anything happens)
+and **Do Not Be Lazy focus from centre out** (understood, not designed -
+`NearestTargetIndex` sorts by distance from the *pawn*; centre-out would
+sort by distance from `order.ScanCenter`, and the design work is the
+weighting between the two, not the sort). The wishlist entry notes that
+centre-out and the dead `showSweepOverlay` checkbox are worth doing
+together.
 
 ## Planned but NOT implemented - do not build without a fresh go-ahead
 

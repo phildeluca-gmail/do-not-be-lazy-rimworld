@@ -14,6 +14,10 @@ Load all referenced documents at the start of every session and before any imple
 - `./DoNotBeLazy_Architecture.md` - Mod architecture document. Defines intent, core behaviors, component structure, edge cases, Claude Code execution plan with model assignments, and dependency setup.
 - `./human-style-coding-260327.md` - Human-style coding guide. Defines comment style, naming conventions, abstraction rules, and stylistic drift. Written for JS/Python examples but applies to C# with the overrides below.
 
+Not required session reading, but know it exists:
+
+- `./RW-Wishlist.md` - Capture file for RimWorld mod ideas that have not been architected. **Nothing in it is a go-ahead.** An entry graduates by being written up in the relevant architecture document first. Read it when asked about future work, or before proposing something that might already be parked there.
+
 ---
 
 ## When to Consult Each Document

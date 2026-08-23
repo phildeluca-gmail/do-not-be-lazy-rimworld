@@ -131,6 +131,39 @@ Full detail in `NEXT_SESSION.md` "Open items 3-5". Summary:
    `fixedBillGiverDefs.Count == 1`; otherwise it is
    `ForGroup(PotentialBillGiver)`, which accepts any bench. Scope with
    vanilla's `ThingIsUsableBillGiver`.
+6. **The menu offers a sweep the radius scan can't fill.** Reported from
+   play: `* Haul general things until done` appears with nothing
+   haulable within 16 tiles, and the 08-22 log has four
+   `scan found nothing, no sweep started` lines. `FindTargetWithJob`
+   asks `HasJobOnThing` about the clicked cell for *any* selected pawn;
+   `TaskScanner` asks `PotentialWorkThingsGlobal` over the radius for
+   `eligiblePawns[0]` only. For hauling those are genuinely different
+   sets - `ListerHaulables` excludes things already in valid storage,
+   `HasJobOnThing` does not. Fixing it properly means running the radius
+   scan at menu-build time, which costs a radial scan per eligible def
+   per right-click; **do not build either option without a decision.**
+
+### Wishlist, not planned work
+
+`RW-Wishlist.md` (new 2026-08-23) is a capture file one rung below
+section 5's execution plan: ideas with no design, no cost and no
+go-ahead. It currently holds **ConfigureKeys / interface changes**
+(captured verbatim, not yet understood - the requester needs to say
+whether it means key bindings for this mod or a separate project) and
+**focus from centre out**, which does touch this mod's core:
+
+`AssignNextTask` picks each pawn's next target with
+`NearestTargetIndex(pawn.Position, ...)` - nearest to the **pawn**. The
+clicked cell survives on the order as `ScanCenter` but only builds and
+rescans the pool; it never orders it. Centre-out would sort by distance
+from `ScanCenter` so the group clears the middle first and works outward
+in rings, which is what a player picturing "until done" around a spot
+usually means. The design work is the **weighting** between
+distance-from-centre and distance-from-pawn - strict centre-out sends a
+pawn across the map while a target sits beside them. It also pairs
+naturally with `showSweepOverlay`, which is still a checkbox that draws
+nothing (3.4): centre-out is the behaviour that would make drawing the
+radius worth looking at. Nothing outside `SweepManager.cs` is affected.
 
 ---
 
