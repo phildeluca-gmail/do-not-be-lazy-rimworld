@@ -2,7 +2,7 @@
 
 # Do Not Be Lazy - RimWorld 1.5 Mod Architecture
 
-## 0. Current Status (2026-08-22, evening)
+## 0. Current Status (2026-08-27)
 
 **STANDING STILL IS ANSWERED, AND IT WAS OURS.** The three instruments
 built this morning never ran (the `jobDiagnostics` checkbox was never
@@ -67,6 +67,128 @@ without trouble by Tamas in a later sweep.
 throwing inside any of those is loud and contained. Three sessions were
 spent on mods that were throwing somewhere harmless.
 
+### The 08-22 pool fixes are CONFIRMED IN GAME (2026-08-27 log)
+
+`logs/20260827-013412-dnbl.log`. Produced by the **08-23 build**, so it
+tests nothing specified below - but it is the first real game to run the
+08-22 evening fixes, and all three hold:
+
+- **The removed `break`:** `BeginSweep CleanFilth: 648 targets, 50 pawns`.
+  Fifty pawns assigned from one click; 51 distinct pawns worked over the
+  session.
+- **No-consume-on-failure:** 872 `skipping ... - reserved` against
+  **zero** `no job for` discards. The 08-22 log had 151 discards against
+  ~97 assignments.
+- **Rescan on a dry pool:** five rescans across three concurrent orders.
+
+Two things that log also settled, both recorded in `NEXT_SESSION.md` in
+full:
+
+1. **RimWorld's ~1000-message cap fired four times**, so that log is
+   lossy and every count from it is a floor. The gap made three
+   concurrent sweeps look like one sweep with a missing `BeginSweep`
+   line. Ours is the noise that blew the cap - 2,136 of 3,882 lines were
+   `JobSourcePatch` failing to attribute `Wait_MaintainPosture` for
+   drafted pawns. **`JobSourcePatch` should skip `Wait_MaintainPosture`
+   before `jobDiagnostics` is switched on again.**
+2. **The pipeline census ran for the first time.** One piece of news:
+   `JobGiver_Work.TryIssueJobPackage` carries a **transpiler from
+   SmarterConstruction**. Not implicated in anything; know it is there
+   before blaming vanilla for a scan oddity. `DetermineNextJob` is
+   unpatched.
+
+### TOP PRIORITY, specified 2026-08-27 - the two ordered changes
+
+Both were ordered directly by the user on 2026-08-27 and both outrank
+everything in "Diagnosed, NOT implemented" below. They are unrelated in
+mechanism and related in intent: **the player's mouse click is the
+instruction, and the mod keeps overriding it.**
+
+#### A. Work emanates from the click, not from each pawn
+
+`AssignNextTask` picked each pawn's next target with
+`NearestTargetIndex(pawn.Position, ...)` - nearest to the **pawn**. The
+clicked cell was carried on the order as `ScanCenter` but only ever used
+to build and rescan the pool; it never ordered it. A group sweep
+therefore dissolved into each pawn tidying its own neighbourhood, and
+the pile the player actually pointed at was cleared last as often as
+first.
+
+**Decided:** targets are now ranked by distance from `ScanCenter`, with
+distance from the pawn as the tie-break only. The pool clears in rings
+outward from the click. This graduates the `RW-Wishlist.md` entry
+"focus from centre out"; the weighting question that entry raised is
+settled the strict way, on the grounds that the click is an explicit
+order and guessing at a blend would make it less predictable, not more.
+
+**The accepted cost:** a pawn can walk past a target beside them to
+reach one nearer the click. Bounded by `sweepRadius` (default 16, max
+50), so at default it is a few seconds of walking; at radius 50 it is
+visible. Revisit with a blend only if the radius-50 case is actually
+played and actually annoys.
+
+#### B. A right-click meant to move pawns must move pawns
+
+**Reported from play 2026-08-27: "we always trigger clean or the
+underlying task when moving or trying to move to a formation."** This is
+review finding 4 (below) confirmed live, and it is worse than the
+finding described, because it does not need drafted pawns to bite.
+
+Two vanilla mechanisms, both defeated by appending a single option:
+
+1. `TryMakeFloatMenu` auto-executes the menu when *every* option is
+   `autoTakeable` and enabled - that is how a right-click moves a pawn
+   with no menu at all ("Go here" is `autoTakeable`). Our `*` entries
+   are never `autoTakeable`, and our feedback entries are `Disabled`, so
+   the first one we add cancels the auto-take.
+2. `TryMakeMultiSelectFloatMenu` returns `false` on an empty option list,
+   and that `false` is what lets the group move happen. One appended
+   option flips it to `true` - and the menu it then opens has **no goto
+   entry**, because `ChoicesAtForMultiSelect` builds only from
+   `Thing.GetMultiSelectFloatMenuOptions` and never adds one. So the
+   player's move becomes a menu whose only entry is
+   `* Clean until done`, which is what they then click.
+
+**Decided, both halves:**
+
+- **Suppress every `*` entry when the whole selection is drafted.**
+  `PawnValidator.CanSweep` already rejects drafted pawns, so every entry
+  we add in that case is a greyed-out one that informs nobody and costs
+  the auto-take. Gate on *all* drafted rather than *any*: a mixed
+  selection still has pawns that can genuinely sweep. This supersedes
+  nothing in section 4's drafted bullet - that bullet governs
+  assignment, this governs whether the menu entry is drawn at all.
+- **Add a `Move here` option whenever we are the reason a multi-select
+  menu is non-empty.** Verified present in this build by reflection:
+  `FloatMenuMakerMap.PawnGotoAction(IntVec3 clickCell, Pawn pawn,
+  IntVec3 gotoLoc)` is public static, and
+  `RimWorld.RCellFinder.BestOrderedGotoDestNear(IntVec3 root, Pawn
+  searcher, Predicate<IntVec3> cellValidator)` is the destination
+  picker vanilla's own `GotoLocationOption` uses - the per-pawn spread
+  that stops a squad stacking on one cell comes from it, so calling it
+  per pawn reproduces the vanilla formation move rather than
+  approximating it. Priority `MenuOptionPriority.GoHere` (3), which
+  sorts above our `Low` (2) entries, so the move is the top item.
+  Only added when the incoming list was empty - if vanilla already put
+  options there, the menu was opening regardless and we are not the
+  cause.
+
+**One side effect, and it sharpens an existing open question.** The
+drafted firefighting question in section 4 - `FightFires` is
+`canBeDoneWhileDrafted: true` with `autoTakeablePriorityDrafted: 20`, and
+a fire during a raid is exactly when everyone is drafted - used to
+produce a greyed `* Fight fires until done - <pawn>: is drafted` entry.
+It now produces nothing at all. No behaviour is lost, since
+`CanSweep` refused it either way, but the player is no longer told why.
+If that question is ever answered "yes, let drafted pawns fight fires",
+the suppression here needs a firefighting exemption alongside the ones in
+`PawnValidator.CanSweep` and `SweepManager.MapComponentTick`.
+
+**Not done, deliberately:** we do not make our own entries
+`autoTakeable`. An `autoTakeable` sweep option would start a sweep on a
+bare right-click with no menu and no confirmation, which is a far worse
+failure than the one being fixed.
+
 ### Shipped 2026-08-22 evening
 
 All in `Components/SweepManager.cs` unless noted. **None of it has run in
@@ -121,11 +243,13 @@ Full detail in `NEXT_SESSION.md` "Open items 3-5". Summary:
    order. Same via the `CompRefuelable` -> `RefuelJob` branch. Plus
    vanilla's 500-600 tick `nextTickToSearchForIngredients` cooldown,
    which one transient ingredient miss turns into a permanent removal.
-4. **Drafted right-click can no longer move pawns.** Our non-`autoTakeable`
-   options cancel `TryMakeFloatMenu`'s auto-take, and on multi-select they
-   flip `TryMakeMultiSelectFloatMenu` from `false` to `true`, suppressing
-   the squad move - into a menu that has no goto entry, because
-   `ChoicesAtForMultiSelect` never adds one.
+4. **Drafted right-click can no longer move pawns.** **IMPLEMENTED
+   2026-08-27, untested in game - see "TOP PRIORITY" item B above**,
+   which also records that the bug is not limited to drafted pawns. Our
+   non-`autoTakeable` options cancel `TryMakeFloatMenu`'s auto-take, and
+   on multi-select they flip `TryMakeMultiSelectFloatMenu` from `false`
+   to `true`, suppressing the squad move - into a menu that has no goto
+   entry, because `ChoicesAtForMultiSelect` never adds one.
 5. **Nonsense entries on a workbench.**
    `WorkGiver_DoBill.PotentialWorkThingRequest` only narrows when
    `fixedBillGiverDefs.Count == 1`; otherwise it is
@@ -149,21 +273,19 @@ Full detail in `NEXT_SESSION.md` "Open items 3-5". Summary:
 section 5's execution plan: ideas with no design, no cost and no
 go-ahead. It currently holds **ConfigureKeys / interface changes**
 (captured verbatim, not yet understood - the requester needs to say
-whether it means key bindings for this mod or a separate project) and
-**focus from centre out**, which does touch this mod's core:
+whether it means key bindings for this mod or a separate project).
 
-`AssignNextTask` picks each pawn's next target with
-`NearestTargetIndex(pawn.Position, ...)` - nearest to the **pawn**. The
-clicked cell survives on the order as `ScanCenter` but only builds and
-rescans the pool; it never orders it. Centre-out would sort by distance
-from `ScanCenter` so the group clears the middle first and works outward
-in rings, which is what a player picturing "until done" around a spot
-usually means. The design work is the **weighting** between
-distance-from-centre and distance-from-pawn - strict centre-out sends a
-pawn across the map while a target sits beside them. It also pairs
-naturally with `showSweepOverlay`, which is still a checkbox that draws
-nothing (3.4): centre-out is the behaviour that would make drawing the
-radius worth looking at. Nothing outside `SweepManager.cs` is affected.
+**"Focus from centre out" has graduated and is no longer wishlist.** It
+was ordered on 2026-08-27, specified as TOP PRIORITY item A above, and
+implemented the same day. The weighting question the entry raised was
+settled strict: distance from `ScanCenter` first, distance from the pawn
+as tie-break only.
+
+Still true and still unbuilt: it pairs naturally with
+`showSweepOverlay`, which remains a checkbox that draws nothing (3.4).
+Centre-out is the behaviour that makes drawing the radius worth looking
+at, and now that the sweep genuinely radiates from the click, the
+overlay would be showing something real.
 
 ---
 
@@ -1419,13 +1541,17 @@ Rather than cloning existing `FloatMenuOption` entries (they don't expose the `W
 
 Sweep-eligible WorkGiverDefs: any whose `Worker is WorkGiver_DoBill` (covers all workstation/bill types without hardcoding each one), plus any whose `workType.defName` is `Hauling`, `Construction`, `Cleaning`, `Mining`, or `Growing` - minus a small `ExcludedDefNames` denylist (currently just `CookFillHopper`, see the status-section bullet above) for specific defs that technically match but produce confusing options nobody wants. Target detection (`FindTargetWithJob`) branches on `def.scanCells` vs `def.scanThings`: cell-scanned defs (`GrowerSow`) check `HasJobOnCell` against the clicked cell directly, so they work even when nothing is on that cell - which is the normal case for an empty tile waiting to be sown.
 
+**Drafted suppression and `Move here` (added 2026-08-27):** Before any def is considered, `Build` drops the entire click when **every** selected pawn is drafted - no sweep options, no greyed feedback entries, no consume option. This is not cosmetic: an appended option cancels `TryMakeFloatMenu`'s auto-take and flips `TryMakeMultiSelectFloatMenu` from `false` to `true`, and both of those are how vanilla moves pawns on a right-click. Since `PawnValidator.CanSweep` rejects drafted pawns anyway, every entry suppressed here was a greyed-out one. Gated on *all* drafted, not *any* - a mixed selection still contains pawns that can sweep.
+
+That fixes the drafted case but not the undrafted one, because `ChoicesAtForMultiSelect` never builds a goto option of its own. So on the multi-select path only, when the incoming option list was **empty** and we are about to make it non-empty, a `Move here` option is inserted at `MenuOptionPriority.GoHere` (3, above our `Low`). It calls `RCellFinder.BestOrderedGotoDestNear(clickCell, pawn, null)` then `FloatMenuMakerMap.PawnGotoAction(clickCell, pawn, dest)` for each pawn that can reach the cell - both verified present in this build's `Assembly-CSharp.dll` by reflection, and both are what vanilla's own `GotoLocationOption` uses, so the per-pawn spread that stops a squad stacking on one cell is vanilla's, not ours. The option is skipped entirely if no selected pawn can reach the clicked cell.
+
 **Consume (added 2026-08-15):** Separate from all of the above - eating and drug use aren't `WorkGiverDef`-based in RimWorld at all (`JobDefOf.Ingest` instead), so `AddConsumeOption` in the same file handles it independently of `eligibleDefs`/`SweepManager` entirely. If any `Thing` at the clicked cell has `def.ingestible != null && def.ingestible.showIngestFloatOption` (the same flag vanilla itself uses to decide whether to offer an eat/smoke/snort option), and at least one selected pawn is alive/not downed/not in a mental state and `FoodUtility.WillEat` says yes, a `* <ingestCommandString>` option appears (e.g. `* Smoke smokeleaf joint`, `* Snort yayo` - `ingestCommandString` is the same per-ThingDef format vanilla uses, so wording matches). **Corrected 2026-08-17:** only *drugs* set `ingestCommandString` in Core - it defaults to empty, verified by reflection on `RimWorld.IngestibleProperties`. Plain food and corpses therefore fall through to the hardcoded `"Consume " + LabelShort` fallback and read `* Consume fine meal`, not `* Eat meal`. That still matches vanilla's own English wording, which uses the `ConsumeThing` key for the same fallback. Choosing it fires one `JobDefOf.Ingest` job per eligible pawn immediately, sized via the vanilla `FoodUtility.WillIngestStackCountOf` helper (same one the base game's single-pawn "Eat X" order uses) - not tracked as a sweep, since there's nothing to interrupt or chain: it's a one-shot order per pawn, same as manually right-clicking for each of them individually.
 
 Deliberately does **not** exclude drafted pawns (unlike the WorkGiver-based sweeps) - you can manually order a drafted pawn to eat or take a combat drug in vanilla, and dosing a raiding party before a fight is a real use case. Also does not gate on hunger level - a manual order works regardless of current need, matching vanilla's manual-order semantics. If the stack doesn't have enough for everyone, later pawns in the loop may fail to get their dose once the stack runs empty from under them - not handled specially, since vanilla's own job system already has to tolerate pawns racing for the same food and fails harmlessly rather than crashing.
 
 `CanConsume` branches on `thing.def.ingestible.drugCategory` (fixed 2026-08-15): non-drug food goes through `FoodUtility.WillEat` as before, but anything with a real drug category skips `WillEat` entirely (it's a food-appetite check and rejected every drug outright, which was the original bug - no `* Consume` was ever appearing for drugs) and instead only excludes Teetotalers (`pawn.story.traits.HasTrait(TraitDefOf.DrugDesire, -1)`), per explicit user request.
 
-**SweepManager.cs** - A `MapComponent` maintaining `Dictionary<Pawn, SweepOrder>`. `SweepOrder` holds a `WorkGiverDef` and a `SharedPool` (`List<LocalTargetInfo>`) - for area sweeps, every pawn assigned in the same `BeginSweep` call shares the same pool instance, so claiming a target for one pawn removes it for the rest of the group (implements "nearest unassigned task first" via a linear nearest-in-pool scan per assignment). **A target only leaves the pool when a job is actually created for it, or when `TargetIsGone` says it no longer exists** (2026-08-22 evening) - a pawn refused for a transient reason skips it via a per-call `refused` set and leaves it for someone else. The pool also **rescans** from `ScanCenter`/`ScanRadius`, once per `AssignNextTask` call, whenever a pawn runs it dry; this applies to every area sweep, not just firefighting. Workstation orders carry an empty pool since bill continuation doesn't use it (see JobTrackerPatch below). `LocalTargetInfo` transparently covers both Thing and cell targets, so the pool/nearest-scan logic didn't need to change to support `GrowerSow` - only the two spots that branch on target type explicitly did: `AssignNextTask` calls `scanner.JobOnCell` instead of `JobOnThing` when `!target.HasThing`, and `TargetRefusalReason` (a bool `TargetStillValid` until 2026-08-22) checks cell bounds/area/sow-settings/reservation instead of Thing-specific checks (Destroyed, forbidden) for the same case, returning the name of the failing check so the trace can say why a target was skipped.
+**SweepManager.cs** - A `MapComponent` maintaining `Dictionary<Pawn, SweepOrder>`. `SweepOrder` holds a `WorkGiverDef` and a `SharedPool` (`List<LocalTargetInfo>`) - for area sweeps, every pawn assigned in the same `BeginSweep` call shares the same pool instance, so claiming a target for one pawn removes it for the rest of the group. **Target order is centre-out from the click as of 2026-08-27** (`NextTargetIndex`): the pool is ranked by distance from `ScanCenter` - the cell the player right-clicked - with distance from the requesting pawn used only to break ties between targets equidistant from the centre. It was nearest-to-*pawn* until then, which made a group sweep dissolve into each pawn tidying its own neighbourhood and left the pile the player pointed at to be cleared whenever. The known cost is a pawn walking past a nearby target to reach one closer to the click; bounded by `sweepRadius`, negligible at the default 16 and visible at the maximum 50. **A target only leaves the pool when a job is actually created for it, or when `TargetIsGone` says it no longer exists** (2026-08-22 evening) - a pawn refused for a transient reason skips it via a per-call `refused` set and leaves it for someone else. The pool also **rescans** from `ScanCenter`/`ScanRadius`, once per `AssignNextTask` call, whenever a pawn runs it dry; this applies to every area sweep, not just firefighting. Workstation orders carry an empty pool since bill continuation doesn't use it (see JobTrackerPatch below). `LocalTargetInfo` transparently covers both Thing and cell targets, so the pool/nearest-scan logic didn't need to change to support `GrowerSow` - only the two spots that branch on target type explicitly did: `AssignNextTask` calls `scanner.JobOnCell` instead of `JobOnThing` when `!target.HasThing`, and `TargetRefusalReason` (a bool `TargetStillValid` until 2026-08-22) checks cell bounds/area/sow-settings/reservation instead of Thing-specific checks (Destroyed, forbidden) for the same case, returning the name of the failing check so the trace can say why a target was skipped.
 
 Job-to-job chaining is **event-driven**, not tick-polled: `JobTrackerPatch`'s postfix on `Pawn_JobTracker.EndCurrentJob` calls `SweepManager.Notify_JobEnded(pawn, condition)` when a swept pawn's job ends, and that pulls the next target off the shared pool. A non-`Succeeded` condition does not necessarily end the sweep - see `TargetFailureIsRecoverable` and the 2026-08-16 status entry for how target-scoped failures are separated from pawn-scoped interrupts, and for the per-pawn `MaxConsecutiveFailures` bound that keeps the retry path from recursing.
 
@@ -1476,7 +1602,7 @@ drop. Three responsibilities:
   `WorkGiver_Scanner`, so the normal virtual call already does the right
   thing.
 
-**PawnValidator.cs** - Static utility. Given a pawn and a `WorkGiverDef`, returns bool for whether the pawn can perform that work type. Checks: dead/downed/mental-state/drafted, work type enabled and active in the pawn's work settings, Manipulation capacity.
+**PawnValidator.cs** - Static utility. Given a pawn and a `WorkGiverDef`, returns bool for whether the pawn can perform that work type. Checks: dead/downed/mental-state/drafted, work type enabled and active in the pawn's work settings, Manipulation capacity. `Check` returns a `Refusal` enum rather than a bool so the float menu can name which gate tripped; `CanSweep` is the bool wrapper and `RefusalReason` is the wording. Note that a drafted pawn now short-circuits earlier than this: `FloatMenuPatch` drops the whole click when the entire selection is drafted, so `Refusal.Drafted` is only reachable from a mixed selection.
 
 **JobDriver_AreaSweep.cs** - Not written; turned out to be unnecessary. Workstation "stop after one bill" is overridden without a custom JobDriver: `JobTrackerPatch`'s postfix on `EndCurrentJob` checks if the ending job was `JobDefOf.DoBill` on a sweep's bill giver, and if so directly asks the `WorkGiver_Scanner` for another job on that same giver before falling through to `SweepManager`. `SweepManager` otherwise issues the same vanilla `Job` the float menu would have created, chained sequentially via `Notify_JobEnded`.
 
@@ -1488,6 +1614,8 @@ drop. Three responsibilities:
 | `FloatMenuMakerMap` | `ChoicesAtForMultiSelect` | Postfix | Append `*` entries to menu (2+ pawns selected) |
 | `Pawn_JobTracker` | `EndCurrentJob` | Postfix | Notify SweepManager to queue next task |
 | `Need` | `CurLevelPercentage` | (read only) | Polled by NeedMonitor, no patch needed |
+| `FloatMenuMakerMap` | `PawnGotoAction` | (called, not patched) | Backs the `Move here` entry we add to a multi-select menu we caused to open |
+| `RCellFinder` | `BestOrderedGotoDestNear` | (called, not patched) | Per-pawn goto destination for that entry - vanilla's own squad spread |
 
 ### 3.4 Settings (ModSettings)
 
@@ -1508,7 +1636,7 @@ drop. Three responsibilities:
 - **Reservation compliance:** Vanilla reservation system is respected, not overridden. `TaskScanner` filters out reserved targets via `map.reservationManager.CanReserve()`. For workstations, only the highest-skilled pawn in the selection is assigned; others are skipped for that task type.
 - **Workstation bill depletion:** Bills can require materials. If materials run out mid-sweep, the pawn should gracefully exit the sweep rather than idle at the station.
 - **Save/Load:** `SweepManager` should implement `ExposeData()` to persist active sweeps across saves, or clear them on load (simpler, recommended for v1).
-- **Drafted pawns in selection:** If any selected pawns are drafted, exclude them from sweep assignment. Do not undraft them automatically. **Open question as of 2026-08-18:** firefighting is the one case where vanilla disagrees - `FightFires` is `canBeDoneWhileDrafted: true` with `autoTakeablePriorityDrafted: 20`, and a fire during a raid is exactly when the player has everyone drafted. Currently still excluded, for consistency; changing it means a per-WorkGiver exception in both `PawnValidator.CanSweep` and `SweepManager.MapComponentTick`. Awaiting a decision.
+- **Drafted pawns in selection:** If any selected pawns are drafted, exclude them from sweep assignment. Do not undraft them automatically. **Extended 2026-08-27:** when *every* selected pawn is drafted, `FloatMenuPatch` adds nothing to the menu at all rather than adding greyed entries - an appended option, greyed or not, cancels vanilla's right-click auto-take and its multi-select squad move, which is how a drafted right-click moves pawns. Exclusion from assignment and suppression of the menu entry are separate rules; this bullet is the first, the FloatMenuPatch entry in 3.2 is the second. **Open question as of 2026-08-18:** firefighting is the one case where vanilla disagrees - `FightFires` is `canBeDoneWhileDrafted: true` with `autoTakeablePriorityDrafted: 20`, and a fire during a raid is exactly when the player has everyone drafted. Currently still excluded, for consistency; changing it means a per-WorkGiver exception in both `PawnValidator.CanSweep` and `SweepManager.MapComponentTick`. Awaiting a decision.
 - **Pawn death/downed/mental break mid-sweep:** SweepManager must detect these state changes on tick and remove the pawn from active sweeps. Check `pawn.Dead`, `pawn.Downed`, `pawn.InMentalState`.
 - **Forbidden targets:** TaskScanner must check `thing.IsForbidden(pawn)` before including a target. Forbidden items/buildings are skipped.
 - **Area restrictions:** Pawns with allowed-area restrictions may not be permitted to path to some tasks within the 16-tile radius. TaskScanner must check `pawn.Map.areaManager` and the pawn's allowed area before assigning.

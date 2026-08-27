@@ -525,7 +525,7 @@ namespace DoNotBeLazy.Components
                 // pawn was refused was hauled fine by another a minute
                 // later. Only claim a target once we actually have a job for
                 // it; everything else is skipped, not consumed.
-                int i = NearestTargetIndex(pawn.Position, order.SharedPool, refused);
+                int i = NextTargetIndex(order.ScanCenter, pawn.Position, order.SharedPool, refused);
                 if (i < 0)
                 {
                     // nothing left that this pawn hasn't already been refused.
@@ -726,12 +726,33 @@ namespace DoNotBeLazy.Components
             }
         }
 
+        // Centre-out: the target nearest the cell the player clicked wins,
+        // and the pawn's own position only separates targets that tie on
+        // that. Was nearest-to-pawn until 2026-08-27, which meant a group
+        // sweep dissolved into each pawn tidying whatever was under its own
+        // feet and the pile the player actually pointed at got cleared
+        // whenever. The pool empties in rings now.
+        //
+        // Ties are common rather than exotic - a radial scan produces plenty
+        // of cells the same distance from centre - so the tie-break earns
+        // its keep: it stops two pawns racing for the same ring cell when
+        // one of them is standing next to a different one.
+        //
+        // Known cost, accepted deliberately (see architecture doc section 0,
+        // TOP PRIORITY item A): a pawn can walk past a target beside them to
+        // reach one closer to the click. sweepRadius bounds it - trivial at
+        // the default 16, visible at the maximum 50.
+        //
         // skip = targets this pawn has already been refused this call. -1
         // means the pool holds nothing left for them.
-        private static int NearestTargetIndex(IntVec3 from, List<LocalTargetInfo> pool, HashSet<LocalTargetInfo> skip)
+        private static int NextTargetIndex(IntVec3 center, IntVec3 pawnPos, List<LocalTargetInfo> pool, HashSet<LocalTargetInfo> skip)
         {
-            int nearest = -1;
-            float nearestDistSq = 0f;
+            // LengthHorizontalSquared is int on IntVec3, so these compare
+            // exactly and the tie-break branch is a real equality, not a
+            // float one that never fires
+            int best = -1;
+            int bestFromCenter = 0;
+            int bestFromPawn = 0;
 
             for (int i = 0; i < pool.Count; i++)
             {
@@ -740,15 +761,21 @@ namespace DoNotBeLazy.Components
                     continue;
                 }
 
-                float distSq = (pool[i].Cell - from).LengthHorizontalSquared;
-                if (nearest < 0 || distSq < nearestDistSq)
+                IntVec3 cell = pool[i].Cell;
+                int fromCenter = (cell - center).LengthHorizontalSquared;
+                int fromPawn = (cell - pawnPos).LengthHorizontalSquared;
+
+                if (best < 0
+                    || fromCenter < bestFromCenter
+                    || (fromCenter == bestFromCenter && fromPawn < bestFromPawn))
                 {
-                    nearest = i;
-                    nearestDistSq = distSq;
+                    best = i;
+                    bestFromCenter = fromCenter;
+                    bestFromPawn = fromPawn;
                 }
             }
 
-            return nearest;
+            return best;
         }
     }
 }

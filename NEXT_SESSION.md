@@ -1,19 +1,23 @@
-<!-- Pickup context for a fresh session. Session closed 2026-08-23. Read this first, then CLAUDE.md's referenced docs as usual. -->
+<!-- Pickup context for a fresh session. Session closed 2026-08-27: two ordered changes built (centre-out sweeps; right-click move), and the 08-22 pool fixes finally confirmed in a real game. Read this first, then CLAUDE.md's referenced docs as usual. -->
 
 # Pickup: Do Not Be Lazy
 
-**This session is closed.** Everything below is current as of the close
-and everything named as committed is pushed. Resume it (standing-still
+**This session is closed, 2026-08-27.** Everything below is committed
+and pushed. The two top-priority changes are written, building and
+**untested in a game** - the test session that happened this night ran
+the *old* DLL, so it tested none of them. It did, however, confirm the
+08-22 pool fixes in a real game for the first time. Resume it (standing-still
 ANSWERED from a real log, pool-discard + rescan fixed, logging gaps
 closed, wishlist started) with:
 
 ```
-claude --resume 7254dd70-3fd5-4c55-a0f6-fcab3652315a
+claude --resume 92786a93-35e8-4bdb-b076-3e794ec4a752
 ```
 
 Earlier sessions, for reference only:
 
 ```
+OLD: claude --resume 7254dd70-3fd5-4c55-a0f6-fcab3652315a   (standing-still answered, pool-discard + rescan fixed)
 OLD: claude --resume 6ed5db2f-8d09-4435-ab6c-2fb321b5823c   (menu findings 1+2, job diagnostics, /pull-logs)
 OLD: claude --resume 4b475e1d-24b5-48e9-94e4-f6ce4865faa9   (vehicle-packing diagnosis, TEST_PLAN conversion)
 OLD: claude --resume 5e862c7c-fa2b-40a6-b221-e0174424c01f   (08-18 review: six findings, radius, standing-still)
@@ -70,12 +74,16 @@ critical needs (hunger/rest/joy/mood).
   real log, and the cause was ours.** See "Open item 2" below - it is
   now a closed item kept for the record. The two fixes for it are
   written and building; **neither has run in a game.**
-- **The installed DLL is older than the repo build.** Copy
-  `DoNotBeLazy/Assemblies/DoNotBeLazy.dll` (+ `.pdb`) into
+- **The installed DLL needs recopying - the 2026-08-27 build is newer.**
+  Copy `DoNotBeLazy/Assemblies/DoNotBeLazy.dll` (+ `.pdb`) into
   `E:\SteamLibrary\steamapps\common\RimWorld\Mods\DoNotBeLazy\Assemblies\`
   and restart RimWorld before testing. The user does this step manually,
-  and `/pull-logs` step 1 checks it. It has been wrong on three separate
-  pulls now; do not skip it.
+  and `/pull-logs` step 1 checks it.
+  **Compare hashes, not the sentence above.** This line claimed "older
+  than the repo build" from 2026-08-23 through 2026-08-26 while the two
+  copies were byte-identical, and acting on it wasted a step. `md5sum`
+  both and believe the result:
+  `md5sum DoNotBeLazy/Assemblies/DoNotBeLazy.dll "E:/SteamLibrary/steamapps/common/RimWorld/Mods/DoNotBeLazy/Assemblies/DoNotBeLazy.dll"`
 - **What shipped 2026-08-22 evening, all untested in game:**
   - `SweepManager.AssignNextTask` no longer consumes a pool target on
     failure (fix 1) - `RemoveAt` moved to after a job is created, with a
@@ -90,39 +98,185 @@ critical needs (hunger/rest/joy/mood).
   - `/pull-logs` now captures ` at Namespace.Class.Method` stack frames
     and `Could not reserve` / `Existing reservers`.
 - **What IS verified in game:** verbose logging works (2026-08-17), a
-  `HaulMerge` sweep runs end to end (2026-08-17), and as of the 08-22
-  evening log the **need pause/resume loop works** - four pause/resume
-  pairs, all resumed, no `MaxPauseTicks` give-ups.
+  `HaulMerge` sweep runs end to end (2026-08-17), the **need
+  pause/resume loop works** (08-22 log, four pause/resume pairs), and as
+  of the **2026-08-27 log the two 08-22 pool fixes are confirmed** - see
+  "The 2026-08-27 log" below. That log also ran the job-pipeline census
+  for the first time.
 - Still untested from before: **the sow fixes** (`cc502c9`) and the menu
   findings 1+2 fix. Phase 1 of the playtest plan has still not been run.
 
 ## Start here next session
 
-1. **Copy the DLL over and restart the game.** Nothing from 08-21 or
-   08-22 has been in front of RimWorld.
-2. **Re-run the standing-still repro**: select ~34 pawns, right-click a
-   pile, `* Haul general things until done`. Before the fix, a 17-target
-   pool gave work to **2** pawns and discarded 16 targets. After it,
-   pawns should spread across the pool and the discards should be
-   skips-with-a-reason that stay available. `/pull-logs standing still`.
-3. **Watch for the two deliberate behaviour changes** the rescan
-   introduced: sweeps can now run indefinitely (`* Clean until done`
-   will keep finding new filth - drafting or a manual order still ends
-   it), and a rescan uses the *requesting* pawn as driver, so a pawn
-   with a restricted allowed area rescans a smaller area than the
-   original click did.
-4. **While you're in there:** the menu findings 1+2 fix means a
-   right-click that used to do nothing should now show a greyed
-   `* ... until done - <pawn>: is not assigned to hauling`-style entry,
-   and a burning tile should always open *some* menu.
-5. Then `TEST_PLAN.md` Phase 1, which has still never been run.
+1. **Copy the DLL over and restart the game.** The 08-27 build
+   (`DE25C3A5389A1C702206E78424207FFB`) is newer than the installed copy
+   (`DA1EAD6142E46C0912381357F6CD434C`, the 08-23 build). **The 08-27
+   test session ran the old DLL and therefore tested none of the two
+   ordered changes.** Compare hashes, don't trust this line.
+2. **Turn `jobDiagnostics` OFF and disable Automatic Hunting** before
+   playing. Both are pure noise now and together they cost the 08-27 log
+   four message-limit gaps - see "The log message cap" below. Leave
+   `verboseLogging` on.
+3. **`TEST_PLAN.md` Phase 7, T7.1 through T7.6.** The two ordered
+   changes: a right-click meant to move pawns moves pawns, and sweep
+   work emanates from the clicked cell outward. T7.1 and T7.3 are the
+   reported bug; T7.5 is the ordered behaviour change.
+4. **Watch for the three deliberate behaviour changes.** Two from the
+   rescan: sweeps run indefinitely (confirmed in the 08-27 log - not one
+   sweep ended on its own), and a rescan uses the *requesting* pawn as
+   driver, so a pawn with a restricted allowed area rescans a smaller
+   area than the original click did. One from centre-out: **pawns
+   walking past nearer work is correct now**, not a bug.
+5. **Still never run:** `TEST_PLAN.md` Phase 1 (the sow fixes), and the
+   menu findings 1+2 feedback entries. Note a **fully drafted**
+   selection now shows nothing at all by design, so don't test the
+   greyed-entry path that way.
 
-**Not in that list on purpose:** open items 3-6 are all diagnosed and
-none is built. Item 3 (workstation sweeps dropping after one bill) is
-the one with a real player complaint behind it and is the natural next
-piece of code. Items 4 and 5 are float-menu interface bugs and pair
-naturally with each other. Item 6 needs a decision, not typing.
-`RW-Wishlist.md` is further out than any of them.
+## The 2026-08-27 log: the 08-22 pool fixes are CONFIRMED
+
+`logs/20260827-013412-dnbl.log`, 3,882 trace lines. **Produced by the
+08-23 build**, so it tests nothing from 08-27 - but it is the first real
+game to exercise the 08-22 evening fixes, and they hold.
+
+| What | Evidence |
+|---|---|
+| The removed `break` (finding 6) | `BeginSweep CleanFilth: 648 targets, 50 pawns` - fifty pawns assigned from one click, 51 distinct pawns given clean jobs over the session. The old code served a handful and dropped the rest silently. |
+| No-consume-on-failure (fix 1) | **872 `skipping ... - reserved`, zero `no job for` discards.** Refusals are named and left in the pool. The 08-22 log had 151 discards against ~97 assignments. |
+| Rescan on dry pool (fix 2) | Five rescans across three concurrent orders. Nikoletta drained hers, a rescan found 17, she carried on. |
+| Sweeps run indefinitely | Zero `nothing left within ... ending sweep` lines. Deliberate, not a fault. |
+| Failure tolerance | 8 x `job ended Incompletable`, 1 x `ErroredPather`, all CleanFilth. Zero `failed in a row`. No sweep died. |
+
+**One loose end:** `Abi paused from sweep` appears once with **no resume
+line**. The 08-22 log had four clean pairs. It may simply have fallen in
+a dropped window (below) - unresolved, worth a glance next time.
+
+## The log message cap - a real trap, cost data this time
+
+`Reached max messages limit. Stopping logging to avoid spam.` appears
+**four times** in the 08-27 `Player.log` (lines 1877, 2913, 3955, 4995).
+That is RimWorld's ~1000-message cap being hit and reset. **Messages in
+those windows are gone**, so every count from that log is a floor.
+
+**Do not mistake the resulting hole for a bug.** It looked like one:
+exactly one `BeginSweep` line exists, yet at least three pools were live
+at once (297, 118 and 17 "left" within ten lines, rescans from two
+different centres). `AddNewTargets` mutates one shared list, so differing
+counts can only mean separate orders - the later `BeginSweep` lines were
+dropped, not missing from the code.
+
+**The cause is ours.** 2,136 of 3,882 trace lines were
+`job <pawn>: Wait_MaintainPosture from none [-] (tree ?)` - drafted pawns
+standing still, a job `JobSourcePatch` cannot attribute and logs anyway.
+That noise is what blew the cap. **Turn `jobDiagnostics` off unless you
+are actively chasing an idle report**, and consider making
+`JobSourcePatch` skip `Wait_MaintainPosture` before turning it on again.
+
+## Job pipeline census - first run, one piece of news
+
+From the same log, the only time these instruments have ever emitted:
+
+- `TryFindAndStartJob`: prefix `TKS_PriorityTreatment` - expected.
+- `StartJob`: prefixes `CommonSense`, `VFEPirates.Mod`; our postfix.
+- `EndCurrentJob`: prefix `CommonSense`, plus our prefix and postfix.
+- `DetermineNextJob`: **unpatched.**
+- `JobGiver_Work.TryIssueJobPackage`: **transpiler `SmarterConstruction`.**
+
+**The last one is the news** - a transpiler on the WorkGiver scan loop,
+which was not on the radar in any previous session. Not implicated in
+anything yet; know it exists before blaming vanilla for a scan oddity.
+
+The idle probe produced a single line (`idle Food: no job - ... queued=2
+... thinker=ok`) - one occurrence with jobs queued, i.e. between jobs,
+not stuck.
+
+**Errors: nothing of ours.** 35 x `MissingMethodException` from
+`ARY_AutomaticHunting.AnimalHuntingManager.GameComponentTick`, the same
+known-broken mod, still enabled despite T0.4 saying to disable it.
+Contained by `GameComponentUtility`'s per-component try/catch. Zero
+`Exception in WorkGiver`, zero error-recover jobs, and **zero
+`Could not reserve` / `Existing reservers`** - consistent with an
+all-cleaning session, since cleaning has no destination to reserve. That
+contrast is the same one that pinned the 08-22 diagnosis.
+
+## TOP PRIORITY, built 2026-08-27, untested in game
+
+Two changes, both ordered directly rather than found in review, both
+outranking every open item below. Full specification in
+`DoNotBeLazy_Architecture.md` section 0, "TOP PRIORITY". Tests are
+`TEST_PLAN.md` Phase 7. Builds clean, 0 warnings; **neither has run in a
+game.**
+
+The two share an intent: **the player's mouse click is the instruction,
+and the mod was overriding it in both directions** - ignoring where they
+clicked when handing out work, and swallowing the click entirely when
+they meant to move.
+
+### A. Work emanates from the click
+
+`AssignNextTask` picked each pawn's next target nearest to **the pawn**.
+`ScanCenter` - the clicked cell - built and rescanned the pool but never
+ordered it, so a group sweep dissolved into each pawn tidying its own
+feet and the pile the player pointed at was cleared whenever.
+
+`NearestTargetIndex` is now `NextTargetIndex(center, pawnPos, pool,
+skip)`: rank by distance from `ScanCenter`, break ties on distance from
+the pawn. The pool empties in rings outward from the click. One file,
+`SweepManager.cs`.
+
+**This graduates the `RW-Wishlist.md` "focus from centre out" entry**,
+and it settles that entry's open weighting question the strict way,
+against that entry's own recommendation. The objection it raised was
+accepted, not answered: **a pawn can now walk past a target beside them
+to reach one nearer the click, and that is the pass condition, not a
+bug.** It is bounded by `sweepRadius` - trivial at the default 16,
+possibly annoying at the maximum 50, which is what T7.6 exists to
+measure. The mitigation is designed and written down in the wishlist
+entry; **do not apply it without asking.**
+
+### B. A right-click meant to move pawns must move pawns
+
+**Reported from play: "we always trigger clean or the underlying task
+when moving or trying to move to a formation."** This is review finding
+4 confirmed live, and worse than the finding said - it does not need
+drafted pawns to bite.
+
+Appending a single option defeats two separate vanilla mechanisms:
+
+1. `TryMakeFloatMenu` auto-executes a menu whose options are **all**
+   `autoTakeable` - that is how a right-click moves a pawn with no menu.
+   Ours never are, and feedback entries are `Disabled`, so the first one
+   we add cancels it.
+2. `TryMakeMultiSelectFloatMenu` returns `false` on an empty list, and
+   that `false` is what lets the group move happen. One option flips it
+   to `true` - into a menu with **no goto entry**, because
+   `ChoicesAtForMultiSelect` never builds one. The player's move became
+   a menu whose only entry was `* Clean until done`.
+
+Both halves fixed, in `FloatMenuPatch.cs`:
+
+- **All-drafted selections get nothing at all** - no sweep options, no
+  greyed feedback, no consume. `CanSweep` rejected drafted pawns anyway,
+  so every entry suppressed was a grey one. Gated on *all* drafted, not
+  *any*; a mixed selection still holds pawns that can sweep.
+- **A `Move here` option** is inserted at `MenuOptionPriority.GoHere`
+  (above our `Low`) on the multi-select path only, and only when the
+  incoming list was empty - i.e. only when we are the reason the menu
+  opened. Per pawn it calls
+  `RCellFinder.BestOrderedGotoDestNear(cell, pawn, null)` then
+  `FloatMenuMakerMap.PawnGotoAction(cell, pawn, dest)`. Both verified
+  present in this build by reflecting on `lib/Assembly-CSharp.dll`, and
+  both are what vanilla's own `GotoLocationOption` uses - so the spread
+  that stops a squad stacking on one cell is vanilla's, not ours.
+
+**Deliberately not done:** our entries are not made `autoTakeable`. That
+would start a sweep on a bare right-click with no menu and no
+confirmation - a worse failure than the one being fixed.
+
+**One side effect.** A fully drafted selection used to show a greyed
+`* Fight fires until done - <pawn>: is drafted`. It now shows nothing.
+No behaviour lost, but if the long-open "should drafted pawns fight
+fires" question is ever answered yes, this suppression needs a
+firefighting exemption too.
 
 ## Open item 1: vehicle packing offers no `* pack until done`
 
@@ -244,7 +398,7 @@ architecture doc section 0.
    entry twice. **The Sense of Urgency half of this finding is
    withdrawn** (2026-08-21): that mod adds no `Firefighter` def, and
    nothing sweep-eligible at all.
-4. **Paused sweeps now survive interrupts that used to end them** -
+4b. **Paused sweeps now survive interrupts that used to end them** -
    `SweepManager.cs:365`. A manual player order during a pause no longer
    ends the sweep; the pawn is pulled back when it finishes. Looks
    intentional, but it's wider than the reported bug.
@@ -268,9 +422,10 @@ playtest** - neither has been seen in a running game. 3-6 are still
 open. `TEST_PLAN.md` has no tests for either, since it predates the
 whole feedback change.
 
-## Open items 3-6: diagnosed 2026-08-22 evening, NOT implemented
+## Open items 3-6: diagnosed 2026-08-22 evening
 
-All three are fully traced to a vanilla mechanism. Nothing is written.
+**Item 4 was built 2026-08-27** and is marked below; 3, 5 and 6 are still
+fully traced to a vanilla mechanism with nothing written.
 They were ranked as items 3-8 of the fix list; 1, 2 and the logging ones
 are done. Item 6 was reported from play after that list was written.
 
@@ -311,7 +466,12 @@ unconditional `RemoveSweep`; give a null `JobOnThing` a strike against
 `MaxConsecutiveFailures` with a retry rather than ending the order. Same
 for the resume path in `AssignNextTask`.
 
-### 4. Drafted right-click can no longer move pawns
+### 4. Drafted right-click can no longer move pawns - **BUILT 2026-08-27**
+
+**Implemented, untested in game. See "TOP PRIORITY" item B above**, which
+also records that the bug was wider than this entry describes: it does
+not need drafted pawns. The diagnosis below stands and is kept for the
+mechanism.
 
 `FloatMenuMakerMap.TryMakeFloatMenu` auto-executes the menu when *every*
 option is `autoTakeable` and enabled - that is how a drafted right-click

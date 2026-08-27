@@ -64,54 +64,34 @@ bare `Listing_Standard` today), the float menu itself, or an overlay.
 
 ---
 
-## 2. Do Not Be Lazy - focus from centre out
+## 2. Do Not Be Lazy - focus from centre out - **GRADUATED 2026-08-27**
 
 **Asked for, verbatim:** "DoNotBeLazy focus from center out".
 
-**Status: understood well enough to describe, not designed.** This one
-maps onto a specific line of existing code.
+**Status: graduated and implemented.** Ordered on 2026-08-27 as "the
+work should emanate from my mouse click", written up as TOP PRIORITY
+item A in `DoNotBeLazy_Architecture.md` section 0, and implemented the
+same day in `SweepManager.NextTargetIndex`. It is no longer wishlist and
+this entry is kept only so the reasoning below isn't re-derived.
 
-**What happens now.** `SweepManager.AssignNextTask` picks each pawn's
-next target with `NearestTargetIndex(pawn.Position, order.SharedPool,
-refused)` - nearest to **the pawn**, every time. The clicked cell is
-kept on the order as `ScanCenter` and used only to build the pool and to
-rescan; it never influences which target comes next.
+**How the open design question was settled.** This entry said the
+weighting between distance-from-centre and distance-from-pawn was the
+real design work, and that "strict centre-out is easy and probably
+wrong". It was built strict anyway, on the user's explicit instruction:
+the click is an order, and a blend makes the result less predictable
+rather than more. Distance from `ScanCenter` ranks; distance from the
+pawn only breaks ties.
 
-**What "centre out" would mean.** Order the pool by distance from
-`order.ScanCenter` instead, so the group clears the middle of the radius
-first and works outward in rings, rather than each pawn greedily
-grabbing whatever is under their feet.
+**The objection this entry raised still stands and was accepted, not
+answered:** strict centre-out can send a pawn past a target beside them
+to reach one nearer the click. It is bounded by `sweepRadius`, so it is
+seconds at the default 16 and visible at the maximum 50. The cheap
+mitigation this entry proposed - let a pawn take anything within a few
+tiles of itself first - is still the right first move if that turns out
+to matter in play. Do not apply it without asking; it is a deliberate
+softening of an explicit instruction.
 
-**Why it is worth doing.** With nearest-to-pawn, a group spreads across
-the whole radius immediately and the area finishes everywhere at once
-and nowhere first. Centre-out finishes a growing, contiguous area, which
-is what the player is usually picturing when they click a spot and say
-"until done" - and it makes progress legible, which the mod currently
-has no way to show.
-
-**Why it isn't a one-line change:**
-
-- **It fights walking distance.** Strict centre-out can send a pawn
-  across the map to the next ring while a target sits beside them. The
-  real design question is the *weighting* between distance-from-centre
-  and distance-from-pawn, not which one wins. A cheap first cut: sort by
-  distance from centre, but let a pawn take anything within a few tiles
-  of itself first.
-- **The pool is shared and mutated.** Since 2026-08-22 a refused target
-  stays in the pool, so the ordering has to tolerate targets that are
-  passed over and revisited. A pre-sorted list would need re-sorting
-  after every rescan; computing the distance on demand (as
-  `NearestTargetIndex` does now) is simpler and probably still cheap.
-- **Rescans move the goalposts.** New work found by a rescan is scanned
-  from `ScanCenter`, so it slots into the ring order naturally - that
-  part is fine.
-- **It interacts with `showSweepOverlay`.** If the radius is ever drawn,
-  centre-out is the behaviour that makes the drawing worth looking at.
-  Worth doing the two together.
-
-**Where it would go:** `NearestTargetIndex` and its call site in
-`AssignNextTask`, `SweepManager.cs`. Nothing else needs to know.
-
-**Do not build this without a decision on the weighting.** Strict
-centre-out is easy and probably wrong; the weighted version is the
-actual feature, and picking the weight is the design work.
+**Still unbuilt, still paired with this:** `showSweepOverlay` remains a
+settings checkbox that draws nothing. Now that the sweep genuinely
+radiates from the click, drawing the radius would be showing something
+real.

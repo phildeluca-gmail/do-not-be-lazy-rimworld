@@ -1,4 +1,4 @@
-<!-- Converted from the published artifact to markdown 2026-08-20 so it can be read without a browser. Three entries carry CORRECTION notes where the plan had gone stale against shipped code - see T0.1, T3.5, T3.6. Phase 6 added 2026-08-22 evening for the pool-discard and rescan fixes. -->
+<!-- Converted from the published artifact to markdown 2026-08-20 so it can be read without a browser. Three entries carry CORRECTION notes where the plan had gone stale against shipped code - see T0.1, T3.5, T3.6. Phase 6 added 2026-08-22 evening for the pool-discard and rescan fixes. Reordered 2026-08-26: passed tests now live in a Completed tests section at the bottom, so the top of the file is only work outstanding. -->
 
 # Sow Fix Shakedown
 
@@ -9,21 +9,35 @@ that - ordered so each phase only runs once the one above it has proven
 its own instruments.
 
 - **Target:** RimWorld 1.5.4409, no DLC, ~60 mods
-- **Entries:** 35, across phases 0-6 (`T0.1` through `T6.7`)
-- **Status:** Phase 0 passed 2026-08-17, and T0.3 passed again
-  2026-08-21 on a fresh save (sow trace carried `plant=Plant_Rice`, no
-  reflection warning). **Phase 1 has never been run.**
-- **Run Phase 6 first if time is short.** It covers the bug that was
-  actually reported from play and answered on 2026-08-22 - Phase 1 is
-  still the sow work, which nobody has complained about since.
+- **Entries:** 41, across phases 0-7 (`T0.1` through `T7.6`)
+- **Status:** 5 passed - Phase 0 (2026-08-17) and T6.1 (2026-08-27).
+  T6.4 and T6.6 were also *observed* in the 08-27 log (no sweep ended on
+  its own, and none was meant to) but neither was run as written.
+- **Run Phase 7 first.** Added 2026-08-27 for the two ordered changes
+  (work emanates from the click; a right-click meant to move pawns must
+  move pawns). Both outrank everything else in this file.
+- **Status:** 4 of 35 entries have passed - Phase 0, 2026-08-17, with
+  T0.3 passing again 2026-08-21 on a fresh save (sow trace carried
+  `plant=Plant_Rice`, no reflection warning). **Everything from Phase 1
+  down is outstanding, and Phase 1 has never been run.**
+- **Reading order, changed 2026-08-26.** Passed tests were moved to
+  **Completed tests** at the bottom of the file. Phases run in the order
+  they appear here; the only thing below that still bears on a new
+  session is T0.1, which is a per-build precondition rather than a
+  result.
+- **Then Phase 6 if time is short.** It covers the standing-still bug
+  reported from play and answered on 2026-08-22 - Phase 1 is still the
+  sow work, which nobody has complained about since.
 
 > **Read before starting.** Every pass/fail signature below is read off
 > `[DoNotBeLazy]` log lines. Those lines were a no-op from Phase 1 of
 > the project until commit `cc502c9` - past playtests showed zero of
 > them and were misread as "nothing fired". **Phase 0 exists to prove
-> the logger is live.** Until T0.2 passes, an absence of log lines
-> proves nothing at all, and no result from any later phase is worth
-> recording.
+> the logger is live**, and it has passed - it now sits under
+> **Completed tests** at the bottom. Its conclusion still governs
+> everything here: unless T0.2's checkbox is on for the run you are
+> extracting, an absence of log lines proves nothing at all, and no
+> result from any later phase is worth recording.
 
 > **Coverage gap, narrowed 2026-08-22 evening.** This plan predates the
 > fire sweeps, the need pause/resume fix, the menu-feedback entries (all
@@ -35,99 +49,21 @@ its own instruments.
 
 ---
 
-## Phase 0 - Prove the instruments
+## Phase 0 - Prove the instruments · **PASSED, moved to the bottom**
 
-Four checks, maybe ten minutes. All of them gate everything after.
+All four checks passed 2026-08-17, and T0.3 passed again 2026-08-21 on a
+fresh save. The tests themselves are at the end of this file under
+**Completed tests**. Two of them are still worth a glance before a
+session rather than a full re-run:
 
-### T0.1 - Ship the current build · **BLOCKER**
-
-**Setup.** Copy `DoNotBeLazy\Assemblies\DoNotBeLazy.dll` into
-`<RimWorld>\Mods\DoNotBeLazy\Assemblies\`, then fully restart the game.
-
-**Do.** Before launching, compare the timestamp of the copy against the
-source build.
-
-```powershell
-Get-Item "<RimWorld>\Mods\DoNotBeLazy\Assemblies\DoNotBeLazy.dll" |
-  Select-Object LastWriteTime, Length
-```
-
-**Pass.** Matches the DLL in the repo at
-`DoNotBeLazy\Assemblies\DoNotBeLazy.dll`.
-
-**Fail.** Any earlier timestamp means the game is loading last session's
-code and every result below is fiction. Recopy.
-
-> **CORRECTION (2026-08-20).** The original plan hardcoded
-> `8/16/2026 9:37:58 AM` here. The current build is
-> **`8/18/2026 10:07:03 PM`, 30,720 bytes**. Don't hardcode it again -
-> compare against whatever the repo's copy actually reads, since the
-> useful question is "is the game running what I just built", not "does
-> it match a date someone typed into a document".
-
-### T0.2 - Make the logger speak · **BLOCKER**
-
-**Setup.** Options → Mod settings → Do Not Be Lazy → tick **"Verbose
-logging (for bug reports)"**. Close the settings window rather than
-alt-tabbing away - closing is what writes the setting to disk.
-
-**Do.** Select one colonist, right-click anything that offers a `*`
-option, run it. Then extract:
-
-```powershell
-Select-String -Path "$env:USERPROFILE\AppData\LocalLow\Ludeon Studios\RimWorld by Ludeon Studios\Player.log" -Pattern '\[DoNotBeLazy\]' | ForEach-Object { $_.Line }
-```
-
-RimWorld truncates `Player.log` on launch - extract before restarting,
-not after.
-
-**Pass.** One or more `[DoNotBeLazy]` lines come back.
-
-**Fail.** Zero lines means the checkbox didn't persist or T0.1 didn't
-take. **Stop here.** Do not run Phase 1 blind.
-
-### T0.3 - Confirm the reflection target resolved · **BLOCKER**
-
-**Why.** The whole sow fix hangs on reaching a `protected static` field
-by name. If `AccessTools.Field` came back null, `GrowerCompat` is inert
-and silently does nothing - the sow tests would all fail for a reason
-unrelated to what they're testing.
-
-**Do.** Scan the same extraction for this warning. It is logged
-unconditionally, not gated behind the verbose checkbox, and fires the
-first time `GrowerCompat` is touched rather than at startup.
-
-```
-WorkGiver_Grower.wantedPlantDef not found - sow sweeps
-may target the wrong crop or unzoned cells
-```
-
-**Pass.** The warning is *absent* after at least one sow right-click.
-
-**Fail.** Warning present - the field was renamed or is otherwise
-unreachable in this build. Phase 1 is meaningless until that's resolved.
-
-### T0.4 - Quiet the broken neighbours
-
-**Do.** Disable **Automatic Hunting** for this run. It throws every tick
-in `GameComponentTick` (`TraverseParms.For`) and also calls
-`Toils_General.WaitWith`, so its noise sits in the middle of every
-extraction and it is the leading suspect for colonists standing still.
-
-**Corrected 2026-08-21.** This step used to say Sense of Urgency, on the
-belief that it was the 1.6-compiled mod throwing on `WaitWith`. It isn't
-- it ships a real 1.5 assembly with no such reference, and none of its
-WorkGiverDefs is sweep-eligible, so it can neither break hunting nor
-duplicate a `*` option. Leaving it enabled is fine.
-
-**Keep.** Leave the rest of the ~60-mod list loaded, Performance Fish
-included. It patches `WorkGiverDef::get_Worker()`, which
-`EligibleDefs()` calls on every def - testing without it wouldn't test
-the configuration you actually play.
-
-**Note.** If you keep Automatic Hunting enabled anyway, expect its
-exception in the raw log every tick. Not ours, but it makes an
-extraction hard to read.
+1. **T0.1 (ship the build)** is a precondition, not a one-time result.
+   Re-check it whenever the repo has been rebuilt. Verified again
+   2026-08-26: the installed DLL and the repo build are byte-identical
+   (md5 `da1ead6142e46c0912381357f6cd434c`, both dated 2026-08-23
+   04:03), and no source file is newer than the build.
+2. **T0.2 (verbose logging on)** depends on a settings checkbox that
+   lives in the save-independent settings file. It has stayed on across
+   sessions, but a zero-line extraction means check it first.
 
 ---
 
@@ -572,27 +508,23 @@ These are the pool-discard and rescan changes. **Nothing here has ever
 run in a game.** Run this phase before Phase 1 if time is short - it
 covers the bug that was actually reported from play.
 
-### T6.1 - A big selection spreads across the pool · **CORE**
+### T6.1 - A big selection spreads across the pool · **PASSED 2026-08-27**
 
-**Why.** The reported bug. In `logs/20260822-225440-dnbl.log`, a
-17-target pool with **34 pawns selected** gave work to **2** of them and
-discarded 16 targets; a 1-target pool with 36 selected served one pawn
-and dropped 35. Those pawns stood still.
+Moved to **Completed tests** at the bottom of this file. Passed on
+`CleanFilth` rather than `HaulGeneral` - `BeginSweep CleanFilth: 648
+targets, 50 pawns`, 51 distinct pawns worked. The `break` it tests was in
+the pawn loop and is WorkGiver-agnostic, so the substitution is fair.
 
-**Do.** Select ~30 colonists. Right-click a scattered pile of haulables
-with roughly 15-20 items in range and take
-`* Haul general things until done`.
+### T6.2 - A refused target is not destroyed · **CORE, STILL OPEN**
 
-**Pass.** `BeginSweep HaulGeneral: N targets, M pawns` is followed by
-assignments to **many distinct pawns**, not one or two. No pawn in the
-selection is left standing with no job and no `skipping`/`no job` line
-explaining itself.
-
-**Fail shape to watch for.** `M pawns` much larger than the number of
-pawns that ever appear in a `<pawn>: <JobDef> on ...` line. That is the
-old `break` behaviour returning.
-
-### T6.2 - A refused target is not destroyed · **CORE**
+**Not passed by the 2026-08-27 log, and read the reason before assuming
+it was.** That session was all cleaning, and this test's own contrast
+note predicts what happened: **zero** `no job` lines, because cleaning
+has no destination to reserve. What the log does show is 872
+`skipping ... - reserved` with the targets staying in the pool, which is
+the same fix seen from the side that doesn't stress it. **The hauling
+case this test exists for is still untested.** Run it on haulables into
+a nearly-full stockpile, as written below.
 
 **Why.** 151 `no job` discards against ~97 haul assignments in one
 session. A target one pawn couldn't take was thrown away for everyone.
@@ -626,7 +558,14 @@ return.
 empty, the rescan runs and either finds work or logs
 `nothing left within N of <cell>, ending sweep`.
 
-### T6.4 - A finished sweep says so
+### T6.4 - A finished sweep says so · **NOT RUN - see note**
+
+**The 2026-08-27 log has zero `nothing left within ... ending sweep`
+lines**, which is consistent with T6.6 (rescans keep finding filth, so
+nothing finished) rather than with this line being broken. Untested
+either way - it needs a sweep that genuinely runs out.
+
+
 
 **Do.** Sweep a small, fully completable pile - five haulables, nothing
 else in range.
@@ -647,7 +586,13 @@ triggers a rescan. Watch the `(N left)` counter across the run.
 **Pass.** The count rises only by however much genuinely new work
 appeared. A sudden near-doubling is the dedup failing.
 
-### T6.6 - Sweeps that never end · **BEHAVIOUR CHANGE, DECIDE AFTER**
+### T6.6 - Sweeps that never end · **BEHAVIOUR CHANGE, OBSERVED 2026-08-27**
+
+**Seen in the 08-27 log:** not one sweep ended on its own across 3,882
+trace lines and three concurrent orders. That is the change working as
+designed, and it is the decision this entry asks for - still unmade.
+
+
 
 **Why.** Deliberate consequence of the rescan: an area sweep no longer
 has a natural end. This needs a judgement call, not a pass/fail.
@@ -674,12 +619,263 @@ The other pawns keep working targets outside that area.
 
 ---
 
+## Phase 7 - The 2026-08-27 ordered changes · **RUN THIS FIRST**
+
+Both were ordered directly and both outrank every other phase in this
+file, Phase 6 included. Six entries. Full specification in
+`DoNotBeLazy_Architecture.md` section 0, "TOP PRIORITY".
+
+### T7.1 - A right-click moves a drafted squad again · **CORE, THE REPORT**
+
+**Setup.** Draft 3+ colonists. Stand them somewhere with filth or
+haulables nearby, so a `*` option would have been on offer.
+
+**Do.** Right-click a destination cell to move them into formation.
+
+**Pass.** They move. No float menu opens at all - the click behaves
+exactly as it does with the mod disabled.
+
+**Fail.** A menu opens, or they don't move. If the menu opens and its
+only entry is `* Clean until done`, the drafted suppression did not
+take - check that every pawn in the selection is actually drafted, since
+the gate is *all* drafted, not *any*.
+
+### T7.2 - The same, single drafted pawn · **CORE**
+
+**Do.** Draft one colonist, right-click a destination.
+
+**Pass.** They move with no menu. Vanilla auto-takes a menu whose options
+are all `autoTakeable`, and this is the path that was cancelled by any
+appended entry, greyed or not.
+
+### T7.3 - An undrafted group can still be moved · **CORE, THE OTHER HALF**
+
+**Why this is separate.** The report was about formations, but the bug
+does not need drafted pawns. `ChoicesAtForMultiSelect` never builds a
+goto option, so an undrafted multi-select right-click that we make
+non-empty opens a menu with no way to move.
+
+**Do.** Select 3+ **undrafted** colonists. Right-click a spot that offers
+a sweep - filth on the floor is easiest.
+
+**Pass.** The menu opens with **`Move here` as the first entry**, above
+`* Clean until done`. Choosing it walks all of them there, spread across
+neighbouring cells rather than stacked on one.
+
+**Fail.** No `Move here` entry - then either the incoming option list
+wasn't empty (vanilla put something there, so we are not the cause and
+the entry is correctly absent) or no selected pawn could reach the cell.
+Try a plainly reachable cell before calling it a bug.
+
+### T7.4 - `Move here` stays out of the way when it isn't ours
+
+**Do.** Multi-select undrafted colonists and right-click something
+vanilla already offers a multi-select option for.
+
+**Pass.** No `Move here` entry from us. The menu was opening with or
+without our contribution, so we didn't suppress anything and owe nothing.
+
+### T7.5 - Work emanates from the click · **CORE**
+
+**Setup.** A long line or wide field of filth, 20+ tiles across. Put
+your pawns at the **far end** of it, deliberately.
+
+**Do.** Select them all. Right-click the **far end from the pawns** and
+`* Clean until done`.
+
+**Pass.** They walk past nearer filth to clear the area around the cell
+you clicked first, and the cleared area grows outward from that point in
+rings. **The pawns walking past nearer work is the pass condition, not a
+bug** - it is the accepted cost recorded in architecture doc section 0.
+
+**Fail.** Each pawn cleans whatever is under its own feet and the field
+finishes everywhere at once. That is the old nearest-to-pawn behaviour.
+
+**Read it in the trace.** `<pawn>: <JobDef> on <target>` lines - the
+target cells should be increasing in distance from the `BeginSweep`
+cell, not from each pawn.
+
+### T7.6 - Centre-out at radius 50 · **KNOWN COST, MEASURE IT**
+
+**Why.** Strict centre-out is bounded by `sweepRadius`. At the default 16
+the extra walking is seconds; at 50 it is the thing most likely to make
+this change feel wrong.
+
+**Do.** Set `sweepRadius` to 50 in mod settings. Repeat T7.5.
+
+**Pass.** Judgement call, and the point is to make it deliberately: does
+the walking look purposeful or stupid? Record the answer either way.
+
+**If it looks stupid,** the mitigation is already designed and written
+down - let a pawn take anything within a few tiles of itself before
+falling back to centre-out (`RW-Wishlist.md` entry 2). **Do not apply it
+without asking**; it deliberately softens an explicit instruction.
+
+---
+
 ## Reporting back
 
-Run the extraction from T0.2 and paste only the `[DoNotBeLazy]` lines,
+Run `/pull-logs` - it archives, extracts and reads the log without
+pasting it back. Give it the test ID and what you saw on screen.
+
+**Two traps that have each cost real data.** (1) Check which DLL the game
+actually loaded before reading a line of the log; `/pull-logs` step 1
+does it. (2) RimWorld caps logging at ~1000 messages and prints
+`Reached max messages limit`; it fired **four times** in the 08-27 log,
+so counts from a noisy session are floors, not totals. Turn
+`jobDiagnostics` off unless you are actively chasing an idle report.
+
+If extracting by hand instead, paste only the `[DoNotBeLazy]` lines,
 plus the test ID and what you saw on screen. Whole logs cost enormous
 context to reach a two-line answer - the trace exists so they aren't
 needed.
 
-Phases 0 through 2 are the pass that decides whether commit `cc502c9`
-holds. Phases 3 through 5 can follow separately if time is short.
+**Phase 7 comes before all of it** - it is the only phase covering work
+that was ordered rather than found. After that, phases 1 and 2 are the
+pass that decides whether commit `cc502c9` holds; Phase 0 already passed
+and is at the bottom of the file. Phases 3 through 5 can follow
+separately if time is short.
+---
+
+# Completed tests
+
+Everything below has passed in a real game. Kept for the procedure and
+the pass/fail signatures, not because it needs running again. Nothing
+here gates a new session except T0.1, which is a precondition - see the
+Phase 0 pointer above.
+
+## Phase 6 - passed entries
+
+### T6.1 - A big selection spreads across the pool · **PASSED 2026-08-27**
+
+**Evidence.** `logs/20260827-013412-dnbl.log`:
+`BeginSweep CleanFilth: 648 targets, 50 pawns`, followed by clean jobs to
+**51 distinct pawns** over the session. No pawn was dropped silently.
+
+**Caveat on the substitution.** Written for `HaulGeneral`, passed on
+`CleanFilth`. The `break` this tests sat in the pawn loop in
+`BeginAreaSweep` and never looked at the WorkGiverDef, so the swap does
+not weaken the result. The *hauling*-specific half of the 08-22 report is
+T6.2, which is still open.
+
+**Original procedure, as written:**
+
+**Why.** The reported bug. In `logs/20260822-225440-dnbl.log`, a
+17-target pool with **34 pawns selected** gave work to **2** of them and
+discarded 16 targets; a 1-target pool with 36 selected served one pawn
+and dropped 35. Those pawns stood still.
+
+**Do.** Select ~30 colonists. Right-click a scattered pile of haulables
+with roughly 15-20 items in range and take
+`* Haul general things until done`.
+
+**Pass.** `BeginSweep HaulGeneral: N targets, M pawns` is followed by
+assignments to **many distinct pawns**, not one or two. No pawn in the
+selection is left standing with no job and no `skipping`/`no job` line
+explaining itself.
+
+**Fail shape to watch for.** `M pawns` much larger than the number of
+pawns that ever appear in a `<pawn>: <JobDef> on ...` line. That is the
+old `break` behaviour returning.
+
+## Phase 0 - Prove the instruments
+
+Four checks, maybe ten minutes. All of them gate everything after.
+
+### T0.1 - Ship the current build · **BLOCKER**
+
+**Setup.** Copy `DoNotBeLazy\Assemblies\DoNotBeLazy.dll` into
+`<RimWorld>\Mods\DoNotBeLazy\Assemblies\`, then fully restart the game.
+
+**Do.** Before launching, compare the timestamp of the copy against the
+source build.
+
+```powershell
+Get-Item "<RimWorld>\Mods\DoNotBeLazy\Assemblies\DoNotBeLazy.dll" |
+  Select-Object LastWriteTime, Length
+```
+
+**Pass.** Matches the DLL in the repo at
+`DoNotBeLazy\Assemblies\DoNotBeLazy.dll`.
+
+**Fail.** Any earlier timestamp means the game is loading last session's
+code and every result below is fiction. Recopy.
+
+> **CORRECTION (2026-08-20).** The original plan hardcoded
+> `8/16/2026 9:37:58 AM` here, and the correction that replaced it
+> hardcoded `8/18/2026 10:07:03 PM` - both went stale within days. Don't
+> hardcode it again: compare against whatever the repo's copy actually
+> reads, since the useful question is "is the game running what I just
+> built", not "does it match a date someone typed into a document". A
+> hash is stronger than a timestamp - `md5sum` both copies.
+>
+> **Checked 2026-08-26 and matching.** Repo and installed DLL are
+> byte-identical, md5 `da1ead6142e46c0912381357f6cd434c`, and no `.cs`
+> file is newer than the build. Note this contradicts the "installed DLL
+> is older than the repo build" line in `NEXT_SESSION.md`, which is
+> stale.
+
+### T0.2 - Make the logger speak · **BLOCKER**
+
+**Setup.** Options → Mod settings → Do Not Be Lazy → tick **"Verbose
+logging (for bug reports)"**. Close the settings window rather than
+alt-tabbing away - closing is what writes the setting to disk.
+
+**Do.** Select one colonist, right-click anything that offers a `*`
+option, run it. Then extract:
+
+```powershell
+Select-String -Path "$env:USERPROFILE\AppData\LocalLow\Ludeon Studios\RimWorld by Ludeon Studios\Player.log" -Pattern '\[DoNotBeLazy\]' | ForEach-Object { $_.Line }
+```
+
+RimWorld truncates `Player.log` on launch - extract before restarting,
+not after.
+
+**Pass.** One or more `[DoNotBeLazy]` lines come back.
+
+**Fail.** Zero lines means the checkbox didn't persist or T0.1 didn't
+take. **Stop here.** Do not run Phase 1 blind.
+
+### T0.3 - Confirm the reflection target resolved · **BLOCKER**
+
+**Why.** The whole sow fix hangs on reaching a `protected static` field
+by name. If `AccessTools.Field` came back null, `GrowerCompat` is inert
+and silently does nothing - the sow tests would all fail for a reason
+unrelated to what they're testing.
+
+**Do.** Scan the same extraction for this warning. It is logged
+unconditionally, not gated behind the verbose checkbox, and fires the
+first time `GrowerCompat` is touched rather than at startup.
+
+```
+WorkGiver_Grower.wantedPlantDef not found - sow sweeps
+may target the wrong crop or unzoned cells
+```
+
+**Pass.** The warning is *absent* after at least one sow right-click.
+
+**Fail.** Warning present - the field was renamed or is otherwise
+unreachable in this build. Phase 1 is meaningless until that's resolved.
+
+### T0.4 - Quiet the broken neighbours
+
+**Do.** Disable **Automatic Hunting** for this run. It throws every tick
+in `GameComponentTick` (`TraverseParms.For`) and also calls
+`Toils_General.WaitWith`, so its noise sits in the middle of every
+extraction and it is the leading suspect for colonists standing still.
+
+**Corrected 2026-08-21.** This step used to say Sense of Urgency, on the
+belief that it was the 1.6-compiled mod throwing on `WaitWith`. It isn't
+- it ships a real 1.5 assembly with no such reference, and none of its
+WorkGiverDefs is sweep-eligible, so it can neither break hunting nor
+duplicate a `*` option. Leaving it enabled is fine.
+
+**Keep.** Leave the rest of the ~60-mod list loaded, Performance Fish
+included. It patches `WorkGiverDef::get_Worker()`, which
+`EligibleDefs()` calls on every def - testing without it wouldn't test
+the configuration you actually play.
+
+**Note.** If you keep Automatic Hunting enabled anyway, expect its
+exception in the raw log every tick. Not ours, but it makes an
+extraction hard to read.
+

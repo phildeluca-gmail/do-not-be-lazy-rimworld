@@ -102,7 +102,7 @@ namespace DoNotBeLazy.Patches
                 {
                     return;
                 }
-                AddSweepOptions(clickPos, new List<Pawn> { pawn }, __result);
+                AddSweepOptions(clickPos, new List<Pawn> { pawn }, __result, false);
             }
         }
 
@@ -112,7 +112,7 @@ namespace DoNotBeLazy.Patches
         {
             public static void Postfix(Vector3 clickPos, List<Pawn> pawns, List<FloatMenuOption> __result)
             {
-                AddSweepOptions(clickPos, pawns, __result);
+                AddSweepOptions(clickPos, pawns, __result, true);
             }
         }
 
@@ -120,7 +120,7 @@ namespace DoNotBeLazy.Patches
         // takes the right-click menu down for every other mod in the chain
         // too (Achtung patches the same area). Better to silently lose our
         // * entries than to break the menu.
-        private static void AddSweepOptions(Vector3 clickPos, List<Pawn> pawns, List<FloatMenuOption> options)
+        private static void AddSweepOptions(Vector3 clickPos, List<Pawn> pawns, List<FloatMenuOption> options, bool multiSelect)
         {
             if (pawns == null || pawns.Count == 0 || options == null)
             {
@@ -129,7 +129,7 @@ namespace DoNotBeLazy.Patches
 
             try
             {
-                Build(clickPos, pawns, options);
+                Build(clickPos, pawns, options, multiSelect);
             }
             catch (Exception e)
             {
@@ -137,8 +137,32 @@ namespace DoNotBeLazy.Patches
             }
         }
 
-        private static void Build(Vector3 clickPos, List<Pawn> pawns, List<FloatMenuOption> options)
+        private static void Build(Vector3 clickPos, List<Pawn> pawns, List<FloatMenuOption> options, bool multiSelect)
         {
+            // A right-click on a drafted selection is a move order, not a
+            // work order, and appending anything at all breaks it: vanilla
+            // auto-executes a float menu whose options are all autoTakeable
+            // (that is how a drafted right-click moves a pawn with no menu),
+            // and our entries are never autoTakeable. Since CanSweep rejects
+            // drafted pawns anyway, every entry we'd add here is a greyed-out
+            // one - we were trading the move order for a line of grey text.
+            //
+            // All drafted, not any: a mixed selection still holds pawns that
+            // can genuinely sweep, and vanilla wasn't going to auto-take for
+            // that selection either.
+            if (AllDrafted(pawns))
+            {
+                return;
+            }
+
+            // what vanilla had already put in the menu before we touched it.
+            // If this is zero on the multi-select path, the menu was going to
+            // be empty - and an empty multi-select menu is what lets the
+            // squad move happen (TryMakeMultiSelectFloatMenu returns false).
+            // Adding even one option suppresses that move, so if we do add
+            // one we owe the player a way to move. See MoveHereOption.
+            int vanillaOptionCount = options.Count;
+
             // don't trust pawns[0] to be spawned - caravan/world pawns can
             // sit in a selection and their Map is null
             Map map = null;
@@ -257,6 +281,83 @@ namespace DoNotBeLazy.Patches
             {
                 AddConsumeOption(pawns, map, thingsHere, options);
             }
+
+            // We only owe a move order when we are the reason the menu is
+            // opening at all. Single-select already gets vanilla's own
+            // "Go here"; ChoicesAtForMultiSelect never builds one, so on that
+            // path an empty-turned-non-empty list means we just swallowed the
+            // player's squad move.
+            if (multiSelect && vanillaOptionCount == 0 && options.Count > 0)
+            {
+                FloatMenuOption move = MoveHereOption(pawns, map, cell);
+                if (move != null)
+                {
+                    options.Insert(0, move);
+                }
+            }
+        }
+
+        private static bool AllDrafted(List<Pawn> pawns)
+        {
+            foreach (Pawn p in pawns)
+            {
+                if (p != null && !p.Drafted)
+                {
+                    return false;
+                }
+            }
+
+            return true;
+        }
+
+        // "Move here" for a multi-select menu that only exists because we put
+        // something in it. Reproduces vanilla's squad move rather than
+        // approximating it: BestOrderedGotoDestNear is the same destination
+        // picker FloatMenuMakerMap.GotoLocationOption uses, and it is what
+        // spreads a group across neighbouring cells instead of stacking them
+        // all on the one that was clicked. PawnGotoAction is public static in
+        // this build (checked by reflection on Assembly-CSharp, along with
+        // BestOrderedGotoDestNear's three-argument shape).
+        //
+        // GoHere priority sorts this above our own Low entries, so the move
+        // is the first thing in the menu - which is where a player who was
+        // trying to move expects it.
+        private static FloatMenuOption MoveHereOption(List<Pawn> pawns, Map map, IntVec3 cell)
+        {
+            // Resolved now rather than in the closure: an option offering a
+            // move that no selected pawn can make is worse than no option.
+            var movers = new List<Pawn>();
+            foreach (Pawn p in pawns)
+            {
+                if (p == null || !p.Spawned || p.Map != map || p.Downed)
+                {
+                    continue;
+                }
+
+                // Danger.Deadly to match vanilla's goto check - a manual move
+                // order is allowed to walk somewhere dangerous
+                if (p.CanReach(cell, PathEndMode.OnCell, Danger.Deadly))
+                {
+                    movers.Add(p);
+                }
+            }
+
+            if (movers.Count == 0)
+            {
+                return null;
+            }
+
+            return new FloatMenuOption(
+                "Move here",
+                () =>
+                {
+                    foreach (Pawn p in movers)
+                    {
+                        IntVec3 dest = RCellFinder.BestOrderedGotoDestNear(cell, p, null);
+                        FloatMenuMakerMap.PawnGotoAction(cell, p, dest);
+                    }
+                },
+                MenuOptionPriority.GoHere);
         }
 
         // Greyed-out entry explaining why a sweep isn't on offer. Vanilla
