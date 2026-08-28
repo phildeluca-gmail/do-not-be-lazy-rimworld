@@ -10,12 +10,16 @@ its own instruments.
 
 - **Target:** RimWorld 1.5.4409, no DLC, ~60 mods
 - **Entries:** 41, across phases 0-7 (`T0.1` through `T7.6`)
-- **Status:** 5 passed - Phase 0 (2026-08-17) and T6.1 (2026-08-27).
-  T6.4 and T6.6 were also *observed* in the 08-27 log (no sweep ended on
-  its own, and none was meant to) but neither was run as written.
+- **Status:** 7 passed - Phase 0 (2026-08-17), T6.1, and T7.1 + T7.2
+  (all 2026-08-27). T6.4 and T6.6 were also *observed* in the 08-27 log
+  (no sweep ended on its own, and none was meant to) but neither was run
+  as written.
 - **Run Phase 7 first.** Added 2026-08-27 for the two ordered changes
   (work emanates from the click; a right-click meant to move pawns must
-  move pawns). Both outrank everything else in this file.
+  move pawns). Both outrank everything else in this file. **The drafted
+  half is done:** T7.1 and T7.2 passed 2026-08-27 and have moved to
+  Completed tests. **T7.3 through T7.6 are still outstanding** - T7.3 is
+  the undrafted half of the same report, T7.5 the centre-out change.
 - **Status:** 4 of 35 entries have passed - Phase 0, 2026-08-17, with
   T0.3 passing again 2026-08-21 on a fresh save (sow trace carried
   `plant=Plant_Rice`, no reflection warning). **Everything from Phase 1
@@ -622,31 +626,9 @@ The other pawns keep working targets outside that area.
 ## Phase 7 - The 2026-08-27 ordered changes · **RUN THIS FIRST**
 
 Both were ordered directly and both outrank every other phase in this
-file, Phase 6 included. Six entries. Full specification in
+file, Phase 6 included. Six entries; **T7.1 and T7.2 passed 2026-08-27**
+and have moved to Completed tests, leaving T7.3-T7.6. Full specification in
 `DoNotBeLazy_Architecture.md` section 0, "TOP PRIORITY".
-
-### T7.1 - A right-click moves a drafted squad again · **CORE, THE REPORT**
-
-**Setup.** Draft 3+ colonists. Stand them somewhere with filth or
-haulables nearby, so a `*` option would have been on offer.
-
-**Do.** Right-click a destination cell to move them into formation.
-
-**Pass.** They move. No float menu opens at all - the click behaves
-exactly as it does with the mod disabled.
-
-**Fail.** A menu opens, or they don't move. If the menu opens and its
-only entry is `* Clean until done`, the drafted suppression did not
-take - check that every pawn in the selection is actually drafted, since
-the gate is *all* drafted, not *any*.
-
-### T7.2 - The same, single drafted pawn · **CORE**
-
-**Do.** Draft one colonist, right-click a destination.
-
-**Pass.** They move with no menu. Vanilla auto-takes a menu whose options
-are all `autoTakeable`, and this is the path that was cancelled by any
-appended entry, greyed or not.
 
 ### T7.3 - An undrafted group can still be moved · **CORE, THE OTHER HALF**
 
@@ -743,6 +725,36 @@ Everything below has passed in a real game. Kept for the procedure and
 the pass/fail signatures, not because it needs running again. Nothing
 here gates a new session except T0.1, which is a precondition - see the
 Phase 0 pointer above.
+
+## Phase 7 - passed entries
+
+Both halves of the drafted-pawn report. **Reported passed by the user on
+2026-08-27**, on the 08-27 build (`de25c3a5`); no log was pulled for
+either, so the evidence is the observed behaviour, not a trace. The
+undrafted half of the same report, T7.3, has not been run.
+
+### T7.1 - A right-click moves a drafted squad again · **PASSED 2026-08-27**
+
+**Setup.** Draft 3+ colonists. Stand them somewhere with filth or
+haulables nearby, so a `*` option would have been on offer.
+
+**Do.** Right-click a destination cell to move them into formation.
+
+**Pass.** They move. No float menu opens at all - the click behaves
+exactly as it does with the mod disabled.
+
+**Fail.** A menu opens, or they don't move. If the menu opens and its
+only entry is `* Clean until done`, the drafted suppression did not
+take - check that every pawn in the selection is actually drafted, since
+the gate is *all* drafted, not *any*.
+
+### T7.2 - The same, single drafted pawn · **PASSED 2026-08-27**
+
+**Do.** Draft one colonist, right-click a destination.
+
+**Pass.** They move with no menu. Vanilla auto-takes a menu whose options
+are all `autoTakeable`, and this is the path that was cancelled by any
+appended entry, greyed or not.
 
 ## Phase 6 - passed entries
 

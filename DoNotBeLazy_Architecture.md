@@ -99,6 +99,11 @@ full:
 
 ### TOP PRIORITY, specified 2026-08-27 - the two ordered changes
 
+**Status as of 2026-08-27 evening: item B is PASSED in a real game
+(TEST_PLAN `T7.1`, `T7.2`); item A is built, building clean and still
+UNTESTED (`T7.5` was not run).** The undrafted half of B's report,
+`T7.3`, was also not run.
+
 Both were ordered directly by the user on 2026-08-27 and both outrank
 everything in "Diagnosed, NOT implemented" below. They are unrelated in
 mechanism and related in intent: **the player's mouse click is the
@@ -244,7 +249,8 @@ Full detail in `NEXT_SESSION.md` "Open items 3-5". Summary:
    vanilla's 500-600 tick `nextTickToSearchForIngredients` cooldown,
    which one transient ingredient miss turns into a permanent removal.
 4. **Drafted right-click can no longer move pawns.** **IMPLEMENTED
-   2026-08-27, untested in game - see "TOP PRIORITY" item B above**,
+   2026-08-27 and PASSED IN GAME 2026-08-27 evening (TEST_PLAN T7.1 and
+   T7.2) - see "TOP PRIORITY" item B above**,
    which also records that the bug is not limited to drafted pawns. Our
    non-`autoTakeable` options cancel `TryMakeFloatMenu`'s auto-take, and
    on multi-select they flip `TryMakeMultiSelectFloatMenu` from `false`

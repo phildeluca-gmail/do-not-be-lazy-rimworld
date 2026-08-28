@@ -1,22 +1,33 @@
-<!-- Pickup context for a fresh session. Session closed 2026-08-27: two ordered changes built (centre-out sweeps; right-click move), and the 08-22 pool fixes finally confirmed in a real game. Read this first, then CLAUDE.md's referenced docs as usual. -->
+<!-- Pickup context for a fresh session. Session closed 2026-08-27 evening, on short notice (machine shutting down): T7.1 and T7.2 PASSED in a real game, the installed DLL was confirmed already current, and five new mods were ordered as folders-only but not built. Read this first, then CLAUDE.md's referenced docs as usual. -->
 
 # Pickup: Do Not Be Lazy
 
-**This session is closed, 2026-08-27.** Everything below is committed
-and pushed. The two top-priority changes are written, building and
-**untested in a game** - the test session that happened this night ran
-the *old* DLL, so it tested none of them. It did, however, confirm the
-08-22 pool fixes in a real game for the first time. Resume it (standing-still
-ANSWERED from a real log, pool-discard + rescan fixed, logging gaps
-closed, wishlist started) with:
+**This session is closed, 2026-08-27 evening.** It was cut short - the
+user's machine was shutting down - so this file was written fast. What
+it says is accurate; it is just thinner than usual.
+
+**The headline: the drafted-pawn bug is fixed and proven.** T7.1 and
+T7.2 both passed in a real game on the 08-27 build. That is the first
+in-game confirmation of either ordered change. **T7.3 through T7.6 were
+not run** - T7.3 is the undrafted half of the same report and T7.5 is
+the centre-out change, so the centre-out work is still unproven.
+
+**Also settled:** the installed DLL was already current (see "The DLL
+was already copied" below), and `jobDiagnostics` is now OFF.
+
+**Left open:** five new mods were ordered as folders, and **no folder
+was built** - two scope questions went unanswered when the session
+ended. Full detail in `RW-Wishlist.md` entry 3; summary under "Start
+here next session" below. Resume this session with:
 
 ```
-claude --resume 92786a93-35e8-4bdb-b076-3e794ec4a752
+claude --resume c0e00c19-e139-4554-9d68-d05e7127b90f
 ```
 
 Earlier sessions, for reference only:
 
 ```
+OLD: claude --resume 92786a93-35e8-4bdb-b076-3e794ec4a752   (centre-out sweeps + right-click move built; 08-22 pool fixes confirmed)
 OLD: claude --resume 7254dd70-3fd5-4c55-a0f6-fcab3652315a   (standing-still answered, pool-discard + rescan fixed)
 OLD: claude --resume 6ed5db2f-8d09-4435-ab6c-2fb321b5823c   (menu findings 1+2, job diagnostics, /pull-logs)
 OLD: claude --resume 4b475e1d-24b5-48e9-94e4-f6ce4865faa9   (vehicle-packing diagnosis, TEST_PLAN conversion)
@@ -74,16 +85,27 @@ critical needs (hunger/rest/joy/mood).
   real log, and the cause was ours.** See "Open item 2" below - it is
   now a closed item kept for the record. The two fixes for it are
   written and building; **neither has run in a game.**
-- **The installed DLL needs recopying - the 2026-08-27 build is newer.**
-  Copy `DoNotBeLazy/Assemblies/DoNotBeLazy.dll` (+ `.pdb`) into
-  `E:\SteamLibrary\steamapps\common\RimWorld\Mods\DoNotBeLazy\Assemblies\`
-  and restart RimWorld before testing. The user does this step manually,
-  and `/pull-logs` step 1 checks it.
-  **Compare hashes, not the sentence above.** This line claimed "older
-  than the repo build" from 2026-08-23 through 2026-08-26 while the two
-  copies were byte-identical, and acting on it wasted a step. `md5sum`
-  both and believe the result:
+- **The installed DLL is CURRENT - do not re-copy on faith.** Verified
+  2026-08-27 evening: both copies are
+  `de25c3a5389a1c702206e78424207ffb`, and no `.cs` file is newer than
+  the DLL. The copy step (`DoNotBeLazy/Assemblies/DoNotBeLazy.dll` +
+  `.pdb` into
+  `E:\SteamLibrary\steamapps\common\RimWorld\Mods\DoNotBeLazy\Assemblies\`,
+  then restart RimWorld) is the user's, and `/pull-logs` step 1 checks
+  it - but it did not need doing this time.
+  **Compare hashes, not the sentence above.** This bullet has now been
+  wrong three times: it claimed "older than the repo build" from
+  2026-08-23 through 2026-08-26 while the copies were byte-identical,
+  and claimed it again on 08-27 when they were identical *again*.
+  Acting on it wasted a step each time. `md5sum` both and believe the
+  result:
   `md5sum DoNotBeLazy/Assemblies/DoNotBeLazy.dll "E:/SteamLibrary/steamapps/common/RimWorld/Mods/DoNotBeLazy/Assemblies/DoNotBeLazy.dll"`
+- **`jobDiagnostics` is OFF as of 2026-08-27 evening**, set directly in
+  `Mod_DoNotBeLazy_DoNotBeLazyMod.xml` under
+  `AppData\LocalLow\Ludeon Studios\RimWorld by Ludeon Studios\Config\`
+  with the game closed. `verboseLogging` stays `True`. That file lives
+  outside the repo, so it is **not** covered by any commit here.
+  Automatic Hunting was **not** disabled - that is still to do in-game.
 - **What shipped 2026-08-22 evening, all untested in game:**
   - `SweepManager.AssignNextTask` no longer consumes a pool target on
     failure (fix 1) - `RemoveAt` moved to after a job is created, with a
@@ -102,25 +124,40 @@ critical needs (hunger/rest/joy/mood).
   pause/resume loop works** (08-22 log, four pause/resume pairs), and as
   of the **2026-08-27 log the two 08-22 pool fixes are confirmed** - see
   "The 2026-08-27 log" below. That log also ran the job-pipeline census
-  for the first time.
+  for the first time. **New 2026-08-27 evening: T7.1 and T7.2 passed** -
+  a right-click moves a drafted squad, and a single drafted pawn, with no
+  menu. That is change B below, confirmed in play.
 - Still untested from before: **the sow fixes** (`cc502c9`) and the menu
   findings 1+2 fix. Phase 1 of the playtest plan has still not been run.
 
 ## Start here next session
 
-1. **Copy the DLL over and restart the game.** The 08-27 build
-   (`DE25C3A5389A1C702206E78424207FFB`) is newer than the installed copy
-   (`DA1EAD6142E46C0912381357F6CD434C`, the 08-23 build). **The 08-27
-   test session ran the old DLL and therefore tested none of the two
-   ordered changes.** Compare hashes, don't trust this line.
-2. **Turn `jobDiagnostics` OFF and disable Automatic Hunting** before
-   playing. Both are pure noise now and together they cost the 08-27 log
-   four message-limit gaps - see "The log message cap" below. Leave
-   `verboseLogging` on.
-3. **`TEST_PLAN.md` Phase 7, T7.1 through T7.6.** The two ordered
-   changes: a right-click meant to move pawns moves pawns, and sweep
-   work emanates from the clicked cell outward. T7.1 and T7.3 are the
-   reported bug; T7.5 is the ordered behaviour change.
+**Two live threads. The second is the one with an unanswered question
+in it, so read both before picking.**
+
+### Thread A - finish Phase 7
+
+1. **The DLL is already current - do not re-copy on faith.** Verified
+   2026-08-27 evening: repo and installed copies are both
+   `de25c3a5389a1c702206e78424207ffb`, and no `.cs` file is newer than
+   the DLL, so the build matches source too. The old step-1 instruction
+   claiming the installed copy was the 08-23 build (`da1ead61`) was
+   **wrong for the third time**. Run the `md5sum` before believing any
+   sentence in this file about which DLL is installed:
+   `md5sum DoNotBeLazy/Assemblies/DoNotBeLazy.dll "E:/SteamLibrary/steamapps/common/RimWorld/Mods/DoNotBeLazy/Assemblies/DoNotBeLazy.dll"`
+2. **`jobDiagnostics` is already OFF.** Set to `False` on 2026-08-27
+   evening directly in
+   `C:\Users\ninja\AppData\LocalLow\Ludeon Studios\RimWorld by Ludeon Studios\Config\Mod_DoNotBeLazy_DoNotBeLazyMod.xml`
+   while RimWorld was not running. `verboseLogging` stays `True`.
+   **This file is outside the repo and is not in the commit** - if the
+   game was open at any point since and overwrote it, check the value
+   again. **Automatic Hunting still needs disabling in-game**; that was
+   never done.
+3. **`TEST_PLAN.md` Phase 7, T7.3 through T7.6.** T7.1 and T7.2
+   **passed** and have moved to the Completed tests section at the
+   bottom of that file. T7.3 is the undrafted half of the same report
+   and is the next thing to run; T7.5 is the centre-out change, which
+   nothing has yet confirmed in a game.
 4. **Watch for the three deliberate behaviour changes.** Two from the
    rescan: sweeps run indefinitely (confirmed in the 08-27 log - not one
    sweep ended on its own), and a rescan uses the *requesting* pawn as
@@ -131,6 +168,31 @@ critical needs (hunger/rest/joy/mood).
    menu findings 1+2 feedback entries. Note a **fully drafted**
    selection now shows nothing at all by design, so don't test the
    greyed-entry path that way.
+
+### Thread B - the five new mods, ordered but NOT built
+
+Ordered verbatim on 2026-08-27: *"New mods coming, just build separate
+folders for each: Highlight Corpses With Tech; Notify Ripe (options:
+Ambrosia, Berries); Notify Still Being Attacked; Uninstall Hotkey; Menu
+Hotkeys."*
+
+**Nothing was created.** The order is a go-ahead for folders and
+explicitly not for behaviour. Two scope questions were put to the user,
+the dialog was dismissed, and the machine shut down before they were
+answered:
+
+- **How deep does each folder go** - bare directories, an architecture
+  doc stub only, a buildable empty scaffold mirroring `DoNotBeLazy/`, or
+  scaffold plus stub? Recommended: scaffold plus stub.
+- **Where do they live** - top-level in this repo, regrouped under
+  `Mods/<Name>/`, or separate repos? Recommended: top-level here, and
+  note in `CLAUDE.md` that the repo has become multi-mod.
+
+**Ask these two before building anything.** Full detail, plus a
+name-by-name reading of what each mod appears to mean and the overlap
+between *Menu Hotkeys* and wishlist entry 1 (`ConfigureKeys`), is in
+`RW-Wishlist.md` entry 3. Those readings are guesses from the names
+alone - do not build from them.
 
 ## The 2026-08-27 log: the 08-22 pool fixes are CONFIRMED
 
@@ -198,7 +260,7 @@ Contained by `GameComponentUtility`'s per-component try/catch. Zero
 all-cleaning session, since cleaning has no destination to reserve. That
 contrast is the same one that pinned the 08-22 diagnosis.
 
-## TOP PRIORITY, built 2026-08-27, untested in game
+## TOP PRIORITY, built 2026-08-27 - B is PASSED, A is not
 
 Two changes, both ordered directly rather than found in review, both
 outranking every open item below. Full specification in
@@ -211,7 +273,7 @@ and the mod was overriding it in both directions** - ignoring where they
 clicked when handing out work, and swallowing the click entirely when
 they meant to move.
 
-### A. Work emanates from the click
+### A. Work emanates from the click - **STILL UNTESTED** (T7.5)
 
 `AssignNextTask` picked each pawn's next target nearest to **the pawn**.
 `ScanCenter` - the clicked cell - built and rescanned the pool but never
@@ -233,7 +295,7 @@ possibly annoying at the maximum 50, which is what T7.6 exists to
 measure. The mitigation is designed and written down in the wishlist
 entry; **do not apply it without asking.**
 
-### B. A right-click meant to move pawns must move pawns
+### B. A right-click meant to move pawns must move pawns - **PASSED 2026-08-27**
 
 **Reported from play: "we always trigger clean or the underlying task
 when moving or trying to move to a formation."** This is review finding
@@ -466,7 +528,7 @@ unconditional `RemoveSweep`; give a null `JobOnThing` a strike against
 `MaxConsecutiveFailures` with a retry rather than ending the order. Same
 for the resume path in `AssignNextTask`.
 
-### 4. Drafted right-click can no longer move pawns - **BUILT 2026-08-27**
+### 4. Drafted right-click can no longer move pawns - **FIXED, PASSED 2026-08-27**
 
 **Implemented, untested in game. See "TOP PRIORITY" item B above**, which
 also records that the bug was wider than this entry describes: it does
