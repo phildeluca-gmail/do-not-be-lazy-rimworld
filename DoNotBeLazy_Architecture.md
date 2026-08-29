@@ -126,11 +126,25 @@ outward from the click. This graduates the `RW-Wishlist.md` entry
 settled the strict way, on the grounds that the click is an explicit
 order and guessing at a blend would make it less predictable, not more.
 
-**The accepted cost:** a pawn can walk past a target beside them to
-reach one nearer the click. Bounded by `sweepRadius` (default 16, max
-50), so at default it is a few seconds of walking; at radius 50 it is
-visible. Revisit with a blend only if the radius-50 case is actually
-played and actually annoys.
+**The cost, and how it stopped being permanent:** a pawn can walk past
+a target beside them to reach one nearer the click. Bounded by
+`sweepRadius` (default 16, max 50), so at default it is a few seconds
+of walking; at radius 50 it is visible.
+
+**Superseded 2026-08-29 - the player now chooses.** The old
+nearest-to-pawn rule is back as the second entry of a two-way radio
+group, `centerOutOrder` (3.4), defaulting to centre-out so nothing
+changes for an existing save. The cost above is now something a player
+opts out of rather than something the design absorbs. This also
+retires the standing "do not soften this without asking" note attached
+to the wishlist entry: the softening was asked for.
+
+**A blend was explicitly excluded from this change.** The third mode
+the wishlist proposed - a pawn takes anything within a few tiles of
+itself, otherwise centre-out - is *not* built and is not a third radio
+entry. Two hard modes forecloses nothing; add the blend only on a
+fresh order, and only if the radius-50 case is actually played and
+actually annoys.
 
 #### B. A right-click meant to move pawns must move pawns
 
@@ -1557,7 +1571,9 @@ Deliberately does **not** exclude drafted pawns (unlike the WorkGiver-based swee
 
 `CanConsume` branches on `thing.def.ingestible.drugCategory` (fixed 2026-08-15): non-drug food goes through `FoodUtility.WillEat` as before, but anything with a real drug category skips `WillEat` entirely (it's a food-appetite check and rejected every drug outright, which was the original bug - no `* Consume` was ever appearing for drugs) and instead only excludes Teetotalers (`pawn.story.traits.HasTrait(TraitDefOf.DrugDesire, -1)`), per explicit user request.
 
-**SweepManager.cs** - A `MapComponent` maintaining `Dictionary<Pawn, SweepOrder>`. `SweepOrder` holds a `WorkGiverDef` and a `SharedPool` (`List<LocalTargetInfo>`) - for area sweeps, every pawn assigned in the same `BeginSweep` call shares the same pool instance, so claiming a target for one pawn removes it for the rest of the group. **Target order is centre-out from the click as of 2026-08-27** (`NextTargetIndex`): the pool is ranked by distance from `ScanCenter` - the cell the player right-clicked - with distance from the requesting pawn used only to break ties between targets equidistant from the centre. It was nearest-to-*pawn* until then, which made a group sweep dissolve into each pawn tidying its own neighbourhood and left the pile the player pointed at to be cleared whenever. The known cost is a pawn walking past a nearby target to reach one closer to the click; bounded by `sweepRadius`, negligible at the default 16 and visible at the maximum 50. **A target only leaves the pool when a job is actually created for it, or when `TargetIsGone` says it no longer exists** (2026-08-22 evening) - a pawn refused for a transient reason skips it via a per-call `refused` set and leaves it for someone else. The pool also **rescans** from `ScanCenter`/`ScanRadius`, once per `AssignNextTask` call, whenever a pawn runs it dry; this applies to every area sweep, not just firefighting. Workstation orders carry an empty pool since bill continuation doesn't use it (see JobTrackerPatch below). `LocalTargetInfo` transparently covers both Thing and cell targets, so the pool/nearest-scan logic didn't need to change to support `GrowerSow` - only the two spots that branch on target type explicitly did: `AssignNextTask` calls `scanner.JobOnCell` instead of `JobOnThing` when `!target.HasThing`, and `TargetRefusalReason` (a bool `TargetStillValid` until 2026-08-22) checks cell bounds/area/sow-settings/reservation instead of Thing-specific checks (Destroyed, forbidden) for the same case, returning the name of the failing check so the trace can say why a target was skipped.
+**SweepManager.cs** - A `MapComponent` maintaining `Dictionary<Pawn, SweepOrder>`. `SweepOrder` holds a `WorkGiverDef` and a `SharedPool` (`List<LocalTargetInfo>`) - for area sweeps, every pawn assigned in the same `BeginSweep` call shares the same pool instance, so claiming a target for one pawn removes it for the rest of the group. **Target order is centre-out from the click as of 2026-08-27, and player-selectable as of 2026-08-29** (`NextTargetIndex`): in the default centre-out mode the pool is ranked by distance from `ScanCenter` - the cell the player right-clicked - with distance from the requesting pawn used only to break ties between targets equidistant from the centre. It was nearest-to-*pawn* until 08-27, which made a group sweep dissolve into each pawn tidying its own neighbourhood and left the pile the player pointed at to be cleared whenever. The known cost is a pawn walking past a nearby target to reach one closer to the click; bounded by `sweepRadius`, negligible at the default 16 and visible at the maximum 50 - **and as of 08-29 that cost is opt-out rather than accepted**, because the old nearest-to-pawn rule is back as the second half of the `centerOutOrder` setting (3.4).
+
+**The mode is stamped, not polled.** `SweepOrder.CenterOut` is read from settings once, inside `BeginAreaSweep`, and every subsequent `NextTargetIndex` call for that order uses the stamped value. Changing the setting mid-sweep therefore does nothing to sweeps already running; it applies from the next right-click. Chosen over reading settings live at each assignment on the user's explicit instruction: an order that silently re-orders itself under a running sweep is harder to reason about than one that keeps the rule it was given. Workstation orders take the constructor default - they carry an empty pool and never rank anything, so the value is inert there. **A target only leaves the pool when a job is actually created for it, or when `TargetIsGone` says it no longer exists** (2026-08-22 evening) - a pawn refused for a transient reason skips it via a per-call `refused` set and leaves it for someone else. The pool also **rescans** from `ScanCenter`/`ScanRadius`, once per `AssignNextTask` call, whenever a pawn runs it dry; this applies to every area sweep, not just firefighting. Workstation orders carry an empty pool since bill continuation doesn't use it (see JobTrackerPatch below). `LocalTargetInfo` transparently covers both Thing and cell targets, so the pool/nearest-scan logic didn't need to change to support `GrowerSow` - only the two spots that branch on target type explicitly did: `AssignNextTask` calls `scanner.JobOnCell` instead of `JobOnThing` when `!target.HasThing`, and `TargetRefusalReason` (a bool `TargetStillValid` until 2026-08-22) checks cell bounds/area/sow-settings/reservation instead of Thing-specific checks (Destroyed, forbidden) for the same case, returning the name of the failing check so the trace can say why a target was skipped.
 
 Job-to-job chaining is **event-driven**, not tick-polled: `JobTrackerPatch`'s postfix on `Pawn_JobTracker.EndCurrentJob` calls `SweepManager.Notify_JobEnded(pawn, condition)` when a swept pawn's job ends, and that pulls the next target off the shared pool. A non-`Succeeded` condition does not necessarily end the sweep - see `TargetFailureIsRecoverable` and the 2026-08-16 status entry for how target-scoped failures are separated from pawn-scoped interrupts, and for the per-pawn `MaxConsecutiveFailures` bound that keeps the retry path from recursing.
 
@@ -1626,6 +1642,7 @@ drop. Three responsibilities:
 ### 3.4 Settings (ModSettings)
 
 - `sweepRadius` - int, default 16, configurable 1-50
+- `centerOutOrder` - bool, default **true** (added 2026-08-29) - which end of the sweep the work starts from. Rendered as a two-entry radio group, not a checkbox, because the two modes are alternatives rather than an on/off: **"Nearest to click"** (default, drawn first) ranks targets by distance from the clicked cell; **"Nearest to pawn"** ranks by distance from the pawn asking, ignoring the click. Read once, at click time, and stamped onto the `SweepOrder` - see `SweepOrder.CenterOut` in 3.2. Defaulting true means no existing save changes behaviour. **The setting changes the order of service only, never the pool**: the radius is still measured from the click in both modes, and rescans still use `ScanCenter`. The tooltip has to say so, or a player will read "nearest to pawn" as re-centring the sweep on the pawn.
 - `needThreshold` - float, default 0.05 (5%), configurable 0.01-0.20 - covers hunger/recreation/rest
 - `moodThreshold` - float, default 0.10 (10%), configurable 0.01-0.30 - separate slider, mood specifically (added 2026-08-15 per user request; mood dropping to 5% is already close to a mental break, so it gets its own, higher default)
 - `verboseLogging` - bool, default false - the `[DoNotBeLazy]` sweep trace. Hardcoded false until 2026-08-16, which made every `Logger.Message` a no-op; see section 0.

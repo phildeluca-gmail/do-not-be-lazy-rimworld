@@ -9,7 +9,7 @@ that - ordered so each phase only runs once the one above it has proven
 its own instruments.
 
 - **Target:** RimWorld 1.5.4409, no DLC, ~60 mods
-- **Entries:** 41, across phases 0-7 (`T0.1` through `T7.6`)
+- **Entries:** 44, across phases 0-8 (`T0.1` through `T8.3`)
 - **Status:** 7 passed - Phase 0 (2026-08-17), T6.1, and T7.1 + T7.2
   (all 2026-08-27). T6.4 and T6.6 were also *observed* in the 08-27 log
   (no sweep ended on its own, and none was meant to) but neither was run
@@ -20,10 +20,13 @@ its own instruments.
   half is done:** T7.1 and T7.2 passed 2026-08-27 and have moved to
   Completed tests. **T7.3 through T7.6 are still outstanding** - T7.3 is
   the undrafted half of the same report, T7.5 the centre-out change.
-- **Status:** 4 of 35 entries have passed - Phase 0, 2026-08-17, with
-  T0.3 passing again 2026-08-21 on a fresh save (sow trace carried
+- **Phase 0 detail**, since the count above doesn't carry it: T0.3
+  passed again 2026-08-21 on a fresh save (sow trace carried
   `plant=Plant_Rice`, no reflection warning). **Everything from Phase 1
   down is outstanding, and Phase 1 has never been run.**
+- **Phase 8 added 2026-08-29** for the sweep-ordering radio group
+  (`centerOutOrder`). Three entries, none run. T8.1 shares a setup with
+  T7.5, so run the two together.
 - **Reading order, changed 2026-08-26.** Passed tests were moved to
   **Completed tests** at the bottom of the file. Phases run in the order
   they appear here; the only thing below that still bears on a new
@@ -712,8 +715,73 @@ plus the test ID and what you saw on screen. Whole logs cost enormous
 context to reach a two-line answer - the trace exists so they aren't
 needed.
 
+---
+
+## Phase 8 - The 2026-08-29 ordering setting
+
+Three entries. **T8.1 is the one that matters**; the other two guard the
+two ways this change can be wrong without looking wrong.
+
+Note that T7.5 and T7.6 in Phase 7 still test the centre-out *rule* -
+they are unaffected by this phase and still unrun. Run them at the
+default setting, which is the same behaviour they were written against.
+
+### T8.1 - The setting actually changes the order · **CORE**
+
+**Setup.** T7.5's setup exactly: a long line or wide field of filth, 20+
+tiles, pawns at the far end. Doing it as a back-to-back pair against
+T7.5 is the point - same field, same click, one setting changed.
+
+**Do.** Options > Mod Settings > Do Not Be Lazy. Confirm the radio group
+reads **"Sweep works outward from:"** with **the click** selected (that
+is the default). Set it to **Each pawn**. Close settings. Select the
+pawns, right-click the far end, `* Clean until done`.
+
+**Pass.** Pawns clean what is under their own feet first and the field
+finishes everywhere at once - the pre-08-27 behaviour. Flip back to
+**The click**, repeat, and T7.5's centre-out result returns.
+
+**Fail.** Identical behaviour in both modes. That means the setting is
+not reaching `NextTargetIndex` - most likely the order was stamped
+before the setting was read, or the wrong branch is wired.
+
+**Read it in the trace.** The `BeginSweep` line now names the mode:
+`... , order centre-out` or `... , order pawn-nearest`. If that word
+does not match the radio button you just set, stop - nothing after it
+means anything.
+
+### T8.2 - The mode is stamped, not polled · **THE DESIGN DECISION**
+
+**Why.** The mode is read once at click time and fixed for the life of
+the order. That is deliberate (architecture doc 3.2), and it is
+invisible unless tested for directly.
+
+**Do.** Start a long sweep with **The click** selected. While it is
+still running, open settings, switch to **Each pawn**, close settings,
+and watch the same sweep.
+
+**Pass.** The running sweep keeps clearing in rings from the original
+click. The *next* right-click sweep uses pawn-nearest.
+
+**Fail.** The running sweep changes ordering mid-flight. That means
+`NextTargetIndex` is reading settings live instead of `order.CenterOut`.
+
+### T8.3 - The setting survives a restart
+
+**Do.** Set **Each pawn**, quit RimWorld fully, relaunch, reopen the
+settings window.
+
+**Pass.** Still **Each pawn**. A fresh install/profile with no saved
+value shows **The click**.
+
+**Fail.** Reverts to the default. `Scribe_Values.Look` for
+`centerOutOrder` is missing or misnamed.
+
+---
+
 **Phase 7 comes before all of it** - it is the only phase covering work
-that was ordered rather than found. After that, phases 1 and 2 are the
+that was ordered rather than found. **Phase 8 goes with it**: T8.1 is
+cheap and shares a setup with T7.5. After that, phases 1 and 2 are the
 pass that decides whether commit `cc502c9` holds; Phase 0 already passed
 and is at the bottom of the file. Phases 3 through 5 can follow
 separately if time is short.

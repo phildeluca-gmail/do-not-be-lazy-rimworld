@@ -16,6 +16,7 @@ Load all referenced documents at the start of every session and before any imple
 
 Not required session reading, but know it exists:
 
+- `./DNBL-manifest.md` - Inventory of every discrete functional piece of code in the Do Not Be Lazy mod, by file, with line numbers and one line on what each unit does. A lookup table for "where does X live" and "what already exists" - read it before grepping the whole tree, and before adding anything that might duplicate something already there. It records what exists, never why; rationale stays in the architecture doc. Line numbers drift, names do not. **Update it in the same change that adds, removes or renames a functional unit** - a stale manifest is worse than none.
 - `./RW-Wishlist.md` - Capture file for RimWorld mod ideas that have not been architected. **Nothing in it is a go-ahead.** An entry graduates by being written up in the relevant architecture document first. Read it when asked about future work, or before proposing something that might already be parked there.
 
 ---

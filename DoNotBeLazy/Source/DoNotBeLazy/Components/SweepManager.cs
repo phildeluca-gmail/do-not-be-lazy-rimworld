@@ -34,6 +34,14 @@ namespace DoNotBeLazy.Components
         public IntVec3 ScanCenter { get; }
         public int ScanRadius { get; }
 
+        // Which ordering rule NextTargetIndex uses for this order: true
+        // ranks by distance from ScanCenter, false by distance from the
+        // requesting pawn. Read from settings once, at BeginAreaSweep, and
+        // fixed for the life of the order - flipping the setting mid-sweep
+        // deliberately doesn't re-order a sweep already under way. Inert on
+        // workstation orders; their pool is empty and nothing ranks it.
+        public bool CenterOut { get; }
+
         // Targets already put back in the pool once after the WorkGiver
         // answered with blocker-clearing work instead of the task itself.
         // Capped at one re-queue each: a cell that can never be satisfied
@@ -41,13 +49,14 @@ namespace DoNotBeLazy.Components
         public HashSet<LocalTargetInfo> Requeued { get; } = new HashSet<LocalTargetInfo>();
 
         public SweepOrder(WorkGiverDef workGiverDef, List<LocalTargetInfo> sharedPool, Thing workstationTarget = null,
-            IntVec3 scanCenter = default(IntVec3), int scanRadius = 0)
+            IntVec3 scanCenter = default(IntVec3), int scanRadius = 0, bool centerOut = true)
         {
             WorkGiverDef = workGiverDef;
             SharedPool = sharedPool;
             WorkstationTarget = workstationTarget;
             ScanCenter = scanCenter;
             ScanRadius = scanRadius;
+            CenterOut = centerOut;
         }
     }
 
@@ -327,6 +336,10 @@ namespace DoNotBeLazy.Components
             // (forbidden, reservable, radius) don't vary by which pawn asked
             Pawn driver = eligiblePawns[0];
             int radius = DoNotBeLazyMod.Settings.sweepRadius;
+
+            // read once, here, and stamped onto the order below - see
+            // SweepOrder.CenterOut
+            bool centerOut = DoNotBeLazyMod.Settings.centerOutOrder;
             List<LocalTargetInfo> pool = TaskScanner.FindTargets(clickCell, radius, map, workGiverDef, driver);
             if (pool.Count == 0)
             {
@@ -346,11 +359,11 @@ namespace DoNotBeLazy.Components
                 return;
             }
 
-            Logger.Message($"BeginSweep {workGiverDef.defName}: {pool.Count} targets, {eligiblePawns.Count} pawns");
+            Logger.Message($"BeginSweep {workGiverDef.defName}: {pool.Count} targets, {eligiblePawns.Count} pawns, order {(centerOut ? "centre-out" : "pawn-nearest")}");
 
             // every area sweep rescans when a pawn runs the pool dry now, not
             // just fire
-            var order = new SweepOrder(workGiverDef, pool, null, clickCell, radius);
+            var order = new SweepOrder(workGiverDef, pool, null, clickCell, radius, centerOut);
 
             // was: break out of this loop the moment the pool emptied, which
             // is why "* haul until done" with 36 selected sent exactly one
@@ -525,7 +538,7 @@ namespace DoNotBeLazy.Components
                 // pawn was refused was hauled fine by another a minute
                 // later. Only claim a target once we actually have a job for
                 // it; everything else is skipped, not consumed.
-                int i = NextTargetIndex(order.ScanCenter, pawn.Position, order.SharedPool, refused);
+                int i = NextTargetIndex(order.ScanCenter, pawn.Position, order.SharedPool, refused, order.CenterOut);
                 if (i < 0)
                 {
                     // nothing left that this pawn hasn't already been refused.
@@ -745,14 +758,23 @@ namespace DoNotBeLazy.Components
         //
         // skip = targets this pawn has already been refused this call. -1
         // means the pool holds nothing left for them.
-        private static int NextTargetIndex(IntVec3 center, IntVec3 pawnPos, List<LocalTargetInfo> pool, HashSet<LocalTargetInfo> skip)
+        // The only place sweep order is decided. centerOut ranks by distance
+        // from the clicked cell (the pawn only breaks ties); otherwise it's
+        // the pre-08-27 rule, nearest to the pawn, ignoring the click. Which
+        // one applies is stamped on the order at click time - see
+        // SweepOrder.CenterOut.
+        //
+        // Same loop for both rather than two: the pawn distance is needed in
+        // either case, so the modes differ only in which value ranks and
+        // which one is the tie-break.
+        private static int NextTargetIndex(IntVec3 center, IntVec3 pawnPos, List<LocalTargetInfo> pool, HashSet<LocalTargetInfo> skip, bool centerOut)
         {
             // LengthHorizontalSquared is int on IntVec3, so these compare
             // exactly and the tie-break branch is a real equality, not a
             // float one that never fires
             int best = -1;
-            int bestFromCenter = 0;
-            int bestFromPawn = 0;
+            int bestPrimary = 0;
+            int bestSecondary = 0;
 
             for (int i = 0; i < pool.Count; i++)
             {
@@ -765,13 +787,16 @@ namespace DoNotBeLazy.Components
                 int fromCenter = (cell - center).LengthHorizontalSquared;
                 int fromPawn = (cell - pawnPos).LengthHorizontalSquared;
 
+                int primary = centerOut ? fromCenter : fromPawn;
+                int secondary = centerOut ? fromPawn : fromCenter;
+
                 if (best < 0
-                    || fromCenter < bestFromCenter
-                    || (fromCenter == bestFromCenter && fromPawn < bestFromPawn))
+                    || primary < bestPrimary
+                    || (primary == bestPrimary && secondary < bestSecondary))
                 {
                     best = i;
-                    bestFromCenter = fromCenter;
-                    bestFromPawn = fromPawn;
+                    bestPrimary = primary;
+                    bestSecondary = secondary;
                 }
             }
 

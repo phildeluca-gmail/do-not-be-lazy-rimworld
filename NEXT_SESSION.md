@@ -1,24 +1,52 @@
-<!-- Pickup context for a fresh session. Session closed 2026-08-27 evening, on short notice (machine shutting down): T7.1 and T7.2 PASSED in a real game, the installed DLL was confirmed already current, and five new mods were ordered as folders-only but not built. Read this first, then CLAUDE.md's referenced docs as usual. -->
+<!-- Pickup context for a fresh session. Updated 2026-08-29: the sweep-ordering radio group was built and DNBL-manifest.md was created. The 08-27 material below it still stands. Read this first, then CLAUDE.md's referenced docs as usual. -->
 
 # Pickup: Do Not Be Lazy
 
-**This session is closed, 2026-08-27 evening.** It was cut short - the
-user's machine was shutting down - so this file was written fast. What
-it says is accurate; it is just thinner than usual.
+**Latest work, 2026-08-29: the centre-out rule is now a player
+setting, and there is a new code manifest.** Two things happened:
 
-**The headline: the drafted-pawn bug is fixed and proven.** T7.1 and
-T7.2 both passed in a real game on the 08-27 build. That is the first
-in-game confirmation of either ordered change. **T7.3 through T7.6 were
-not run** - T7.3 is the undrafted half of the same report and T7.5 is
-the centre-out change, so the centre-out work is still unproven.
+1. **`centerOutOrder`, a two-entry radio group** in mod settings -
+   "Sweep works outward from: **The click** / **Each pawn**". Default is
+   the click, so nothing changes for an existing save; picking "Each
+   pawn" restores the pre-08-27 nearest-to-pawn rule. **The mode is
+   stamped onto the `SweepOrder` at click time**, on explicit
+   instruction, so flipping the setting does not re-order a sweep
+   already running. Built, **builds clean, and NOT yet run in a game** -
+   `TEST_PLAN.md` Phase 8 (T8.1-T8.3) is new and untouched.
+   `DoNotBeLazy_Architecture.md` 3.2 and 3.4 carry the detail. **A blend
+   mode was explicitly excluded** - no third radio entry without a fresh
+   order.
+2. **`DNBL-manifest.md` is new** - an inventory of every discrete
+   functional unit in the mod, by file, with line numbers. Read it
+   before grepping the tree or adding something that may already exist.
+   **It must be updated in the same change that adds, removes or renames
+   a unit**; CLAUDE.md now says so.
 
-**Also settled:** the installed DLL was already current (see "The DLL
-was already copied" below), and `jobDiagnostics` is now OFF.
+**The DLL was rebuilt 2026-08-29 and the installed copy was NOT
+updated.** Run the `md5sum` in Thread A step 1 before believing
+anything about which build the game has - the repo copy is now ahead.
+
+---
+
+**The 08-27 session is closed.** It was cut short - the user's machine
+was shutting down - so what follows was written fast. It is accurate,
+just thinner than usual.
+
+**The 08-27 headline: the drafted-pawn bug is fixed and proven.** T7.1
+and T7.2 both passed in a real game on the 08-27 build. That is the
+first in-game confirmation of either ordered change. **T7.3 through T7.6
+were not run** - T7.3 is the undrafted half of the same report and T7.5
+is the centre-out change, so the centre-out rule itself is *still*
+unproven in game, setting or no setting.
+
+**Also settled 08-27:** the installed DLL was current as of that date
+(see "The DLL was already copied" below - no longer true after the 08-29
+rebuild), and `jobDiagnostics` is OFF.
 
 **Left open:** five new mods were ordered as folders, and **no folder
 was built** - two scope questions went unanswered when the session
 ended. Full detail in `RW-Wishlist.md` entry 3; summary under "Start
-here next session" below. Resume this session with:
+here next session" below. Resume the 08-27 session with:
 
 ```
 claude --resume c0e00c19-e139-4554-9d68-d05e7127b90f
@@ -132,15 +160,25 @@ critical needs (hunger/rest/joy/mood).
 
 ## Start here next session
 
-**Two live threads. The second is the one with an unanswered question
-in it, so read both before picking.**
+**Two live threads. Thread A grew on 2026-08-29 - it now covers Phase 8
+as well as Phase 7. Thread B is the one with an unanswered question in
+it, so read both before picking.**
 
-### Thread A - finish Phase 7
+### Thread A - finish Phase 7, and now Phase 8
 
-1. **The DLL is already current - do not re-copy on faith.** Verified
-   2026-08-27 evening: repo and installed copies are both
-   `de25c3a5389a1c702206e78424207ffb`, and no `.cs` file is newer than
-   the DLL, so the build matches source too. The old step-1 instruction
+0. **The DLL is NOT current as of 2026-08-29.** The 08-29 rebuild put
+   the ordering setting into the repo copy and nothing was copied to
+   the game. Copy it before testing anything, then re-check the md5 -
+   step 1's "already current" note below describes 08-27 and is now
+   stale. **T8.1 shares its setup with T7.5, so run those two together
+   and get the centre-out rule and its setting proven in one pass.**
+   Phase 8 is three entries, none run.
+
+1. **The DLL was current on 2026-08-27 - the note below is kept for the
+   md5 command, not the conclusion.** Verified
+   2026-08-27 evening: repo and installed copies were both
+   `de25c3a5389a1c702206e78424207ffb`, and no `.cs` file was newer than
+   the DLL, so the build matched source too. The old step-1 instruction
    claiming the installed copy was the 08-23 build (`da1ead61`) was
    **wrong for the third time**. Run the `md5sum` before believing any
    sentence in this file about which DLL is installed:
@@ -281,19 +319,25 @@ ordered it, so a group sweep dissolved into each pawn tidying its own
 feet and the pile the player pointed at was cleared whenever.
 
 `NearestTargetIndex` is now `NextTargetIndex(center, pawnPos, pool,
-skip)`: rank by distance from `ScanCenter`, break ties on distance from
-the pawn. The pool empties in rings outward from the click. One file,
-`SweepManager.cs`.
+skip, centerOut)`: in the default mode, rank by distance from
+`ScanCenter` and break ties on distance from the pawn. The pool empties
+in rings outward from the click. One file, `SweepManager.cs`.
 
-**This graduates the `RW-Wishlist.md` "focus from centre out" entry**,
-and it settles that entry's open weighting question the strict way,
-against that entry's own recommendation. The objection it raised was
-accepted, not answered: **a pawn can now walk past a target beside them
-to reach one nearer the click, and that is the pass condition, not a
-bug.** It is bounded by `sweepRadius` - trivial at the default 16,
+**This graduated the `RW-Wishlist.md` "focus from centre out" entry**,
+settling that entry's open weighting question the strict way, against
+that entry's own recommendation. **A pawn can walk past a target beside
+them to reach one nearer the click, and that is the pass condition, not
+a bug.** It is bounded by `sweepRadius` - trivial at the default 16,
 possibly annoying at the maximum 50, which is what T7.6 exists to
-measure. The mitigation is designed and written down in the wishlist
-entry; **do not apply it without asking.**
+measure.
+
+**Amended 2026-08-29: the cost is now opt-out, not accepted.** The old
+nearest-to-pawn rule came back as the second half of the
+`centerOutOrder` radio group, and the standing "do not soften without
+asking" note is retired - the softening was asked for. What is *still*
+unbuilt and still needs a fresh order is the **blend** (a pawn takes
+anything within a few tiles of itself, otherwise centre-out). It was
+deliberately excluded from the 08-29 change, not forgotten.
 
 ### B. A right-click meant to move pawns must move pawns - **PASSED 2026-08-27**
 

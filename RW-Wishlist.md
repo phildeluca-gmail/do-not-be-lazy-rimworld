@@ -82,14 +82,21 @@ the click is an order, and a blend makes the result less predictable
 rather than more. Distance from `ScanCenter` ranks; distance from the
 pawn only breaks ties.
 
-**The objection this entry raised still stands and was accepted, not
-answered:** strict centre-out can send a pawn past a target beside them
-to reach one nearer the click. It is bounded by `sweepRadius`, so it is
-seconds at the default 16 and visible at the maximum 50. The cheap
+**The objection this entry raised was answered on 2026-08-29 by making
+it a setting.** Strict centre-out can send a pawn past a target beside
+them to reach one nearer the click; that is now the default half of a
+two-way radio group (`centerOutOrder`, architecture doc 3.4), with the
+old nearest-to-pawn rule as the other half. The mode is stamped onto
+the `SweepOrder` at click time, so it does not change under a running
+sweep. **The "do not soften without asking" note that used to sit here
+is retired - the softening was asked for.**
+
+**The blend is still not built and still needs a fresh order.** The
 mitigation this entry proposed - let a pawn take anything within a few
-tiles of itself first - is still the right first move if that turns out
-to matter in play. Do not apply it without asking; it is a deliberate
-softening of an explicit instruction.
+tiles of itself first, otherwise centre-out - was explicitly excluded
+from the 08-29 change rather than forgotten. It would be a third radio
+entry. Only worth doing if the radius-50 case is actually played and
+actually annoys.
 
 **Still unbuilt, still paired with this:** `showSweepOverlay` remains a
 settings checkbox that draws nothing. Now that the sweep genuinely
