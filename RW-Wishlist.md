@@ -105,33 +105,41 @@ real.
 
 ---
 
-## 3. Five new mods, ordered 2026-08-27 - **FOLDERS NOT YET BUILT**
+## 3. Five new mods, ordered 2026-08-27 - **FOLDERS BUILT 2026-08-29**
 
 **Asked for, verbatim:** "New mods coming, just build separate folders
 for each: Highlight Corpses With Tech; Notify Ripe (options: Ambrosia,
 Berries); Notify Still Being Attacked; Uninstall Hotkey; Menu Hotkeys."
 
-**Status: ordered, blocked on two scope questions, nothing built.** The
-session ended before either was answered. The instruction is a
-go-ahead for *folders*, and explicitly not for behaviour - "just build
-separate folders" was the whole ask. Do not implement any of the five
-without a fresh order.
+**Status: folders built 2026-08-29. Behaviour still not ordered.** The
+instruction was a go-ahead for *folders*, and explicitly not for
+behaviour - "just build separate folders" was the whole ask. **Do not
+implement any of the five without a fresh order.**
 
-**The two unanswered questions.** They were put to the user and the
-dialog was dismissed, so both are still open:
+**Where the detail now lives.** Each mod has its own
+`<Name>_Architecture.md` at the repo root carrying the verbatim ask, the
+guess-from-the-name, and the questions that must be settled before it
+becomes a plan. **Those stubs supersede the summaries below** - the
+summaries are kept because this entry is the historical record.
 
-1. **How deep does each folder go?** Four readings, materially
-   different work: (a) bare empty directories; (b) folder plus a
-   `<Name>_Architecture.md` stub holding the verbatim ask, no code;
-   (c) a buildable scaffold mirroring `DoNotBeLazy/` - `About/About.xml`,
+**Both scope questions were answered 2026-08-29:**
+
+1. **How deep does each folder go?** Answered: **scaffold plus
+   architecture stub** - `About/About.xml`,
    `Source/<Name>/<Name>.csproj` pointing at `../../../lib`, a
-   `Core/<Name>Mod.cs` that loads and does nothing; (d) c plus b.
-   The recommendation given was (d), because this project's rule is that
-   an idea graduates by being written up in an architecture doc first.
-2. **Where do they live?** Five new top-level folders in this repo
-   beside `DoNotBeLazy/`; or a regrouping under `Mods/<Name>/` that also
-   moves `DoNotBeLazy` (this breaks the csproj `OutputPath` and the
-   installed-DLL copy step, so it is not free); or five separate repos.
+   `Core/<Name>Mod.cs` that loads and logs one line, plus a
+   `<Name>_Architecture.md` holding the verbatim ask. All five build
+   clean and produce a DLL - verified, though the first build of a
+   scaffold needs `/t:Restore,Rebuild` because no assets file exists yet.
+   (The options rejected were: bare directories; scaffold with no stub;
+   stubs with no code.)
+2. **Where do they live?** Answered: **top-level in this repo**, beside
+   `DoNotBeLazy/`. `CLAUDE.md` now opens with a multi-mod section, and
+   `.gitignore` was broadened from `DoNotBeLazy/Assemblies/*.dll` to
+   `*/Assemblies/*.dll` so a new mod folder is covered automatically.
+   (The options rejected were: a regrouping under `Mods/<Name>/` that
+   also moves `DoNotBeLazy` and breaks the csproj `OutputPath`; and five
+   separate repos.)
    The recommendation was this repo, top-level, with a note added to
    `CLAUDE.md` that the repo is now multi-mod. Precedent exists:
    `DoNotFreakOut_Architecture.md` already sits here for a second mod

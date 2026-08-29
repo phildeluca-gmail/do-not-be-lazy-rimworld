@@ -2,6 +2,11 @@
 
 # DNBL Manifest
 
+**Scope: the Do Not Be Lazy mod only.** The repo went multi-mod on
+2026-08-29, but the other five are empty scaffolds with nothing to
+inventory. Give one its own manifest when it grows behaviour, rather
+than widening this file.
+
 Every functional unit in `DoNotBeLazy/Source/DoNotBeLazy/`, by file. A
 unit is something that does one job and can be pointed at: a class, a
 method, a Harmony patch, or a piece of static state that outlives a

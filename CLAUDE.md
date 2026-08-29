@@ -6,6 +6,28 @@ This file governs how Claude Code operates in this project. Read it fully before
 
 ---
 
+## This repo is multi-mod as of 2026-08-29
+
+It is still named after Do Not Be Lazy, and Do Not Be Lazy is still the only mod with any behaviour in it. But five more now sit beside it at the top level, each as a buildable scaffold that loads and does nothing:
+
+`HighlightCorpsesWithTech/`, `NotifyRipe/`, `NotifyStillBeingAttacked/`, `UninstallHotkey/`, `MenuHotkeys/`
+
+**None of the five has agreed behaviour.** Each has a `<Name>_Architecture.md` stub at the repo root holding the verbatim ask and the questions still open. They were ordered as folders and explicitly not as behaviour. **Do not implement any of them without a fresh go-ahead**, and when one is ordered, answer its stub's section 3 questions before writing code.
+
+Layout for every mod, including new ones:
+
+```
+<Name>/
+  About/About.xml
+  Source/<Name>/<Name>.csproj      <- refs ../../../lib, OutputPath ../../Assemblies/
+  Source/<Name>/Core/<Name>Mod.cs
+<Name>_Architecture.md             <- repo root, beside the others
+```
+
+`lib/` is shared by all of them and is gitignored. Build output is ignored via `*/Assemblies/*.dll`, so a new mod folder is covered automatically. A scaffold needs `/t:Restore,Rebuild` on its first build; the assets file does not exist yet. This adds no NuGet packages and does not relax the no-NuGet rule below.
+
+---
+
 ## Referenced Documents
 
 Load all referenced documents at the start of every session and before any implementation work begins.

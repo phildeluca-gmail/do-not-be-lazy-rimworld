@@ -43,10 +43,11 @@ unproven in game, setting or no setting.
 (see "The DLL was already copied" below - no longer true after the 08-29
 rebuild), and `jobDiagnostics` is OFF.
 
-**Left open:** five new mods were ordered as folders, and **no folder
-was built** - two scope questions went unanswered when the session
-ended. Full detail in `RW-Wishlist.md` entry 3; summary under "Start
-here next session" below. Resume the 08-27 session with:
+**Left open on 08-27, and CLOSED on 08-29:** five new mods were ordered
+as folders and no folder was built, because two scope questions went
+unanswered when the session ended. Both were answered 2026-08-29 and all
+five scaffolds now exist and build - see Thread B below. **Behaviour for
+those five is still not ordered.** Resume the 08-27 session with:
 
 ```
 claude --resume c0e00c19-e139-4554-9d68-d05e7127b90f
@@ -104,17 +105,24 @@ critical needs (hunger/rest/joy/mood).
   item 6 and these doc updates. Run `git log -1` and `git status`
   anyway rather than trusting this line: it has been stale twice and
   cost time both times.
-- **New file: `RW-Wishlist.md`** - capture for ideas that have not been
-  architected. Two entries so far (ConfigureKeys / interface changes;
-  Do Not Be Lazy focus from centre out). **Nothing in it is a
-  go-ahead**; an entry graduates by being written up in an architecture
-  doc first. Registered in `CLAUDE.md` as non-required reading.
+- **`RW-Wishlist.md`** - capture for ideas that have not been
+  architected. Three entries: ConfigureKeys / interface changes (still
+  not understood); focus from centre out (**graduated, built, and made a
+  setting 08-29**); the five new mods (**scaffolded 08-29, behaviour not
+  ordered**). **Nothing in it is a go-ahead**; an entry graduates by
+  being written up in an architecture doc first. Registered in
+  `CLAUDE.md` as non-required reading, alongside `DNBL-manifest.md`.
 - **2026-08-22 evening: the standing-still report is ANSWERED, from a
   real log, and the cause was ours.** See "Open item 2" below - it is
   now a closed item kept for the record. The two fixes for it are
   written and building; **neither has run in a game.**
-- **The installed DLL is CURRENT - do not re-copy on faith.** Verified
-  2026-08-27 evening: both copies are
+- **The installed DLL is STALE as of 2026-08-29** - the ordering-setting
+  rebuild is in the repo copy only, and nothing was copied to the game.
+  Copy it before testing. The bullet below describes 08-27 and its
+  *conclusion* is now wrong; its `md5sum` command and its warning are
+  still worth having.
+- **(08-27) The installed DLL was CURRENT - do not re-copy on faith.**
+  Verified 2026-08-27 evening: both copies were
   `de25c3a5389a1c702206e78424207ffb`, and no `.cs` file is newer than
   the DLL. The copy step (`DoNotBeLazy/Assemblies/DoNotBeLazy.dll` +
   `.pdb` into
@@ -161,8 +169,9 @@ critical needs (hunger/rest/joy/mood).
 ## Start here next session
 
 **Two live threads. Thread A grew on 2026-08-29 - it now covers Phase 8
-as well as Phase 7. Thread B is the one with an unanswered question in
-it, so read both before picking.**
+as well as Phase 7, and it is the only one with outstanding work.
+Thread B was unblocked and built the same day; what is left there is a
+decision, not a task.**
 
 ### Thread A - finish Phase 7, and now Phase 8
 
@@ -207,30 +216,43 @@ it, so read both before picking.**
    selection now shows nothing at all by design, so don't test the
    greyed-entry path that way.
 
-### Thread B - the five new mods, ordered but NOT built
+### Thread B - the five new mods: FOLDERS BUILT, behaviour still not ordered
 
 Ordered verbatim on 2026-08-27: *"New mods coming, just build separate
 folders for each: Highlight Corpses With Tech; Notify Ripe (options:
 Ambrosia, Berries); Notify Still Being Attacked; Uninstall Hotkey; Menu
 Hotkeys."*
 
-**Nothing was created.** The order is a go-ahead for folders and
-explicitly not for behaviour. Two scope questions were put to the user,
-the dialog was dismissed, and the machine shut down before they were
-answered:
+**Done 2026-08-29.** Both scope questions were answered: scaffold plus
+architecture stub, top-level in this repo. Five folders now sit beside
+`DoNotBeLazy/`, each with `About/About.xml`, a csproj pointing at
+`../../../lib`, and a `Core/<Name>Mod.cs` that loads and logs one line.
+**All five build clean and produce a DLL** - the first build of any
+scaffold needs `/t:Restore,Rebuild`, since no assets file exists yet.
+`.gitignore` now uses `*/Assemblies/*.dll` so new mod folders are
+covered automatically, and `CLAUDE.md` opens with a multi-mod section.
 
-- **How deep does each folder go** - bare directories, an architecture
-  doc stub only, a buildable empty scaffold mirroring `DoNotBeLazy/`, or
-  scaffold plus stub? Recommended: scaffold plus stub.
-- **Where do they live** - top-level in this repo, regrouped under
-  `Mods/<Name>/`, or separate repos? Recommended: top-level here, and
-  note in `CLAUDE.md` that the repo has become multi-mod.
-
-**Ask these two before building anything.** Full detail, plus a
-name-by-name reading of what each mod appears to mean and the overlap
-between *Menu Hotkeys* and wishlist entry 1 (`ConfigureKeys`), is in
-`RW-Wishlist.md` entry 3. Those readings are guesses from the names
+**The order was for folders and explicitly not for behaviour, and that
+has not changed. Do not implement any of the five without a fresh
+order.** Each now has its own `<Name>_Architecture.md` at the repo root
+holding the verbatim ask, the guess-from-the-name, and the questions
+that must be settled first. Those readings are guesses from the names
 alone - do not build from them.
+
+**Two things worth knowing before any of them starts:**
+
+- **`MenuHotkeys` overlaps wishlist entry 1** (`ConfigureKeys -
+  interface changes`) and may be the same idea restated. Its stub says
+  so. Settle the two together; a second mod patching the float menu that
+  Do Not Be Lazy already owns invites conflicts.
+- **None of the five has a `Defs/` folder, and neither does Do Not Be
+  Lazy.** `UninstallHotkey` and `MenuHotkeys` both want a
+  `KeyBindingDef`, so whichever is built first writes the first XML in
+  this repo.
+
+**Not yet done for these five:** none is installed to the game
+directory, so none has been seen to load in RimWorld. The scaffolds
+build; that is all that has been verified.
 
 ## The 2026-08-27 log: the 08-22 pool fixes are CONFIRMED
 

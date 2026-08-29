@@ -1,8 +1,10 @@
 # Build artifacts
 bin/
 obj/
-DoNotBeLazy/Assemblies/*.dll
-DoNotBeLazy/Assemblies/*.pdb
+# repo went multi-mod 2026-08-29 - match every mod folder, not just
+# DoNotBeLazy, or a new scaffold silently commits its build output
+*/Assemblies/*.dll
+*/Assemblies/*.pdb
 *.user
 
 # Reference DLLs (copyrighted third-party/game files - not ours to redistribute)

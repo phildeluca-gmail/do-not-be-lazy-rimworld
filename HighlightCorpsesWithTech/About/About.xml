@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<ModMetaData>
+  <packageId>phildeluca.highlightcorpseswithtech</packageId>
+  <name>Highlight Corpses With Tech</name>
+  <author>Phil DeLuca</author>
+  <supportedVersions>
+    <li>1.5</li>
+  </supportedVersions>
+  <description>Scaffold only - this mod has no behaviour yet. Ordered 2026-08-27, scaffolded 2026-08-29. See HighlightCorpsesWithTech_Architecture.md in the repo root for the verbatim ask and the questions still open.</description>
+  <!-- No modDependencies yet. Add the Harmony block here (copy it from
+       DoNotBeLazy/About/About.xml) if and when this mod actually patches
+       something - declaring a dependency it does not use is noise. -->
+</ModMetaData>
