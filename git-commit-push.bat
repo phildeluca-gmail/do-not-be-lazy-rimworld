@@ -1,8 +1,10 @@
 @echo off
 :: ============================================================
-:: git-commit-generic.bat
+:: git-commit-push.bat
 :: Stage, commit, and push this repository.
 :: Double-click to run.
+::
+:: Repo: https://github.com/phildeluca-gmail/do-not-be-lazy-rimworld
 ::
 :: 2026-08-16: was still staging "SpotTheDifference Files/" from
 :: another project. That pathspec matches nothing here, so nothing
