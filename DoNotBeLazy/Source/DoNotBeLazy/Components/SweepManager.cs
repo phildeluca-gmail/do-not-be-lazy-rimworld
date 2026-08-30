@@ -12,11 +12,11 @@ namespace DoNotBeLazy.Components
     // SharedPool is the live, shared candidate list for the whole sweep -
     // every pawn in the same sweep call (BeginSweep) points at the same
     // List instance, so claiming a target for one pawn removes it for
-    // everyone else. Workstation orders get an empty pool - bill
-    // continuation while it's the same bill happens entirely in
-    // JobTrackerPatch re-asking the scanner for the same bill giver, but
-    // WorkstationTarget is still needed here to resume that same station
-    // after a need-pause (see AssignNextTask).
+    // everyone else. Workstation orders get an empty pool - there is
+    // nothing to fan out across, only one station - and WorkstationTarget
+    // is the whole order: AssignNextTask re-asks that same station for the
+    // next bill, for the haul-off it wants done first, and again when the
+    // pawn comes back from a need-pause.
     public class SweepOrder
     {
         public WorkGiverDef WorkGiverDef { get; }
@@ -95,6 +95,17 @@ namespace DoNotBeLazy.Components
         // share of the shared pool, forever. Half an in-game day.
         private const int MaxPauseTicks = 30000;
 
+        // How long to leave a workstation order alone after the station had
+        // no job to give. Vanilla parks a bill for
+        // WorkGiver_DoBill.ReCheckFailedBillTicksRange (500-600 ticks,
+        // confirmed as a static IntRange on that class in this build) after
+        // any failed ingredient search, and a teammate standing on the stack
+        // for a moment is enough to cause one - so the first null answer
+        // usually means "ask again in ten seconds", not "this bench is
+        // finished". Just past the top of that range; MaxConsecutiveFailures
+        // caps it at eight tries, about eighty seconds.
+        private const int WorkstationRetryTicks = 600;
+
         private readonly Dictionary<Pawn, SweepOrder> activeSweeps = new Dictionary<Pawn, SweepOrder>();
 
         // Per-pawn, not per-order: a SweepOrder is shared across everyone in
@@ -111,6 +122,16 @@ namespace DoNotBeLazy.Components
         // (was a HashSet, and resumption was "first job end after a pause
         // wins". That's the bug - see Notify_JobEnded.)
         private readonly Dictionary<Pawn, int> pausedForNeed = new Dictionary<Pawn, int>();
+
+        // Workstation orders whose station answered null, and the tick to ask
+        // it again on. A workstation order has no pool, so nothing else would
+        // ever bring the pawn back: before this existed the first null answer
+        // ended the order outright, which is half of "they don't return to
+        // the bench". While an entry is here the pawn is working for vanilla,
+        // so Notify_JobEnded ignores their job ends - otherwise the next
+        // thing they finished would re-ask the station immediately and burn
+        // the whole retry budget in a few seconds.
+        private readonly Dictionary<Pawn, int> workstationRetryAt = new Dictionary<Pawn, int>();
 
         // TryTakeOrderedJob interrupts whatever the pawn is doing right now,
         // and that fires EndCurrentJob(InterruptForced) -> JobTrackerPatch's
@@ -152,8 +173,43 @@ namespace DoNotBeLazy.Components
                 if (pawn.Dead || pawn.Downed || pawn.InMentalState || pawn.Drafted || pawn.Map != map)
                 {
                     RemoveSweep(pawn);
+                    continue;
                 }
+
+                TryWorkstationRetry(pawn);
             }
+        }
+
+        // The one piece of chaining that is not event-driven, and it has to
+        // be: a workstation order waiting out a bill's ingredient cooldown
+        // has no job of its own to end, so there is no event to hang it on.
+        private void TryWorkstationRetry(Pawn pawn)
+        {
+            if (!workstationRetryAt.TryGetValue(pawn, out int dueAt))
+            {
+                return;
+            }
+
+            // a need outranks a retry, and the resume path in
+            // Notify_JobEnded calls AssignNextTask itself, which re-arms the
+            // retry if the station still has nothing. Holding both at once
+            // deadlocks the pawn: Notify_JobEnded returns early while a retry
+            // is pending, so the pause would never be cleared. Checked ahead
+            // of the clock so the window is one tick pass, not ten seconds.
+            if (pausedForNeed.ContainsKey(pawn))
+            {
+                workstationRetryAt.Remove(pawn);
+                return;
+            }
+
+            if (Find.TickManager.TicksGame < dueAt || !activeSweeps.TryGetValue(pawn, out SweepOrder order))
+            {
+                return;
+            }
+
+            workstationRetryAt.Remove(pawn);
+            Logger.Message($"{pawn.LabelShort}: asking {order.WorkstationTarget?.LabelShort} for work again ({order.WorkGiverDef.defName})");
+            AssignNextTask(pawn, order);
         }
 
         public bool TryGetActiveSweep(Pawn pawn, out SweepOrder order)
@@ -173,6 +229,7 @@ namespace DoNotBeLazy.Components
             activeSweeps.Remove(pawn);
             pausedForNeed.Remove(pawn);
             consecutiveFailures.Remove(pawn);
+            workstationRetryAt.Remove(pawn);
         }
 
         public bool IsPaused(Pawn pawn)
@@ -264,11 +321,12 @@ namespace DoNotBeLazy.Components
                     continue;
                 }
 
-                // empty pool - see SweepOrder comment. billGiver is kept so
-                // AssignNextTask can re-ask this same station after a
-                // need-pause; a fresh assignment always clears any leftover
-                // pause state from a previous order
+                // empty pool - see SweepOrder comment. billGiver is the
+                // order: every job after this one comes from AssignNextTask
+                // re-asking this same station. A fresh assignment always
+                // clears leftover pause and retry state from a previous order
                 pausedForNeed.Remove(pawn);
+                workstationRetryAt.Remove(pawn);
                 activeSweeps[pawn] = new SweepOrder(workGiverDef, new List<LocalTargetInfo>(), billGiver);
 
                 // whole workstation path used to emit nothing at all - a
@@ -385,6 +443,14 @@ namespace DoNotBeLazy.Components
                 return;
             }
 
+            // waiting out a workstation cooldown. Whatever just ended is
+            // vanilla's work rather than ours, and TryWorkstationRetry owns
+            // this pawn until the clock runs out.
+            if (workstationRetryAt.ContainsKey(pawn))
+            {
+                return;
+            }
+
             // the condition is what decides continue-vs-stop, and "the pawn
             // wandered off" reports are almost always answered by this line
             Logger.Message($"{pawn.LabelShort}: job ended {condition} ({order.WorkGiverDef.defName})");
@@ -421,16 +487,15 @@ namespace DoNotBeLazy.Components
                 return;
             }
 
-            // workstation orders end here unconditionally - JobTrackerPatch
-            // already tried requeuing the same bill giver and came up empty,
-            // or the job didn't succeed. Either way there's no pool to draw
-            // the next target from.
-            if (order.WorkGiverDef.Worker is WorkGiver_DoBill)
-            {
-                RemoveSweep(pawn);
-                return;
-            }
-
+            // Workstation orders used to end here unconditionally, on the
+            // reasoning that JobTrackerPatch had already re-asked the bill
+            // giver and come up empty. It hadn't: that continuation only
+            // fired for a job whose def was DoBill, and the job that actually
+            // ends a bill at a bench with product still on it is the
+            // HaulToCell the WorkGiver asks for first. So every bill sweep
+            // died on its first job end. They take the same path as
+            // everything else now - AssignNextTask re-asks the station
+            // instead of drawing from a pool.
             if (condition == JobCondition.Succeeded)
             {
                 consecutiveFailures.Remove(pawn);
@@ -508,13 +573,21 @@ namespace DoNotBeLazy.Components
                     return;
                 }
 
+                // whatever the pawn just finished, ask the station what it
+                // wants next - the bill itself, the haul-off it insists on
+                // first, or a refuel. The old code read a null here as the
+                // end of the order; see WorkstationHadNoJob for why it
+                // usually isn't one.
                 Job resumeJob = scanner.JobOnThing(pawn, order.WorkstationTarget, true);
                 if (resumeJob == null)
                 {
-                    RemoveSweep(pawn);
+                    WorkstationHadNoJob(pawn, order);
                     return;
                 }
 
+                consecutiveFailures.Remove(pawn);
+                workstationRetryAt.Remove(pawn);
+                Logger.Message($"{pawn.LabelShort}: {resumeJob.def.defName} at {order.WorkstationTarget.LabelShort} ({order.WorkGiverDef.defName})");
                 GiveJob(pawn, resumeJob);
                 return;
             }
@@ -628,6 +701,44 @@ namespace DoNotBeLazy.Components
             // their last line.
             Logger.Message($"{pawn.LabelShort}: nothing left within {order.ScanRadius} of {order.ScanCenter}, ending sweep ({order.WorkGiverDef.defName})");
             RemoveSweep(pawn);
+        }
+
+        // A workstation order has no pool to fall back on, so a null answer
+        // from the station used to end it on the spot. Most nulls are
+        // temporary - see WorkstationRetryTicks - so ask again shortly
+        // instead, unless the bench genuinely has no work queued, which is
+        // the ending "until the bills are done" is supposed to have.
+        //
+        // BillStack.AnyShouldDoNow is vanilla's own "is anything on this
+        // bench worth doing" test (verified as a no-argument property in this
+        // build). It accounts for suspended bills and for a repeat count
+        // already met, and it is deliberately not affected by the ingredient
+        // cooldown - which is exactly the distinction needed here.
+        private void WorkstationHadNoJob(Pawn pawn, SweepOrder order)
+        {
+            string station = order.WorkstationTarget.LabelShort;
+
+            if (!(order.WorkstationTarget is IBillGiver billGiver)
+                || billGiver.BillStack == null
+                || !billGiver.BillStack.AnyShouldDoNow)
+            {
+                Logger.Message($"{pawn.LabelShort}: no bills left at {station}, ending sweep ({order.WorkGiverDef.defName})");
+                RemoveSweep(pawn);
+                return;
+            }
+
+            consecutiveFailures.TryGetValue(pawn, out int failures);
+            failures++;
+            if (failures >= MaxConsecutiveFailures)
+            {
+                Logger.Message($"{pawn.LabelShort}: {station} gave no job {failures} times running, ending sweep ({order.WorkGiverDef.defName})");
+                RemoveSweep(pawn);
+                return;
+            }
+
+            consecutiveFailures[pawn] = failures;
+            workstationRetryAt[pawn] = Find.TickManager.TicksGame + WorkstationRetryTicks;
+            Logger.Message($"{pawn.LabelShort}: no job at {station} (try {failures}), asking again in {WorkstationRetryTicks} ticks");
         }
 
         // The pool is built once, against one driver pawn, at sweep start.

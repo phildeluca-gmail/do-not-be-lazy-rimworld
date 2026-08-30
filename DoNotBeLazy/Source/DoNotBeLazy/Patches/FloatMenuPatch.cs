@@ -244,6 +244,24 @@ namespace DoNotBeLazy.Patches
 
                 var scanner = (WorkGiver_Scanner)def.Worker;
                 LocalTargetInfo target = FindTargetWithJob(eligiblePawns, def, scanner, cell, thingsHere, out string failReason, out Thing failThing);
+
+                // Cleaning is asked for by area, not by tile. Ordered
+                // 2026-08-30: clicking a filthy floor should offer to clear
+                // the snow a few tiles over too, and clicking a snowy one
+                // should offer the filth - "when both exist in the radius"
+                // was the wording. Every other work type still needs the
+                // clicked cell to answer for itself, which is what keeps
+                // this off the general per-click cost open item 6 warns
+                // about: at most two probes, and only when the click itself
+                // came back empty.
+                if (!target.IsValid
+                    && IsCleaningWork(def)
+                    && TaskScanner.HasTargetInRadius(cell, Core.DoNotBeLazyMod.Settings.sweepRadius, map, def, eligiblePawns[0]))
+                {
+                    Logger.Message($"{def.defName}: nothing on the clicked cell, but the radius has work - offering anyway");
+                    target = cell;
+                }
+
                 if (!target.IsValid)
                 {
                     if (failReason != null && feedback.Count < MaxFeedbackOptions)
@@ -251,6 +269,16 @@ namespace DoNotBeLazy.Patches
                         feedback.Add(DisabledOption(def, failThing?.LabelShort, failReason));
                     }
                     continue;
+                }
+
+                // The thing under the cursor was refused even though the
+                // sweep is on offer - the radius fallback above is the only
+                // way both can be true. Say so anyway: "I clicked the
+                // firefoam and they cleaned everything except the firefoam"
+                // is exactly the report this is here to prevent.
+                if (failReason != null && feedback.Count < MaxFeedbackOptions)
+                {
+                    feedback.Add(DisabledOption(def, failThing?.LabelShort, failReason));
                 }
 
                 string label = def.label.NullOrEmpty() ? def.defName : def.label.CapitalizeFirst();
@@ -295,6 +323,14 @@ namespace DoNotBeLazy.Patches
                     options.Insert(0, move);
                 }
             }
+        }
+
+        // CleanFilth and CleanClearSnow in vanilla, plus anything a mod
+        // files under the same work type. Read off the WorkTypeDef rather
+        // than listing defNames so a modded cleaning giver comes along.
+        private static bool IsCleaningWork(WorkGiverDef def)
+        {
+            return def?.workType?.defName == "Cleaning";
         }
 
         private static bool AllDrafted(List<Pawn> pawns)
@@ -647,6 +683,21 @@ namespace DoNotBeLazy.Patches
                             {
                                 failReason = JobFailReason.Reason;
                                 failThing = thing;
+                            }
+                            else if (failReason == null && FilthCompat.IsFilthCleaning(def))
+                            {
+                                // WorkGiver_CleanFilth writes no
+                                // JobFailReason at all - it just returns
+                                // false - so its two gates are invisible
+                                // unless we name them ourselves. The
+                                // home-area one is why firefoam sprayed
+                                // outside the home area offers nothing to
+                                // anybody, vanilla's own menu included.
+                                failReason = FilthCompat.RefusalReason(thing);
+                                if (failReason != null)
+                                {
+                                    failThing = thing;
+                                }
                             }
                             else if (failReason == null && firefighting && thing is Fire)
                             {

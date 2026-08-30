@@ -47,7 +47,19 @@ namespace DoNotBeLazy.Utility
             return target.Cell.ContainsStaticFire(map);
         }
 
-        public static List<LocalTargetInfo> FindTargets(IntVec3 center, int radius, Map map, WorkGiverDef workGiverDef, Pawn forPawn)
+        // Does this WorkGiver have anything at all to do inside the radius?
+        // Asked at menu-build time, where the answer decides whether an entry
+        // is offered - so it stops at the first hit rather than building a
+        // pool nobody has asked for yet.
+        public static bool HasTargetInRadius(IntVec3 center, int radius, Map map, WorkGiverDef workGiverDef, Pawn forPawn)
+        {
+            return FindTargets(center, radius, map, workGiverDef, forPawn, 1).Count > 0;
+        }
+
+        // limit > 0 stops the scan as soon as that many targets exist. Zero -
+        // the sweep's own call - means "everything", which is what a pool
+        // needs.
+        public static List<LocalTargetInfo> FindTargets(IntVec3 center, int radius, Map map, WorkGiverDef workGiverDef, Pawn forPawn, int limit = 0)
         {
             var results = new List<LocalTargetInfo>();
 
@@ -72,15 +84,22 @@ namespace DoNotBeLazy.Utility
             // so both branches can contribute to the same pool
             if (workGiverDef.scanCells)
             {
-                ScanCells(center, radius, radiusSquared, map, scanner, forPawn, allowedArea, results);
+                ScanCells(center, radius, radiusSquared, map, scanner, forPawn, allowedArea, results, limit);
             }
 
-            if (workGiverDef.scanThings)
+            if (workGiverDef.scanThings && (limit <= 0 || results.Count < limit))
             {
-                ScanThings(center, radiusSquared, map, workGiverDef, scanner, forPawn, allowedArea, results);
+                ScanThings(center, radiusSquared, map, workGiverDef, scanner, forPawn, allowedArea, results, limit);
             }
 
-            Core.Logger.Message($"scan {workGiverDef.defName} r={radius} at {center} for {forPawn.LabelShort}: {results.Count - before} targets");
+            // a limited scan is a menu probe, and one of those runs per
+            // cleaning def per right-click - the caller logs the answer, not
+            // the asking
+            if (limit <= 0)
+            {
+                Core.Logger.Message($"scan {workGiverDef.defName} r={radius} at {center} for {forPawn.LabelShort}: {results.Count - before} targets");
+            }
+
             return results;
         }
 
@@ -89,10 +108,15 @@ namespace DoNotBeLazy.Utility
         // crops) is the case that needs it: scanCells=true, scanThings=false,
         // and the target cell has nothing on it (that's the whole point -
         // it's empty farmland waiting for a seed).
-        private static void ScanCells(IntVec3 center, int radius, float radiusSquared, Map map, WorkGiver_Scanner scanner, Pawn forPawn, Area allowedArea, List<LocalTargetInfo> results)
+        private static void ScanCells(IntVec3 center, int radius, float radiusSquared, Map map, WorkGiver_Scanner scanner, Pawn forPawn, Area allowedArea, List<LocalTargetInfo> results, int limit)
         {
             foreach (IntVec3 cell in GenRadial.RadialCellsAround(center, radius, true))
             {
+                if (limit > 0 && results.Count >= limit)
+                {
+                    return;
+                }
+
                 if (!cell.InBounds(map))
                 {
                     continue;
@@ -153,7 +177,7 @@ namespace DoNotBeLazy.Utility
         // construction and bills included. Iterating that straight was an
         // NRE. Vanilla's JobGiver_Work does the same thing we do here: fall
         // back to the thing lister.
-        private static void ScanThings(IntVec3 center, float radiusSquared, Map map, WorkGiverDef workGiverDef, WorkGiver_Scanner scanner, Pawn forPawn, Area allowedArea, List<LocalTargetInfo> results)
+        private static void ScanThings(IntVec3 center, float radiusSquared, Map map, WorkGiverDef workGiverDef, WorkGiver_Scanner scanner, Pawn forPawn, Area allowedArea, List<LocalTargetInfo> results, int limit)
         {
             // the burning-target filter below would throw out every single
             // candidate here - the target IS the fire
@@ -177,6 +201,11 @@ namespace DoNotBeLazy.Utility
 
             foreach (Thing thing in candidates)
             {
+                if (limit > 0 && results.Count >= limit)
+                {
+                    return;
+                }
+
                 if (thing == null || thing.Map != map)
                 {
                     continue;
