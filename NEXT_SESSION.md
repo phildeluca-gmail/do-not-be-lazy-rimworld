@@ -223,14 +223,30 @@ folders for each: Highlight Corpses With Tech; Notify Ripe (options:
 Ambrosia, Berries); Notify Still Being Attacked; Uninstall Hotkey; Menu
 Hotkeys."*
 
-**Done 2026-08-29.** Both scope questions were answered: scaffold plus
-architecture stub, top-level in this repo. Five folders now sit beside
-`DoNotBeLazy/`, each with `About/About.xml`, a csproj pointing at
-`../../../lib`, and a `Core/<Name>Mod.cs` that loads and logs one line.
-**All five build clean and produce a DLL** - the first build of any
-scaffold needs `/t:Restore,Rebuild`, since no assets file exists yet.
-`.gitignore` now uses `*/Assemblies/*.dll` so new mod folders are
-covered automatically, and `CLAUDE.md` opens with a multi-mod section.
+**Done 2026-08-29, then restructured the same day.** Both scope
+questions were answered - scaffold plus architecture stub, and initially
+top-level in this repo. Five folders were built, each with
+`About/About.xml`, a csproj pointing at `../../../lib`, and a
+`Core/<Name>Mod.cs` that loads and logs one line. **All five build clean
+and produce a DLL**; the first build of any scaffold needs
+`/t:Restore,Rebuild`, since no assets file exists yet.
+
+**Then the location answer was reversed: one standalone repo per mod.**
+Each depends on nothing but Harmony and vanilla RimWorld, and no
+copyrighted DLL is ever committed - `lib/` is gitignored in every repo
+and rebuilt locally by `setup-lib.bat`. See the repo table in
+`CLAUDE.md`.
+
+- **Highlight Corpses With Tech has moved out** to
+  `RimWorld-HighlightCorpsesWithTech/`, pushed to
+  `github.com/phildeluca-gmail/highlight-corpses-with-tech-rimworld`.
+  **It is designed** (rot ruled out by reading the installed R3 mod) but
+  still has no behaviour.
+- **The other four are still in this repo, pending their own repos.**
+  Split each one out as soon as its repo exists. They are not part of
+  Do Not Be Lazy and should gain no behaviour while parked here.
+- **This repo's remote changed** to
+  `github.com/phildeluca-gmail/do-not-be-lazy-rimworld`.
 
 **The order was for folders and explicitly not for behaviour, and that
 has not changed. Do not implement any of the five without a fresh

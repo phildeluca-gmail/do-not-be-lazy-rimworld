@@ -105,7 +105,7 @@ real.
 
 ---
 
-## 3. Five new mods, ordered 2026-08-27 - **FOLDERS BUILT 2026-08-29**
+## 3. Five new mods, ordered 2026-08-27 - **BUILT AND SPLIT 2026-08-29**
 
 **Asked for, verbatim:** "New mods coming, just build separate folders
 for each: Highlight Corpses With Tech; Notify Ripe (options: Ambrosia,
@@ -117,10 +117,18 @@ behaviour - "just build separate folders" was the whole ask. **Do not
 implement any of the five without a fresh order.**
 
 **Where the detail now lives.** Each mod has its own
-`<Name>_Architecture.md` at the repo root carrying the verbatim ask, the
+`<Name>_Architecture.md` carrying the verbatim ask, the
 guess-from-the-name, and the questions that must be settled before it
-becomes a plan. **Those stubs supersede the summaries below** - the
-summaries are kept because this entry is the historical record.
+becomes a plan - in this repo for the four still parked here, and in its
+own repo for Highlight Corpses With Tech. **Those stubs supersede the
+summaries below** - the summaries are kept because this entry is the
+historical record.
+
+**Highlight Corpses With Tech is no longer a guess.** It was fully
+designed on 2026-08-29 and its stub is now a real architecture document
+in `RimWorld-HighlightCorpsesWithTech/`. Notably, reading the installed
+Reclaim/Reuse/Recycle mod proved rot is irrelevant to it. Still no
+behaviour implemented.
 
 **Both scope questions were answered 2026-08-29:**
 
@@ -133,17 +141,24 @@ summaries are kept because this entry is the historical record.
    scaffold needs `/t:Restore,Rebuild` because no assets file exists yet.
    (The options rejected were: bare directories; scaffold with no stub;
    stubs with no code.)
-2. **Where do they live?** Answered: **top-level in this repo**, beside
-   `DoNotBeLazy/`. `CLAUDE.md` now opens with a multi-mod section, and
-   `.gitignore` was broadened from `DoNotBeLazy/Assemblies/*.dll` to
-   `*/Assemblies/*.dll` so a new mod folder is covered automatically.
-   (The options rejected were: a regrouping under `Mods/<Name>/` that
-   also moves `DoNotBeLazy` and breaks the csproj `OutputPath`; and five
-   separate repos.)
-   The recommendation was this repo, top-level, with a note added to
-   `CLAUDE.md` that the repo is now multi-mod. Precedent exists:
-   `DoNotFreakOut_Architecture.md` already sits here for a second mod
-   that was never scaffolded.
+2. **Where do they live?** Answered twice on 2026-08-29, and the second
+   answer is the live one. **First:** top-level in this repo. **Then
+   reversed the same day - one standalone repo per mod**, each depending
+   on nothing but Harmony and vanilla RimWorld. See the table in
+   `CLAUDE.md`. `.gitignore` was broadened from
+   `DoNotBeLazy/Assemblies/*.dll` to `*/Assemblies/*.dll` on the way
+   through, which is still right either way.
+
+   **Highlight Corpses With Tech has already moved out** to
+   `RimWorld-HighlightCorpsesWithTech/` and
+   `github.com/phildeluca-gmail/highlight-corpses-with-tech-rimworld`.
+   The other four are still here **only because their repos do not exist
+   yet** - split each one the moment its repo is created. Naming: repo
+   `<kebab-name>-rimworld`, folder `RimWorld-<PascalName>`.
+
+   Note `DoNotFreakOut_Architecture.md` still sits in this repo for a
+   sixth mod that was never scaffolded. Under the one-repo-per-mod rule
+   it should move out too, whenever it becomes real.
 
 **What each name appears to mean.** All five are guesses from the name
 alone - **do not build from these.** Recorded so the reading isn't

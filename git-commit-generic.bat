@@ -53,6 +53,22 @@ if errorlevel 1 (
     exit /b 1
 )
 
+:: 2026-08-29: pull before push. Without this a change made on another
+:: machine or on GitHub turns into a rejected push and a confusing error
+:: at the very end of the run.
+echo.
+echo Pulling remote changes before push...
+git pull --rebase
+if errorlevel 1 (
+    echo.
+    echo ERROR: pull/rebase failed - you probably have a conflict.
+    echo Your commit exists locally and is NOT on GitHub.
+    echo Resolve the conflict, then run "git rebase --continue" and
+    echo "git push".
+    pause
+    exit /b 1
+)
+
 git push
 if errorlevel 1 (
     echo.

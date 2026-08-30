@@ -6,25 +6,48 @@ This file governs how Claude Code operates in this project. Read it fully before
 
 ---
 
-## This repo is multi-mod as of 2026-08-29
+## One repo per mod - policy set 2026-08-29
 
-It is still named after Do Not Be Lazy, and Do Not Be Lazy is still the only mod with any behaviour in it. But five more now sit beside it at the top level, each as a buildable scaffold that loads and does nothing:
+**Every mod gets its own standalone GitHub repo.** This reverses the "keep them all here" decision made earlier the same day; the user's instruction is that each repo stands alone, depending on nothing but Harmony and vanilla RimWorld.
 
-`HighlightCorpsesWithTech/`, `NotifyRipe/`, `NotifyStillBeingAttacked/`, `UninstallHotkey/`, `MenuHotkeys/`
+| Mod | Repo | Local folder |
+|---|---|---|
+| Do Not Be Lazy | `github.com/phildeluca-gmail/do-not-be-lazy-rimworld` | `RimWorld-DoNotBeLazy/` (this one) |
+| Highlight Corpses With Tech | `github.com/phildeluca-gmail/highlight-corpses-with-tech-rimworld` | `RimWorld-HighlightCorpsesWithTech/` |
+| Notify Ripe | not yet created | still here, pending split |
+| Notify Still Being Attacked | not yet created | still here, pending split |
+| Uninstall Hotkey | not yet created | still here, pending split |
+| Menu Hotkeys | not yet created | still here, pending split |
 
-**None of the five has agreed behaviour.** Each has a `<Name>_Architecture.md` stub at the repo root holding the verbatim ask and the questions still open. They were ordered as folders and explicitly not as behaviour. **Do not implement any of them without a fresh go-ahead**, and when one is ordered, answer its stub's section 3 questions before writing code.
+Naming convention, follow it: repo `<kebab-name>-rimworld`, local folder `RimWorld-<PascalName>`.
 
-Layout for every mod, including new ones:
+**The four uncreated ones still sit in this repo** as buildable scaffolds. They are here only because they have nowhere to go yet - they are not part of Do Not Be Lazy. **Split each one out as soon as its repo exists**; do not add behaviour to any of them while they live here.
+
+**None of them has agreed behaviour.** Each has a `<Name>_Architecture.md` stub holding the verbatim ask and the open questions. They were ordered as folders and explicitly not as behaviour. **Do not implement any without a fresh go-ahead.**
+
+### Standalone repo layout
 
 ```
-<Name>/
-  About/About.xml
-  Source/<Name>/<Name>.csproj      <- refs ../../../lib, OutputPath ../../Assemblies/
-  Source/<Name>/Core/<Name>Mod.cs
-<Name>_Architecture.md             <- repo root, beside the others
+RimWorld-<Name>/                     <- repo root
+  <Name>/                            <- copy THIS into RimWorld/Mods/
+    About/About.xml
+    Assemblies/                      <- build output, gitignored
+    Source/<Name>/<Name>.csproj      <- refs ../../../lib, OutputPath ../../Assemblies/
+    Source/<Name>/Core/<Name>Mod.cs
+  lib/                               <- gitignored, populated by setup-lib.bat
+  <Name>_Architecture.md
+  README.md
+  setup-lib.bat
+  git-commit-push.bat
 ```
 
-`lib/` is shared by all of them and is gitignored. Build output is ignored via `*/Assemblies/*.dll`, so a new mod folder is covered automatically. A scaffold needs `/t:Restore,Rebuild` on its first build; the assets file does not exist yet. This adds no NuGet packages and does not relax the no-NuGet rule below.
+The csproj path `../../../lib` resolves identically here and in a standalone repo, so **splitting a mod out needs no csproj change**.
+
+### Never commit the reference DLLs
+
+`lib/` holds `Assembly-CSharp.dll`, `UnityEngine.dll`, `UnityEngine.CoreModule.dll` and `0Harmony.dll`. **These are copyrighted and are not ours to redistribute.** Every repo gitignores `lib/` and ships a `setup-lib.bat` that copies them out of the developer's own RimWorld install and the Harmony Workshop mod. If you ever find a DLL staged, stop and fix the ignore rule.
+
+Build output is ignored via `*/Assemblies/*.dll`, so a new mod folder is covered automatically. A fresh scaffold or clone needs `/t:Restore,Rebuild` on its first build; the assets file does not exist yet. Restore adds no NuGet packages and does not relax the no-NuGet rule below.
 
 ---
 
@@ -94,12 +117,18 @@ If a task falls outside the scope of both documents, ask before making assumptio
 
 ## Git
 
-Repository setup is manual. The developer creates the repo on GitHub and runs `git init` / `git remote add` before Claude Code handles commits.
+**The developer creates the repo on GitHub.** The GitHub CLI (`gh`) is *not* installed on this machine - only git and GitHub Desktop - so Claude Code cannot create a remote repo itself. Once the empty repo exists, Claude Code can do `git init` / `git remote add` / commit / push.
+
+Remote for this repo: `https://github.com/phildeluca-gmail/do-not-be-lazy-rimworld.git` (renamed 2026-08-29 from `do-not-be-lazy`; GitHub redirects the old URL, but the remote here has been updated to the new one).
 
 For commits during a session, use:
 ```
 git add -A && git commit -m "message" && git push
 ```
+
+**The developer's own route is `git-commit-generic.bat`** in this repo (`git-commit-push.bat` in the split-out ones). It stages, refuses to commit nothing, shows the diffstat, prompts for a message, commits, pulls with rebase, then pushes - stopping with a distinct error at each step. Every repo gets one; keep them in step when one is improved.
+
+**Before pushing, confirm no reference DLL is staged.** See the "Never commit the reference DLLs" rule above.
 
 ---
 

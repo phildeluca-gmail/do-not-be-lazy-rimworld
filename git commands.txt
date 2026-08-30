@@ -1,1 +1,20 @@
  ! git add -A && git commit -m "your message" && git push
+
+Easier: double-click git-commit-generic.bat. It stages, shows what it is
+about to commit, prompts for a message, commits, pulls with rebase, then
+pushes - and stops with a clear error at whichever step fails.
+
+Repo:  https://github.com/phildeluca-gmail/do-not-be-lazy-rimworld
+       (renamed 2026-08-29 from do-not-be-lazy; the old URL redirects,
+        but the remote here points at the new one)
+
+One repo per mod as of 2026-08-29. Split-out mods have the same script
+under the name git-commit-push.bat:
+
+  Highlight Corpses With Tech
+    ..\RimWorld-HighlightCorpsesWithTech
+    https://github.com/phildeluca-gmail/highlight-corpses-with-tech-rimworld
+
+First build after a fresh clone needs a restore pass:
+  msbuild <csproj> /t:Restore,Rebuild
+and lib\ must be populated first - run setup-lib.bat.
