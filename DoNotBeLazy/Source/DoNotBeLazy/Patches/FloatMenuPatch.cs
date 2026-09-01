@@ -283,11 +283,18 @@ namespace DoNotBeLazy.Patches
 
                 string label = def.label.NullOrEmpty() ? def.defName : def.label.CapitalizeFirst();
 
+                // "until done" is wrong for a scanner and would be read as
+                // "until the scan bar fills" - there is no bar. The order
+                // ends on a find, so the option says which ending it means.
+                string ending = ScannerCompat.IsScannerWork(def)
+                    ? " until it finds something"
+                    : " until done";
+
                 WorkGiverDef capturedDef = def;
                 LocalTargetInfo capturedTarget = target;
                 Map capturedMap = map;
                 options.Add(new FloatMenuOption(
-                    "* " + label + " until done",
+                    "* " + label + ending,
                     () =>
                     {
                         SweepManager mgr = capturedMap.GetComponent<SweepManager>();
@@ -578,6 +585,15 @@ namespace DoNotBeLazy.Patches
                 return false;
             }
             if (scanner is WorkGiver_DoBill)
+            {
+                return true;
+            }
+            // The two scanners are workType Research, which is deliberately
+            // not in the supported set - adding it would drag the research
+            // bench in with them, and a research bench has no "until done"
+            // to sweep toward. Matched by worker class instead, same as
+            // WorkGiver_DoBill above. See ScannerCompat.
+            if (ScannerCompat.IsScannerWork(def))
             {
                 return true;
             }

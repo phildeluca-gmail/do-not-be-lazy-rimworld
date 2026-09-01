@@ -48,6 +48,12 @@ namespace DoNotBeLazy.Components
         // would otherwise hand out the same preparatory job forever.
         public HashSet<LocalTargetInfo> Requeued { get; } = new HashSet<LocalTargetInfo>();
 
+        // Scanner orders only: the highest daysWorkingSinceLastFinding seen
+        // on this station so far. A find resets that field to zero, so the
+        // number going down is the completion condition - see
+        // ScannerCompat.FoundSomething. Inert on every other order type.
+        public float MaxScanDays;
+
         public SweepOrder(WorkGiverDef workGiverDef, List<LocalTargetInfo> sharedPool, Thing workstationTarget = null,
             IntVec3 scanCenter = default(IntVec3), int scanRadius = 0, bool centerOut = true)
         {
@@ -176,7 +182,107 @@ namespace DoNotBeLazy.Components
                     continue;
                 }
 
+                // scanner orders never arm a retry (their JobOnThing has no
+                // null path) and bench orders are never scanner work, so
+                // these two are exclusive - the watchdog just returns on
+                // anything that isn't a scanner.
+                TryScannerWatchdog(pawn);
                 TryWorkstationRetry(pawn);
+            }
+        }
+
+        // The scanner equivalent of TryWorkstationRetry, and polled for the
+        // same reason: there is no event to hang it on.
+        // JobDriver_OperateScanner's work toil is ToilCompleteMode.Never, so
+        // a scanner job does not end when the scan finds something - it does
+        // not end at all - and the completion condition has to be watched
+        // for rather than waited on. ScannerCompat carries the detail.
+        //
+        // Three endings, in the order worth checking:
+        //   a find     - the ending the order was given for
+        //   unusable   - power cut, roofed over, forbidden mid-scan
+        //   pawn gone  - they are doing something else now
+        private void TryScannerWatchdog(Pawn pawn)
+        {
+            if (!activeSweeps.TryGetValue(pawn, out SweepOrder order)
+                || !ScannerCompat.IsScannerWork(order.WorkGiverDef))
+            {
+                return;
+            }
+
+            // paused pawns are off eating or sleeping and are not expected
+            // to be at the station - Notify_JobEnded owns the resume, same
+            // as every other order type
+            if (pausedForNeed.ContainsKey(pawn))
+            {
+                return;
+            }
+
+            CompScanner comp = ScannerCompat.ScannerOn(order.WorkstationTarget);
+            if (comp == null || order.WorkstationTarget.Destroyed)
+            {
+                RemoveSweep(pawn);
+                return;
+            }
+
+            if (ScannerCompat.FoundSomething(comp, ref order.MaxScanDays))
+            {
+                Logger.Message($"{pawn.LabelShort}: {order.WorkstationTarget.LabelShort} found something, ending sweep ({order.WorkGiverDef.defName})");
+                EndSweepAndJob(pawn);
+                return;
+            }
+
+            if (!ScannerCompat.CanUseNow(comp))
+            {
+                // the job carries CanUseNow as its own fail condition, so it
+                // is already dying - just stop owning the pawn
+                Logger.Message($"{pawn.LabelShort}: {order.WorkstationTarget.LabelShort} can't be used now, ending sweep ({order.WorkGiverDef.defName})");
+                RemoveSweep(pawn);
+                return;
+            }
+
+            // Still on it? The 1500-tick expiry override swaps the job
+            // object for an identical one without moving the pawn an inch,
+            // and that is what Notify_JobEnded deliberately declines to
+            // judge. This is the check it defers to.
+            Job current = pawn.jobs?.curJob;
+            if (current != null
+                && current.def == JobDefOf.OperateScanner
+                && current.targetA.Thing == order.WorkstationTarget)
+            {
+                return;
+            }
+
+            Logger.Message($"{pawn.LabelShort}: no longer working {order.WorkstationTarget.LabelShort}, ending sweep ({order.WorkGiverDef.defName})");
+            RemoveSweep(pawn);
+        }
+
+        // Drop the order AND stop the pawn. RemoveSweep on its own only
+        // forgets the order - it never touches the job - which is right
+        // everywhere else, because everywhere else the job has already
+        // ended. A scanner job never ends on its own, so a completed scanner
+        // order that only called RemoveSweep would leave the pawn scanning a
+        // finished order forever.
+        private void EndSweepAndJob(Pawn pawn)
+        {
+            RemoveSweep(pawn);
+
+            if (pawn.jobs?.curJob == null)
+            {
+                return;
+            }
+
+            // same self-caused-job-end suppression as GiveJob and
+            // PauseForNeed; without it JobTrackerPatch's postfix re-enters
+            // on our own EndCurrentJob call
+            AssigningJob = true;
+            try
+            {
+                pawn.jobs.EndCurrentJob(JobCondition.Succeeded);
+            }
+            finally
+            {
+                AssigningJob = false;
             }
         }
 
@@ -287,7 +393,11 @@ namespace DoNotBeLazy.Components
                 return;
             }
 
-            if (scanner is WorkGiver_DoBill)
+            // A scanner is a single station worked by a single pawn, so it
+            // takes the workstation path rather than fanning a group out
+            // across a radius. What differs is only the ending: a bench runs
+            // out of bills, a scanner finds something. See ScannerCompat.
+            if (scanner is WorkGiver_DoBill || ScannerCompat.IsScannerWork(workGiverDef))
             {
                 BeginWorkstationSweep(eligiblePawns, clickedTarget.Thing, workGiverDef, scanner);
             }
@@ -327,7 +437,19 @@ namespace DoNotBeLazy.Components
                 // clears leftover pause and retry state from a previous order
                 pausedForNeed.Remove(pawn);
                 workstationRetryAt.Remove(pawn);
-                activeSweeps[pawn] = new SweepOrder(workGiverDef, new List<LocalTargetInfo>(), billGiver);
+                var order = new SweepOrder(workGiverDef, new List<LocalTargetInfo>(), billGiver);
+
+                // Seed the scan high-water mark from wherever this station
+                // already stands. Starting at zero would read the first
+                // sample as a find on a scanner that has been worked before.
+                CompScanner scannerComp = ScannerCompat.ScannerOn(billGiver);
+                if (scannerComp != null)
+                {
+                    order.MaxScanDays = 0f;
+                    ScannerCompat.FoundSomething(scannerComp, ref order.MaxScanDays);
+                }
+
+                activeSweeps[pawn] = order;
 
                 // whole workstation path used to emit nothing at all - a
                 // bill order's only trace was one "job ended" line with no
@@ -510,6 +632,26 @@ namespace DoNotBeLazy.Components
             // bug look like "sowing does nothing" rather than "one cell got
             // skipped". A failed *target* is not a failed *sweep*: drop that
             // target and hand out the next one.
+            // Scanner orders, and only scanner orders. Their vanilla job
+            // carries expiryInterval 1500 with checkOverrideOnExpire, so
+            // every 1500 ticks the think tree re-picks the same scanner as a
+            // *different* Job instance, and the swap arrives here as
+            // InterruptOptional while the pawn carries on scanning without
+            // breaking stride. Treated as a departure, that would cap every
+            // scanner order at roughly 25 seconds of play.
+            //
+            // It cannot be told apart from a real departure at this point:
+            // the replacement job has not started yet, so pawn.CurJob is
+            // still the one that just ended. TryScannerWatchdog looks 60
+            // ticks later, when it has, and ends the sweep then if the pawn
+            // really did walk off. InterruptForced is left fatal - that is
+            // the player manually ordering them elsewhere, and it means it.
+            if (condition == JobCondition.InterruptOptional
+                && ScannerCompat.IsScannerWork(order.WorkGiverDef))
+            {
+                return;
+            }
+
             if (!TargetFailureIsRecoverable(condition))
             {
                 RemoveSweep(pawn);
@@ -569,6 +711,21 @@ namespace DoNotBeLazy.Components
                 // same station, never a pool to draw from
                 if (order.WorkstationTarget.Destroyed)
                 {
+                    RemoveSweep(pawn);
+                    return;
+                }
+
+                // WorkGiver_OperateScanner.JobOnThing has no null path - its
+                // whole body is one JobMaker call - so the "station gave me
+                // nothing, we are done" ending below is unreachable for a
+                // scanner, and it would hand out jobs at an unpowered or
+                // roofed-over machine forever. HasJobOnThing is the gate that
+                // actually answers, and it is the same one the float menu
+                // used to offer the order in the first place.
+                if (ScannerCompat.IsScannerWork(order.WorkGiverDef)
+                    && !scanner.HasJobOnThing(pawn, order.WorkstationTarget, true))
+                {
+                    Logger.Message($"{pawn.LabelShort}: {order.WorkstationTarget.LabelShort} can't be worked now, ending sweep ({order.WorkGiverDef.defName})");
                     RemoveSweep(pawn);
                     return;
                 }
