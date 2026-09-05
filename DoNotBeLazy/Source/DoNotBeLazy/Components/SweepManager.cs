@@ -940,6 +940,17 @@ namespace DoNotBeLazy.Components
             // at the end rather than one line per target, see below
             int noJobCount = 0;
 
+            // Same treatment, and for the same reason. The refusal line below
+            // used to name every skipped target and is O(pool x pawns) - and
+            // unlike noJobCount it survived the 2026-09-03 fix, because at the
+            // time HaulGeneral pooled few enough targets for it not to show.
+            // Redirecting * haul orders to Pick Up And Haul on 2026-09-04
+            // changed that: PUAH pools far more per pawn, one session emitted
+            // 1101 [DoNotBeLazy] lines, and RimWorld's `Reached max messages
+            // limit` cost the evidence for a player's own report.
+            // FIFTH time. Counted by reason, reported once.
+            var refusalCounts = new Dictionary<string, int>();
+
             while (true)
             {
                 // was: RemoveAt(i) up here, before asking for a job, so a
@@ -988,7 +999,9 @@ namespace DoNotBeLazy.Components
                 string refusal = TargetRefusalReason(pawn, target, scanner, firefighting);
                 if (refusal != null)
                 {
-                    Logger.Message($"{pawn.LabelShort}: skipping {target} ({order.WorkGiverDef.defName}) - {refusal}");
+                    // counted, NOT logged per target - see refusalCounts
+                    refusalCounts.TryGetValue(refusal, out int seen);
+                    refusalCounts[refusal] = seen + 1;
                     refused.Add(target);
                     continue;
                 }
@@ -1027,7 +1040,12 @@ namespace DoNotBeLazy.Components
                 // most useful line in a sow trace
                 Logger.Message($"{pawn.LabelShort}: {job.def.defName} on {target}"
                     + (job.plantDefToSow != null ? $" plant={job.plantDefToSow.defName}" : "")
-                    + $" ({order.SharedPool.Count} left)");
+                    + $" ({order.SharedPool.Count} left)"
+                    // skips walked past on the way to this job, folded in
+                    // rather than given a line of their own - otherwise the
+                    // count is simply lost whenever the pawn does find work,
+                    // which is most of the time
+                    + RefusalSummary(refusalCounts));
 
                 // WorkGiver answered "clear this blocker first" rather than
                 // the work asked for (GrowerSow returns CutPlant/HaulAside).
@@ -1040,6 +1058,14 @@ namespace DoNotBeLazy.Components
 
                 GiveJob(pawn, job);
                 return;
+            }
+
+            // One line per call, naming each reason and how many targets it
+            // accounted for - which is what the per-target version was
+            // actually being read for anyway.
+            if (refusalCounts.Count > 0)
+            {
+                Logger.Message($"{pawn.LabelShort}: skipped{RefusalSummary(refusalCounts)} ({order.WorkGiverDef.defName})");
             }
 
             // TWO DIFFERENT ENDINGS, and collapsing them into one is the
@@ -1081,6 +1107,26 @@ namespace DoNotBeLazy.Components
             // "job ended Succeeded" as their last line.
             Logger.Message($"{pawn.LabelShort}: nothing left within {order.ScanRadius} of {order.ScanCenter}, ending sweep ({order.WorkGiverDef.defName})");
             RemoveSweep(pawn);
+        }
+
+        // " - skipped 52 reserved, 3 forbidden", or "" when nothing was
+        // skipped. Reasons, not targets: a target name per skip is what blew
+        // RimWorld's message cap five sessions running, and the reason is the
+        // part anyone was ever reading.
+        private static string RefusalSummary(Dictionary<string, int> counts)
+        {
+            if (counts == null || counts.Count == 0)
+            {
+                return "";
+            }
+
+            var parts = new List<string>();
+            foreach (KeyValuePair<string, int> pair in counts)
+            {
+                parts.Add($"{pair.Value} {pair.Key}");
+            }
+
+            return " - skipped " + string.Join(", ", parts.ToArray());
         }
 
         // A workstation order has no pool to fall back on, so a null answer
