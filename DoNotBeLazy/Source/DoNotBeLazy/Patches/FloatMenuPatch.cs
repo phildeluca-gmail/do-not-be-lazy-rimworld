@@ -228,6 +228,32 @@ namespace DoNotBeLazy.Patches
                     continue;
                 }
 
+                // OPEN ITEM 5, closed 2026-09-05 on an explicit order.
+                // Reported as: right-clicking a crematorium offers
+                // "* operate on humanlikes" and "* operate on animals",
+                // with no corpse anywhere near it.
+                //
+                // IsSweepEligible accepts ANY WorkGiver_DoBill regardless of
+                // work type, deliberately - there is one per crafting
+                // station and hardcoding them breaks against mods and DLC.
+                // The cost is that DoBillsMedicalHumanOperation and
+                // DoBillsMedicalAnimalOperation come along too, and every
+                // test downstream asked only "is this thing a potential bill
+                // giver", which a crematorium certainly is.
+                //
+                // WorkGiver_DoBill.ThingIsUsableBillGiver is vanilla's own
+                // per-def answer - it reads fixedBillGiverDefs,
+                // billGiversAllHumanlikes, billGiversAllHumanlikesCorpses
+                // and the mechanoid flag. Verified public instance on
+                // WorkGiver_DoBill in this build by reflection over
+                // lib\Assembly-CSharp.dll, not remembered. A crematorium
+                // fails it for the surgery defs and passes it for its own,
+                // which is exactly the distinction that was missing.
+                if (!DefCanUseAnyBillGiverHere(def, thingsHere))
+                {
+                    continue;
+                }
+
                 List<Pawn> eligiblePawns = EligiblePawns(pawns, map, def);
                 if (eligiblePawns.Count == 0)
                 {
@@ -238,7 +264,16 @@ namespace DoNotBeLazy.Patches
                     if (feedback.Count < MaxFeedbackOptions && WantsSomethingHere(def, thingsHere, fireHere))
                     {
                         string why = FirstRefusal(pawns, map, def, out Pawn refused);
-                        if (why != null)
+
+                        // Ordered 2026-09-05 alongside open item 5: do not
+                        // draw a "why not" line for work the selection can
+                        // NEVER do. A brawler will never do research and a
+                        // pawn with Doctor disabled will never operate - no
+                        // priority change alters either, so the line is pure
+                        // noise on every right-click. An unassigned work
+                        // type still gets its entry, because that one IS
+                        // actionable. See PawnValidator.Hopeless.
+                        if (why != null && !AllHopeless(pawns, map, def))
                         {
                             feedback.Add(DisabledOption(def, refused.LabelShort, why));
                         }
@@ -775,6 +810,15 @@ namespace DoNotBeLazy.Patches
                 return true;
             }
 
+            // A DoBill def's PotentialWorkThingRequest is the whole
+            // PotentialBillGiver group, so it accepts a crematorium for the
+            // surgery defs just as readily as for its own. Ask the def's own
+            // question instead - this is the crematorium report.
+            if (def.Worker is WorkGiver_DoBill)
+            {
+                return DefCanUseAnyBillGiverHere(def, thingsHere);
+            }
+
             try
             {
                 ThingRequest req = ((WorkGiver_Scanner)def.Worker).PotentialWorkThingRequest;
@@ -802,6 +846,62 @@ namespace DoNotBeLazy.Patches
         // First pawn in the selection with something to say, not a tally of
         // all of them - a group is usually refused for one shared reason and
         // naming one of them is enough to explain the click.
+        // True when every selected pawn is permanently incapable of this
+        // work type. One pawn who could do it is enough to keep the entry -
+        // the reason shown is still the first refusal, which is vanilla's
+        // own habit in AddJobGiverWorkOrders.
+        private static bool AllHopeless(List<Pawn> pawns, Map map, WorkGiverDef def)
+        {
+            bool any = false;
+            foreach (Pawn pawn in pawns)
+            {
+                if (pawn == null || pawn.Map != map)
+                {
+                    continue;
+                }
+
+                any = true;
+                if (!PawnValidator.Hopeless(pawn, def))
+                {
+                    return false;
+                }
+            }
+
+            return any;
+        }
+
+        // For a WorkGiver_DoBill, can this def actually use anything on the
+        // clicked cell as a bill giver? Non-DoBill defs are untouched -
+        // scoping matters here, and the first cut of this gate applied to
+        // every def and would have silently killed scanner sweeps (Phase 11):
+        // the scanner defs are workType Research and a scanner is not an
+        // IBillGiver at all.
+        private static bool DefCanUseAnyBillGiverHere(WorkGiverDef def, List<Thing> thingsHere)
+        {
+            if (!(def.Worker is WorkGiver_DoBill bills) || thingsHere == null)
+            {
+                return true;
+            }
+
+            foreach (Thing t in thingsHere)
+            {
+                try
+                {
+                    if (bills.ThingIsUsableBillGiver(t))
+                    {
+                        return true;
+                    }
+                }
+                catch
+                {
+                    // a def that throws on the question does not get to
+                    // answer it - same habit as WantsSomethingHere
+                }
+            }
+
+            return false;
+        }
+
         private static string FirstRefusal(List<Pawn> pawns, Map map, WorkGiverDef def, out Pawn who)
         {
             foreach (Pawn pawn in pawns)

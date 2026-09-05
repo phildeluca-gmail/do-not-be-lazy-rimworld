@@ -215,7 +215,12 @@ namespace DoNotBeLazy.Components
             {
                 if (pawn.Dead || pawn.Downed || pawn.InMentalState || pawn.Drafted || pawn.Map != map)
                 {
-                    RemoveSweep(pawn);
+                    RemoveSweep(pawn,
+                        pawn.Dead ? "dead"
+                        : pawn.Downed ? "downed"
+                        : pawn.InMentalState ? "mental break"
+                        : pawn.Drafted ? "drafted"
+                        : "left the map");
                     continue;
                 }
 
@@ -259,14 +264,15 @@ namespace DoNotBeLazy.Components
             CompScanner comp = ScannerCompat.ScannerOn(order.WorkstationTarget);
             if (comp == null || order.WorkstationTarget.Destroyed)
             {
-                RemoveSweep(pawn);
+                RemoveSweep(pawn, order.WorkstationTarget.Destroyed
+                    ? "the scanner was destroyed"
+                    : "the scanner is no longer a scanner");
                 return;
             }
 
             if (ScannerCompat.FoundSomething(comp, ref order.MaxScanDays))
             {
-                Logger.Message($"{pawn.LabelShort}: {order.WorkstationTarget.LabelShort} found something, ending sweep ({order.WorkGiverDef.defName})");
-                EndSweepAndJob(pawn);
+                EndSweepAndJob(pawn, $"{order.WorkstationTarget.LabelShort} found something");
                 return;
             }
 
@@ -274,8 +280,7 @@ namespace DoNotBeLazy.Components
             {
                 // the job carries CanUseNow as its own fail condition, so it
                 // is already dying - just stop owning the pawn
-                Logger.Message($"{pawn.LabelShort}: {order.WorkstationTarget.LabelShort} can't be used now, ending sweep ({order.WorkGiverDef.defName})");
-                RemoveSweep(pawn);
+                RemoveSweep(pawn, $"{order.WorkstationTarget.LabelShort} can't be used now");
                 return;
             }
 
@@ -291,8 +296,7 @@ namespace DoNotBeLazy.Components
                 return;
             }
 
-            Logger.Message($"{pawn.LabelShort}: no longer working {order.WorkstationTarget.LabelShort}, ending sweep ({order.WorkGiverDef.defName})");
-            RemoveSweep(pawn);
+            RemoveSweep(pawn, $"no longer working {order.WorkstationTarget.LabelShort}");
         }
 
         // Drop the order AND stop the pawn. RemoveSweep on its own only
@@ -301,9 +305,9 @@ namespace DoNotBeLazy.Components
         // ended. A scanner job never ends on its own, so a completed scanner
         // order that only called RemoveSweep would leave the pawn scanning a
         // finished order forever.
-        private void EndSweepAndJob(Pawn pawn)
+        private void EndSweepAndJob(Pawn pawn, string reason)
         {
-            RemoveSweep(pawn);
+            RemoveSweep(pawn, reason);
 
             if (pawn.jobs?.curJob == null)
             {
@@ -397,8 +401,30 @@ namespace DoNotBeLazy.Components
             return new List<Pawn>(activeSweeps.Keys);
         }
 
-        public void RemoveSweep(Pawn pawn)
+        // EVERY ending goes through here and EVERY ending says why.
+        //
+        // Seven of the seventeen call sites used to pass through silently -
+        // and they were, precisely, the unexpected ones. The expected
+        // endings ("no bills left", "pool still inert", "nothing left within
+        // radius") all logged; a pawn yanked out by an InterruptForced, or
+        // failing CanSweep on the next assignment, left no trace at all.
+        // That is backwards, and it cost a session on 2026-09-05: three
+        // butchers stopped with animals still queued and the log had nothing
+        // to say about any of them.
+        //
+        // The reason is mandatory rather than optional so the compiler finds
+        // a missed site instead of a player finding it. One line per sweep
+        // ENDING - not per target, per def or per click - so this does not
+        // reopen the message-cap problem that has cost five sessions.
+        public void RemoveSweep(Pawn pawn, string reason)
         {
+            // only speak if there was actually a sweep to end; RemoveSweep is
+            // called defensively in places where there may be nothing to do
+            if (activeSweeps.TryGetValue(pawn, out SweepOrder ending))
+            {
+                Logger.Message($"{pawn.LabelShort}: sweep ended - {reason} ({ending.WorkGiverDef.defName})");
+            }
+
             activeSweeps.Remove(pawn);
             pausedForNeed.Remove(pawn);
             consecutiveFailures.Remove(pawn);
@@ -775,8 +801,7 @@ namespace DoNotBeLazy.Components
                     {
                         // need isn't recovering (a mood that just stays
                         // low). Don't hold the pool hostage over it.
-                        Logger.Message($"{pawn.LabelShort}: still under threshold after {MaxPauseTicks} ticks paused, ending sweep.");
-                        RemoveSweep(pawn);
+                        RemoveSweep(pawn, $"still under threshold after {MaxPauseTicks} ticks paused");
                     }
                     return;
                 }
@@ -832,7 +857,12 @@ namespace DoNotBeLazy.Components
 
             if (!TargetFailureIsRecoverable(condition))
             {
-                RemoveSweep(pawn);
+                // This is the site that ended legua's butcher sweep on
+                // 2026-09-05 without a word. InterruptForced means something
+                // took the pawn - a manual order, a draft, a mental break,
+                // another mod - and continuing would fight it. Fatal is
+                // right; silent was not.
+                RemoveSweep(pawn, $"job ended {condition}");
                 return;
             }
 
@@ -840,8 +870,7 @@ namespace DoNotBeLazy.Components
             failures++;
             if (failures >= MaxConsecutiveFailures)
             {
-                Logger.Message($"{pawn.LabelShort}: {failures} sweep tasks failed in a row ({condition}), ending sweep.");
-                RemoveSweep(pawn);
+                RemoveSweep(pawn, $"{failures} sweep tasks failed in a row ({condition})");
                 return;
             }
 
@@ -871,7 +900,7 @@ namespace DoNotBeLazy.Components
         {
             if (!(order.WorkGiverDef.Worker is WorkGiver_Scanner scanner))
             {
-                RemoveSweep(pawn);
+                RemoveSweep(pawn, "the WorkGiver is no longer a scanner");
                 return;
             }
 
@@ -879,7 +908,11 @@ namespace DoNotBeLazy.Components
             // roof collapse mid-mining sweep is the obvious one)
             if (!PawnValidator.CanSweep(pawn, order.WorkGiverDef) || !pawn.Spawned || pawn.Map != map)
             {
-                RemoveSweep(pawn);
+                // RefusalReason gives the player's own wording - "is drafted",
+                // "will never do butchering", "is not assigned to cooking".
+                RemoveSweep(pawn, !pawn.Spawned || pawn.Map != map
+                    ? "no longer on this map"
+                    : PawnValidator.RefusalReason(pawn, order.WorkGiverDef) ?? "no longer eligible");
                 return;
             }
 
@@ -889,7 +922,7 @@ namespace DoNotBeLazy.Components
                 // same station, never a pool to draw from
                 if (order.WorkstationTarget.Destroyed)
                 {
-                    RemoveSweep(pawn);
+                    RemoveSweep(pawn, "the station was destroyed");
                     return;
                 }
 
@@ -903,8 +936,7 @@ namespace DoNotBeLazy.Components
                 if (ScannerCompat.IsScannerWork(order.WorkGiverDef)
                     && !scanner.HasJobOnThing(pawn, order.WorkstationTarget, true))
                 {
-                    Logger.Message($"{pawn.LabelShort}: {order.WorkstationTarget.LabelShort} can't be worked now, ending sweep ({order.WorkGiverDef.defName})");
-                    RemoveSweep(pawn);
+                    RemoveSweep(pawn, $"{order.WorkstationTarget.LabelShort} can't be worked now");
                     return;
                 }
 
@@ -1095,8 +1127,7 @@ namespace DoNotBeLazy.Components
                     return;
                 }
 
-                Logger.Message($"{pawn.LabelShort}: pool still inert after {MaxAreaRetries} tries ({order.SharedPool.Count} targets), ending sweep ({order.WorkGiverDef.defName})");
-                RemoveSweep(pawn);
+                RemoveSweep(pawn, $"pool still inert after {MaxAreaRetries} tries ({order.SharedPool.Count} targets)");
                 return;
             }
 
@@ -1105,8 +1136,7 @@ namespace DoNotBeLazy.Components
             // ending looked exactly like a pawn wandering off for no reason;
             // seven pawns in the 08-22 log ended here with a bare
             // "job ended Succeeded" as their last line.
-            Logger.Message($"{pawn.LabelShort}: nothing left within {order.ScanRadius} of {order.ScanCenter}, ending sweep ({order.WorkGiverDef.defName})");
-            RemoveSweep(pawn);
+            RemoveSweep(pawn, $"nothing left within {order.ScanRadius} of {order.ScanCenter}");
         }
 
         // " - skipped 52 reserved, 3 forbidden", or "" when nothing was
@@ -1154,8 +1184,7 @@ namespace DoNotBeLazy.Components
                 // shortly rather than an ending.
                 if (!VehicleCompat.WantsMoreCargo(order.WorkGiverDef, order.WorkstationTarget))
                 {
-                    Logger.Message($"{pawn.LabelShort}: nothing left to load at {station}, ending sweep ({order.WorkGiverDef.defName})");
-                    RemoveSweep(pawn);
+                    RemoveSweep(pawn, $"nothing left to load at {station}");
                     return;
                 }
             }
@@ -1163,8 +1192,7 @@ namespace DoNotBeLazy.Components
                 || billGiver.BillStack == null
                 || !billGiver.BillStack.AnyShouldDoNow)
             {
-                Logger.Message($"{pawn.LabelShort}: no bills left at {station}, ending sweep ({order.WorkGiverDef.defName})");
-                RemoveSweep(pawn);
+                RemoveSweep(pawn, $"no bills left at {station}");
                 return;
             }
 
@@ -1172,8 +1200,7 @@ namespace DoNotBeLazy.Components
             failures++;
             if (failures >= MaxConsecutiveFailures)
             {
-                Logger.Message($"{pawn.LabelShort}: {station} gave no job {failures} times running, ending sweep ({order.WorkGiverDef.defName})");
-                RemoveSweep(pawn);
+                RemoveSweep(pawn, $"{station} gave no job {failures} times running");
                 return;
             }
 

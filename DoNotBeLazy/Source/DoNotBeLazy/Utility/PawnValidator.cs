@@ -34,6 +34,22 @@ namespace DoNotBeLazy.Utility
             return Check(pawn, workGiverDef) == Refusal.None;
         }
 
+        // Can this pawn EVER do this work, whatever the player does with the
+        // work tab? NeverWorks and NeverDoesType are settled facts about the
+        // pawn - a backstory, a trait, a gene - and no priority change fixes
+        // them. NotAssigned looks the same to a player but is one click away
+        // from being false, so it is deliberately NOT in here.
+        //
+        // The menu uses this to decide whether a greyed "why not" entry is
+        // worth drawing. Telling someone their brawler will never do
+        // research is noise; telling them Doctor sits at priority 0 is a
+        // fix they can act on.
+        public static bool Hopeless(Pawn pawn, WorkGiverDef workGiverDef)
+        {
+            Refusal r = Check(pawn, workGiverDef);
+            return r == Refusal.NeverWorks || r == Refusal.NeverDoesType;
+        }
+
         // Words for the greyed-out float menu entry, null when the pawn is
         // fine. Hardcoded English around the def's own translated labels
         // rather than vanilla's keys - CannotPrioritizeNotAssignedToWorkType
