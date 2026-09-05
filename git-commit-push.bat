@@ -36,6 +36,40 @@ if not errorlevel 1 (
     exit /b 0
 )
 
+:: NEVER commit the reference DLLs. CLAUDE.md section 1: they are
+:: copyrighted and are not ours to redistribute. If one is staged the
+:: ignore rule is broken and this must stop rather than push it.
+::
+:: Backported from the push-*.bat scripts 2026-09-05. Not theoretical -
+:: the hand-run version of this check caught Assemblies\*.dll staged
+:: during the Standard Cargo split-out the same day, because
+:: .gitignore's */Assemblies/*.dll needs a directory above Assemblies.
+:: NOT anchored with $ on purpose. git writes LF-only line endings
+:: and findstr's $ expects a CR before the LF, so the anchored form
+:: silently matches NOTHING - verified against a real staged .dll on
+:: 2026-09-05, which is how this was caught before it shipped. A path
+:: merely containing ".dll" would be a false positive; that stops a
+:: commit with a clear message, which is the safe direction to fail.
+git diff --cached --name-only | findstr /i /r "\.dll \.pdb" >nul
+:: The listing below uses a git pathspec rather than a pipe: a piped
+:: command inside a parenthesised cmd block does not survive the ^
+:: escape, and git receives the bar as an argument. And no :: comment
+:: may appear INSIDE the block at all - cmd tries to run it as a
+:: drive change and prints "The system cannot find the drive
+:: specified". Both were caught by running this script for real on
+:: 2026-09-05 rather than reading it.
+if not errorlevel 1 (
+    echo.
+    echo ERROR: a .dll or .pdb is staged. That must never be committed.
+    echo Staged binaries:
+    git diff --cached --name-only -- "*.dll" "*.pdb"
+    echo.
+    echo Fix the .gitignore in this repo before running this again.
+    git reset >nul
+    pause
+    exit /b 1
+)
+
 :: Show exactly what is about to be committed
 echo.
 echo === Files staged for commit ===
