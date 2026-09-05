@@ -1,3 +1,4 @@
+using System;
 using System.Collections.Generic;
 using RimWorld;
 using Verse;
@@ -42,6 +43,13 @@ namespace DoNotBeLazy.Components
         // workstation orders; their pool is empty and nothing ranks it.
         public bool CenterOut { get; }
 
+        // The player's actual order, when the WorkGiver serves more than
+        // one. Null on every sweep that needs no narrowing. Fixed at click
+        // time and applied to the first scan AND to every rescan, or a
+        // chop-wood sweep would quietly turn into a cut-plants sweep the
+        // moment the pool ran dry. See PlantCompat.
+        public Predicate<Thing> TargetFilter { get; }
+
         // Targets already put back in the pool once after the WorkGiver
         // answered with blocker-clearing work instead of the task itself.
         // Capped at one re-queue each: a cell that can never be satisfied
@@ -55,7 +63,8 @@ namespace DoNotBeLazy.Components
         public float MaxScanDays;
 
         public SweepOrder(WorkGiverDef workGiverDef, List<LocalTargetInfo> sharedPool, Thing workstationTarget = null,
-            IntVec3 scanCenter = default(IntVec3), int scanRadius = 0, bool centerOut = true)
+            IntVec3 scanCenter = default(IntVec3), int scanRadius = 0, bool centerOut = true,
+            Predicate<Thing> targetFilter = null)
         {
             WorkGiverDef = workGiverDef;
             SharedPool = sharedPool;
@@ -63,6 +72,7 @@ namespace DoNotBeLazy.Components
             ScanCenter = scanCenter;
             ScanRadius = scanRadius;
             CenterOut = centerOut;
+            TargetFilter = targetFilter;
         }
     }
 
@@ -112,6 +122,19 @@ namespace DoNotBeLazy.Components
         // caps it at eight tries, about eighty seconds.
         private const int WorkstationRetryTicks = 600;
 
+        // The area equivalent, and the same reasoning one level out. A pool
+        // full of targets whose destinations are all reserved by teammates
+        // is the normal state of a group haul for a few seconds at a time -
+        // WorkGiver_Haul answers null for every one of them until somebody
+        // finishes a delivery and frees a cell. Ten seconds is roughly one
+        // haul leg, so that is when it is worth asking again.
+        private const int AreaRetryTicks = 600;
+
+        // ...but a stockpile that is genuinely full stays full, and each
+        // retry walks the whole pool. Ten tries is about a hundred seconds
+        // of patience before the sweep is called finished for that pawn.
+        private const int MaxAreaRetries = 10;
+
         private readonly Dictionary<Pawn, SweepOrder> activeSweeps = new Dictionary<Pawn, SweepOrder>();
 
         // Per-pawn, not per-order: a SweepOrder is shared across everyone in
@@ -138,6 +161,20 @@ namespace DoNotBeLazy.Components
         // thing they finished would re-ask the station immediately and burn
         // the whole retry budget in a few seconds.
         private readonly Dictionary<Pawn, int> workstationRetryAt = new Dictionary<Pawn, int>();
+
+        // Area orders whose pool still holds targets but where every one of
+        // them was refused for this pawn right now, and the tick to look
+        // again on. This is the difference between "nothing left to do" and
+        // "nothing I can do this second", which AssignNextTask used to
+        // collapse into a single RemoveSweep - see the ending there. Same
+        // shape as workstationRetryAt, and for the same reason: while an
+        // entry is here the pawn is working for vanilla, so job ends are
+        // ignored rather than burning the budget in a few seconds.
+        private readonly Dictionary<Pawn, int> areaRetryAt = new Dictionary<Pawn, int>();
+
+        // How many times in a row this pawn has found the pool inert.
+        // Cleared by any successful assignment.
+        private readonly Dictionary<Pawn, int> areaRetries = new Dictionary<Pawn, int>();
 
         // TryTakeOrderedJob interrupts whatever the pawn is doing right now,
         // and that fires EndCurrentJob(InterruptForced) -> JobTrackerPatch's
@@ -188,6 +225,7 @@ namespace DoNotBeLazy.Components
                 // anything that isn't a scanner.
                 TryScannerWatchdog(pawn);
                 TryWorkstationRetry(pawn);
+                TryAreaRetry(pawn);
             }
         }
 
@@ -318,6 +356,35 @@ namespace DoNotBeLazy.Components
             AssignNextTask(pawn, order);
         }
 
+        // The area-order twin of TryWorkstationRetry. Polled for the same
+        // reason - the thing being waited on (a teammate freeing a storage
+        // cell) fires no event we can hang off.
+        private void TryAreaRetry(Pawn pawn)
+        {
+            if (!areaRetryAt.TryGetValue(pawn, out int dueAt))
+            {
+                return;
+            }
+
+            // a need outranks a retry, exactly as it does for a workstation:
+            // holding both at once deadlocks the pawn, because
+            // Notify_JobEnded returns early while a retry is pending and the
+            // pause would never clear
+            if (pausedForNeed.ContainsKey(pawn))
+            {
+                areaRetryAt.Remove(pawn);
+                return;
+            }
+
+            if (Find.TickManager.TicksGame < dueAt || !activeSweeps.TryGetValue(pawn, out SweepOrder order))
+            {
+                return;
+            }
+
+            areaRetryAt.Remove(pawn);
+            AssignNextTask(pawn, order);
+        }
+
         public bool TryGetActiveSweep(Pawn pawn, out SweepOrder order)
         {
             return activeSweeps.TryGetValue(pawn, out order);
@@ -336,6 +403,8 @@ namespace DoNotBeLazy.Components
             pausedForNeed.Remove(pawn);
             consecutiveFailures.Remove(pawn);
             workstationRetryAt.Remove(pawn);
+            areaRetryAt.Remove(pawn);
+            areaRetries.Remove(pawn);
         }
 
         public bool IsPaused(Pawn pawn)
@@ -388,23 +457,122 @@ namespace DoNotBeLazy.Components
                 return;
             }
 
+            // Pick Up And Haul, when installed, takes over a general haul
+            // order - see PuahCompat. Done before the scanner cast because
+            // the substituted def brings its own worker, and before the pool
+            // is built because the pool comes from that worker's scan.
+            workGiverDef = PuahCompat.Substitute(workGiverDef);
+
             if (!(workGiverDef?.Worker is WorkGiver_Scanner scanner))
             {
                 return;
             }
 
-            // A scanner is a single station worked by a single pawn, so it
-            // takes the workstation path rather than fanning a group out
-            // across a radius. What differs is only the ending: a bench runs
-            // out of bills, a scanner finds something. See ScannerCompat.
+            // A bench and a scanner are each one station worked by one pawn,
+            // so they take the workstation path rather than fanning a group
+            // out across a radius. What differs is only the ending: a bench
+            // runs out of bills, a scanner finds something. See ScannerCompat.
             if (scanner is WorkGiver_DoBill || ScannerCompat.IsScannerWork(workGiverDef))
             {
                 BeginWorkstationSweep(eligiblePawns, clickedTarget.Thing, workGiverDef, scanner);
             }
+            else if (VehicleCompat.IsPersistentTargetWork(workGiverDef))
+            {
+                // Same "keep coming back to this one thing" shape, but this
+                // one takes the whole selection - see the method comment.
+                BeginPersistentTargetSweep(eligiblePawns, clickedTarget.Thing, workGiverDef, scanner);
+            }
             else
             {
-                BeginAreaSweep(eligiblePawns, clickedTarget.Cell, workGiverDef, scanner);
+                // Derived here rather than passed in: the clicked Thing is
+                // the only place the player's actual order is recorded, and
+                // this is the last point that still has it. Null for every
+                // sweep that needs no narrowing.
+                BeginAreaSweep(eligiblePawns, clickedTarget.Cell, workGiverDef, scanner,
+                    PlantCompat.FilterFor(clickedTarget.Thing));
             }
+        }
+
+        // The routing rule above, asked as a question, because FloatMenuPatch
+        // needs the same answer before it offers a radius probe: a
+        // persistent-target order is one Thing, so a probe that hands back a
+        // cell would build a menu entry that quietly does nothing.
+        public static bool UsesPersistentTarget(WorkGiverDef def)
+        {
+            if (def == null || !(def.Worker is WorkGiver_Scanner scanner))
+            {
+                return false;
+            }
+
+            return scanner is WorkGiver_DoBill
+                || ScannerCompat.IsScannerWork(def)
+                || VehicleCompat.IsPersistentTargetWork(def);
+        }
+
+        // Vehicle packing, and anything else built on Vehicle Framework's
+        // WorkGiver_CarryToVehicle. Structurally a workstation order - one
+        // target, re-asked until it stops answering - with one deliberate
+        // difference: the whole selection joins it, where a bench takes the
+        // single best-ranked pawn.
+        //
+        // That difference is safe here and is not safe for a bench. Vehicle
+        // Framework reserves per *item* inside FindThingToPack, and
+        // CountLeftToPack subtracts what teammates are already carrying, so
+        // parallel haulers divide the cargo between them instead of racing
+        // for it. A bill, by contrast, is one pawn's job by design
+        // (architecture doc section 2).
+        //
+        // The pawns share one SweepOrder, exactly as an area sweep does. Its
+        // pool stays empty and unread; per-pawn retry and failure counts live
+        // in SweepManager's own dictionaries, so one pawn giving up does not
+        // touch the others.
+        private void BeginPersistentTargetSweep(List<Pawn> eligiblePawns, Thing target, WorkGiverDef workGiverDef, WorkGiver_Scanner scanner)
+        {
+            if (target == null)
+            {
+                return;
+            }
+
+            var order = new SweepOrder(workGiverDef, new List<LocalTargetInfo>(), target);
+            int joined = 0;
+
+            foreach (Pawn pawn in eligiblePawns)
+            {
+                // Asked one pawn at a time, and the order matters: each
+                // GiveJob below puts a job in flight that the NEXT
+                // JobOnThing call can see, through
+                // TransferableCountHauledByOthersForPacking. So a pawn who
+                // gets null here is usually being told the cargo is already
+                // spoken for, which is the right answer rather than a
+                // failure - they simply do not join.
+                Job job = scanner.JobOnThing(pawn, target, true);
+                if (job == null)
+                {
+                    Logger.Message($"BeginSweep {workGiverDef.defName}: no job on {target.LabelShort} for {pawn.LabelShort}, not joining");
+                    continue;
+                }
+
+                // a fresh assignment always clears leftover pause and retry
+                // state from a previous order
+                pausedForNeed.Remove(pawn);
+                workstationRetryAt.Remove(pawn);
+                areaRetryAt.Remove(pawn);
+                areaRetries.Remove(pawn);
+                consecutiveFailures.Remove(pawn);
+                activeSweeps[pawn] = order;
+                joined++;
+
+                Logger.Message($"BeginSweep {workGiverDef.defName} at {target.LabelShort}: {pawn.LabelShort} joined, first job {job.def.defName}");
+                GiveJob(pawn, job);
+            }
+
+            if (joined == 0)
+            {
+                Logger.Message($"BeginSweep {workGiverDef.defName}: no job on {target.LabelShort} for any of {eligiblePawns.Count} pawns, no sweep started");
+                return;
+            }
+
+            Logger.Message($"BeginSweep {workGiverDef.defName} at {target.LabelShort}: {joined} of {eligiblePawns.Count} pawns joined");
         }
 
         private void BeginWorkstationSweep(List<Pawn> eligiblePawns, Thing billGiver, WorkGiverDef workGiverDef, WorkGiver_Scanner scanner)
@@ -458,6 +626,8 @@ namespace DoNotBeLazy.Components
                 // means the bill itself, anything else means the WorkGiver
                 // wants a haul-off or a refuel first.
                 Logger.Message($"BeginSweep {workGiverDef.defName} at {billGiver.LabelShort}: {pawn.LabelShort} of {ranked.Count} ranked, first job {job.def.defName}");
+                areaRetryAt.Remove(pawn);
+                areaRetries.Remove(pawn);
                 GiveJob(pawn, job);
                 return;
             }
@@ -508,7 +678,7 @@ namespace DoNotBeLazy.Components
             return record == null || record.TotallyDisabled ? 0 : record.Level;
         }
 
-        private void BeginAreaSweep(List<Pawn> eligiblePawns, IntVec3 clickCell, WorkGiverDef workGiverDef, WorkGiver_Scanner scanner)
+        private void BeginAreaSweep(List<Pawn> eligiblePawns, IntVec3 clickCell, WorkGiverDef workGiverDef, WorkGiver_Scanner scanner, Predicate<Thing> targetFilter = null)
         {
             // TaskScanner is pawn-scoped (PotentialWorkThingsGlobal takes a
             // pawn) so we build the shared pool off whichever eligible pawn
@@ -520,7 +690,7 @@ namespace DoNotBeLazy.Components
             // read once, here, and stamped onto the order below - see
             // SweepOrder.CenterOut
             bool centerOut = DoNotBeLazyMod.Settings.centerOutOrder;
-            List<LocalTargetInfo> pool = TaskScanner.FindTargets(clickCell, radius, map, workGiverDef, driver);
+            List<LocalTargetInfo> pool = TaskScanner.FindTargets(clickCell, radius, map, workGiverDef, driver, 0, targetFilter);
             if (pool.Count == 0)
             {
                 // the clicked target had a job or the option wouldn't have
@@ -543,7 +713,7 @@ namespace DoNotBeLazy.Components
 
             // every area sweep rescans when a pawn runs the pool dry now, not
             // just fire
-            var order = new SweepOrder(workGiverDef, pool, null, clickCell, radius, centerOut);
+            var order = new SweepOrder(workGiverDef, pool, null, clickCell, radius, centerOut, targetFilter);
 
             // was: break out of this loop the moment the pool emptied, which
             // is why "* haul until done" with 36 selected sent exactly one
@@ -569,6 +739,14 @@ namespace DoNotBeLazy.Components
             // vanilla's work rather than ours, and TryWorkstationRetry owns
             // this pawn until the clock runs out.
             if (workstationRetryAt.ContainsKey(pawn))
+            {
+                return;
+            }
+
+            // same contract for an area order waiting out an inert pool -
+            // TryAreaRetry owns this pawn until its clock runs out, and
+            // whatever just ended was vanilla's work, not ours
+            if (areaRetryAt.ContainsKey(pawn))
             {
                 return;
             }
@@ -758,6 +936,10 @@ namespace DoNotBeLazy.Components
             // back to the same pawn and spin.
             var refused = new HashSet<LocalTargetInfo>();
 
+            // how many pooled targets answered null this call - reported once
+            // at the end rather than one line per target, see below
+            int noJobCount = 0;
+
             while (true)
             {
                 // was: RemoveAt(i) up here, before asking for a job, so a
@@ -785,7 +967,7 @@ namespace DoNotBeLazy.Components
                     }
 
                     rescanned = true;
-                    AddNewTargets(order, TaskScanner.FindTargets(order.ScanCenter, order.ScanRadius, map, order.WorkGiverDef, pawn));
+                    AddNewTargets(order, TaskScanner.FindTargets(order.ScanCenter, order.ScanRadius, map, order.WorkGiverDef, pawn, 0, order.TargetFilter));
                     continue;
                 }
 
@@ -823,7 +1005,16 @@ namespace DoNotBeLazy.Components
                     // transient nearly every time - WorkGiver_Haul comes back
                     // null when every destination cell is reserved by a
                     // teammate. Leave it for whoever's free next.
-                    Logger.Message($"{pawn.LabelShort}: no job for {target} ({order.WorkGiverDef.defName}), left in pool, {order.SharedPool.Count} total");
+                    //
+                    // Counted, NOT logged per target. This line used to name
+                    // every refusal and it is O(pool x pawns): one 359-target
+                    // haul sweep emitted 964 lines, hit RimWorld's
+                    // `Reached max messages limit`, and cost the session the
+                    // evidence for the bug it was meant to help diagnose -
+                    // the third time verbose logging has done that. The
+                    // total is reported once, below, where it means
+                    // something.
+                    noJobCount++;
                     refused.Add(target);
                     continue;
                 }
@@ -851,11 +1042,43 @@ namespace DoNotBeLazy.Components
                 return;
             }
 
-            // Pool's empty even after a rescan - this pawn is done. Said
-            // nothing at all until now, so a sweep ending looked exactly
-            // like a pawn wandering off for no reason; seven pawns in the
-            // 08-22 log ended here with a bare "job ended Succeeded" as
-            // their last line.
+            // TWO DIFFERENT ENDINGS, and collapsing them into one is the
+            // bug this split fixes. The pool still holding targets means the
+            // work is still there and this pawn simply cannot take any of it
+            // *this second* - almost always because teammates have every
+            // destination cell reserved. Striking the pawn off the sweep for
+            // that is what produced "haul until done stopped and left things
+            // in the radius that could be hauled": the pool survived, the
+            // workers did not, and once every pawn had walked an inert pool
+            // the order was over with hundreds of haulables still lying
+            // there.
+            //
+            // The same distinction the target path already makes (see
+            // TargetIsGone) - gone for good, versus not available right now -
+            // finally applied to pawns as well.
+            if (order.SharedPool.Count > 0 && noJobCount > 0)
+            {
+                areaRetries.TryGetValue(pawn, out int tries);
+                tries++;
+
+                if (tries <= MaxAreaRetries)
+                {
+                    areaRetries[pawn] = tries;
+                    areaRetryAt[pawn] = Find.TickManager.TicksGame + AreaRetryTicks;
+                    Logger.Message($"{pawn.LabelShort}: all {noJobCount} of {order.SharedPool.Count} pooled targets refused ({order.WorkGiverDef.defName}), staying in the sweep, looking again in {AreaRetryTicks} ticks (try {tries})");
+                    return;
+                }
+
+                Logger.Message($"{pawn.LabelShort}: pool still inert after {MaxAreaRetries} tries ({order.SharedPool.Count} targets), ending sweep ({order.WorkGiverDef.defName})");
+                RemoveSweep(pawn);
+                return;
+            }
+
+            // Pool's empty even after a rescan - this pawn is done, and this
+            // is the real ending. Said nothing at all until now, so a sweep
+            // ending looked exactly like a pawn wandering off for no reason;
+            // seven pawns in the 08-22 log ended here with a bare
+            // "job ended Succeeded" as their last line.
             Logger.Message($"{pawn.LabelShort}: nothing left within {order.ScanRadius} of {order.ScanCenter}, ending sweep ({order.WorkGiverDef.defName})");
             RemoveSweep(pawn);
         }
@@ -875,7 +1098,22 @@ namespace DoNotBeLazy.Components
         {
             string station = order.WorkstationTarget.LabelShort;
 
-            if (!(order.WorkstationTarget is IBillGiver billGiver)
+            if (VehicleCompat.IsPersistentTargetWork(order.WorkGiverDef))
+            {
+                // The vehicle equivalent of the bill test below: either the
+                // cargo the player asked to have loaded is still outstanding,
+                // or it is not. A null JobOnThing on top of an outstanding
+                // manifest means the items are unreachable, forbidden, or
+                // already in a teammate's arms - all worth another look
+                // shortly rather than an ending.
+                if (!VehicleCompat.WantsMoreCargo(order.WorkGiverDef, order.WorkstationTarget))
+                {
+                    Logger.Message($"{pawn.LabelShort}: nothing left to load at {station}, ending sweep ({order.WorkGiverDef.defName})");
+                    RemoveSweep(pawn);
+                    return;
+                }
+            }
+            else if (!(order.WorkstationTarget is IBillGiver billGiver)
                 || billGiver.BillStack == null
                 || !billGiver.BillStack.AnyShouldDoNow)
             {

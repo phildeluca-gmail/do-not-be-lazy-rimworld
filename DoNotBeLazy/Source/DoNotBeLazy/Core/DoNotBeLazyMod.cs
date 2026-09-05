@@ -19,6 +19,12 @@ namespace DoNotBeLazy.Core
 
             var harmony = new Harmony(HarmonyId);
             harmony.PatchAll();
+
+            // By hand, after PatchAll, because PatchAll cannot resolve a
+            // type this assembly does not reference. No-op unless Vehicle
+            // Framework is installed - see Patches/VehicleMenuPatch.
+            Patches.VehicleMenuPatch.TryPatch(harmony);
+
             Logger.Message("Harmony patches applied.");
         }
 

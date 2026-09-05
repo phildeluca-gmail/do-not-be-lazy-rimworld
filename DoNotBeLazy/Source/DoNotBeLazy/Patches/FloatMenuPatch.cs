@@ -120,7 +120,11 @@ namespace DoNotBeLazy.Patches
         // takes the right-click menu down for every other mod in the chain
         // too (Achtung patches the same area). Better to silently lose our
         // * entries than to break the menu.
-        private static void AddSweepOptions(Vector3 clickPos, List<Pawn> pawns, List<FloatMenuOption> options, bool multiSelect)
+        //
+        // internal rather than private: VehicleMenuPatch calls this from
+        // Vehicle Framework's own menu constructor, which is the only way
+        // any * option reaches a group right-click on a vehicle.
+        internal static void AddSweepOptions(Vector3 clickPos, List<Pawn> pawns, List<FloatMenuOption> options, bool multiSelect)
         {
             if (pawns == null || pawns.Count == 0 || options == null)
             {
@@ -245,23 +249,30 @@ namespace DoNotBeLazy.Patches
                 var scanner = (WorkGiver_Scanner)def.Worker;
                 LocalTargetInfo target = FindTargetWithJob(eligiblePawns, def, scanner, cell, thingsHere, out string failReason, out Thing failThing);
 
-                // Cleaning is asked for by area, not by tile. Ordered
-                // 2026-08-30: clicking a filthy floor should offer to clear
-                // the snow a few tiles over too, and clicking a snowy one
-                // should offer the filth - "when both exist in the radius"
-                // was the wording. Every other work type still needs the
-                // clicked cell to answer for itself, which is what keeps
-                // this off the general per-click cost open item 6 warns
-                // about: at most two probes, and only when the click itself
-                // came back empty.
-                if (!target.IsValid
-                    && IsCleaningWork(def)
-                    && TaskScanner.HasTargetInRadius(cell, Core.DoNotBeLazyMod.Settings.sweepRadius, map, def, eligiblePawns[0]))
-                {
-                    Logger.Message($"{def.defName}: nothing on the clicked cell, but the radius has work - offering anyway");
-                    target = cell;
-                }
-
+                // MENU IS THE CELL, AND ONLY THE CELL. Ordered 2026-09-04:
+                // "what appears in the menu should ONLY be the jobs in that
+                // cell". Two radius probes used to run here and both are
+                // gone:
+                //
+                // - THE FALLBACK (cleaning only, ordered 2026-08-30) added an
+                //   entry the click had not earned - click a filthy floor,
+                //   be offered the snow a few tiles over. Repealed by the
+                //   same order: an unearned entry is exactly what "only the
+                //   jobs in that cell" excludes.
+                // - THE GATE (five work types, 2026-09-02) asked the radius
+                //   whether an earned entry would find anything before
+                //   offering it. That was the open item 6 fix.
+                //
+                // The known cost of removing the gate is that open item 6
+                // comes back: `* Haul general things until done` can be
+                // offered on a tile whose radius holds nothing, and the
+                // sweep then starts and immediately finds nothing. The
+                // 2026-09-03 log has that shape. Accepted deliberately in
+                // exchange for a menu that costs one cell question per def
+                // and says exactly what the cell can do.
+                //
+                // The full scan still happens, unchanged, at BeginSweep -
+                // after the player picks an option, never before.
                 if (!target.IsValid)
                 {
                     if (failReason != null && feedback.Count < MaxFeedbackOptions)
@@ -271,17 +282,26 @@ namespace DoNotBeLazy.Patches
                     continue;
                 }
 
-                // The thing under the cursor was refused even though the
-                // sweep is on offer - the radius fallback above is the only
-                // way both can be true. Say so anyway: "I clicked the
-                // firefoam and they cleaned everything except the firefoam"
-                // is exactly the report this is here to prevent.
+                // Something under the cursor was refused even though the
+                // sweep is on offer. Still reachable with the fallback gone:
+                // FindTargetWithJob walks every thing on the cell and returns
+                // the first that takes a job, so a second thing on the same
+                // tile can have been refused on the way past. Say so anyway -
+                // "I clicked the firefoam and they cleaned everything except
+                // the firefoam" is exactly the report this is here to
+                // prevent.
                 if (failReason != null && feedback.Count < MaxFeedbackOptions)
                 {
                     feedback.Add(DisabledOption(def, failThing?.LabelShort, failReason));
                 }
 
-                string label = def.label.NullOrEmpty() ? def.defName : def.label.CapitalizeFirst();
+                // One WorkGiverDef can serve more than one player order -
+                // PlantsCut is "cut plants" AND "chop wood" - and def.label
+                // can only ever say one of them. Ask the clicked thing what
+                // was actually ordered; PlantCompat returns null for
+                // everything else, which is every other work type.
+                string label = PlantCompat.LabelFor(target.Thing)
+                    ?? (def.label.NullOrEmpty() ? def.defName : def.label.CapitalizeFirst());
 
                 // "until done" is wrong for a scanner and would be read as
                 // "until the scan bar fills" - there is no bar. The order
@@ -330,14 +350,6 @@ namespace DoNotBeLazy.Patches
                     options.Insert(0, move);
                 }
             }
-        }
-
-        // CleanFilth and CleanClearSnow in vanilla, plus anything a mod
-        // files under the same work type. Read off the WorkTypeDef rather
-        // than listing defNames so a modded cleaning giver comes along.
-        private static bool IsCleaningWork(WorkGiverDef def)
-        {
-            return def?.workType?.defName == "Cleaning";
         }
 
         private static bool AllDrafted(List<Pawn> pawns)
@@ -561,6 +573,13 @@ namespace DoNotBeLazy.Patches
         private static bool IsSweepEligible(WorkGiverDef def)
         {
             if (def == null || ExcludedDefNames.Contains(def.defName))
+            {
+                return false;
+            }
+            // Pick Up And Haul's own def would now open the same sweep the
+            // vanilla haul entry does, so it is dropped rather than shown
+            // twice. Only when PUAH is installed - see PuahCompat.
+            if (PuahCompat.IsRedundantEntry(def))
             {
                 return false;
             }

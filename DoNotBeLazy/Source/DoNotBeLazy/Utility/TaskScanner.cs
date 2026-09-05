@@ -1,3 +1,4 @@
+using System;
 using System.Collections.Generic;
 using RimWorld;
 using Verse;
@@ -47,19 +48,15 @@ namespace DoNotBeLazy.Utility
             return target.Cell.ContainsStaticFire(map);
         }
 
-        // Does this WorkGiver have anything at all to do inside the radius?
-        // Asked at menu-build time, where the answer decides whether an entry
-        // is offered - so it stops at the first hit rather than building a
-        // pool nobody has asked for yet.
-        public static bool HasTargetInRadius(IntVec3 center, int radius, Map map, WorkGiverDef workGiverDef, Pawn forPawn)
-        {
-            return FindTargets(center, radius, map, workGiverDef, forPawn, 1).Count > 0;
-        }
-
         // limit > 0 stops the scan as soon as that many targets exist. Zero -
         // the sweep's own call - means "everything", which is what a pool
         // needs.
-        public static List<LocalTargetInfo> FindTargets(IntVec3 center, int radius, Map map, WorkGiverDef workGiverDef, Pawn forPawn, int limit = 0)
+        // filter, when given, narrows the pool to the specific order the
+        // player gave rather than everything the WorkGiver can do - see
+        // PlantCompat, where one def serves both "chop wood" and "cut
+        // plants". Only ScanThings applies it: it is a question about a
+        // Thing, and a scanCells def has no Thing to ask about.
+        public static List<LocalTargetInfo> FindTargets(IntVec3 center, int radius, Map map, WorkGiverDef workGiverDef, Pawn forPawn, int limit = 0, Predicate<Thing> filter = null)
         {
             var results = new List<LocalTargetInfo>();
 
@@ -89,7 +86,7 @@ namespace DoNotBeLazy.Utility
 
             if (workGiverDef.scanThings && (limit <= 0 || results.Count < limit))
             {
-                ScanThings(center, radiusSquared, map, workGiverDef, scanner, forPawn, allowedArea, results, limit);
+                ScanThings(center, radiusSquared, map, workGiverDef, scanner, forPawn, allowedArea, results, limit, filter);
             }
 
             // a limited scan is a menu probe, and one of those runs per
@@ -132,16 +129,6 @@ namespace DoNotBeLazy.Utility
                     continue;
                 }
 
-                if (!map.reservationManager.CanReserve(forPawn, cell))
-                {
-                    continue;
-                }
-
-                if (TargetIsBurning(cell, map))
-                {
-                    continue;
-                }
-
                 // zone "allow sow" / hydroponics power - lives in
                 // WorkGiver_GrowerSow.ExtraRequirements, which only
                 // PotentialWorkCellsGlobal calls, so we apply it ourselves
@@ -150,7 +137,7 @@ namespace DoNotBeLazy.Utility
                     continue;
                 }
 
-                if (!GrowerCompat.CanReachTarget(forPawn, cell, scanner))
+                if (TargetIsBurning(cell, map))
                 {
                     continue;
                 }
@@ -168,6 +155,35 @@ namespace DoNotBeLazy.Utility
                     continue;
                 }
 
+                // Reservation and reachability come last on purpose, and the
+                // ordering above is otherwise cheapest-and-most-selective
+                // first. Every check here is part of one conjunction, so the
+                // result is identical whatever the order; what changes is how
+                // much work a rejected cell costs. These two are the
+                // expensive pair - CanReach walks regions - and for the
+                // scanCells defs that matter they are also the least
+                // selective, because HasJobOnCell for BuildRoofs,
+                // RemoveRoofs, ConstructRemoveFloors, ConstructSmoothFloors,
+                // ConstructSmoothWalls and CleanClearSnow is a designation or
+                // snow-depth lookup that rejects nearly every cell for
+                // nothing.
+                //
+                // Reordered 2026-09-02, when Construction joined the float
+                // menu's radius probe: a right-click that finds nothing runs
+                // this loop once per scanCells def over ~1,800 cells at the
+                // configured radius of 24, and paying for reachability on all
+                // of them first was the difference between a hitch and a
+                // freeze.
+                if (!map.reservationManager.CanReserve(forPawn, cell))
+                {
+                    continue;
+                }
+
+                if (!GrowerCompat.CanReachTarget(forPawn, cell, scanner))
+                {
+                    continue;
+                }
+
                 results.Add(cell);
             }
         }
@@ -177,7 +193,7 @@ namespace DoNotBeLazy.Utility
         // construction and bills included. Iterating that straight was an
         // NRE. Vanilla's JobGiver_Work does the same thing we do here: fall
         // back to the thing lister.
-        private static void ScanThings(IntVec3 center, float radiusSquared, Map map, WorkGiverDef workGiverDef, WorkGiver_Scanner scanner, Pawn forPawn, Area allowedArea, List<LocalTargetInfo> results, int limit)
+        private static void ScanThings(IntVec3 center, float radiusSquared, Map map, WorkGiverDef workGiverDef, WorkGiver_Scanner scanner, Pawn forPawn, Area allowedArea, List<LocalTargetInfo> results, int limit, Predicate<Thing> filter = null)
         {
             // the burning-target filter below would throw out every single
             // candidate here - the target IS the fire
@@ -207,6 +223,14 @@ namespace DoNotBeLazy.Utility
                 }
 
                 if (thing == null || thing.Map != map)
+                {
+                    continue;
+                }
+
+                // asked before anything expensive: this is the player's own
+                // order, so a thing that fails it is never a candidate no
+                // matter what the WorkGiver thinks
+                if (filter != null && !filter(thing))
                 {
                     continue;
                 }
