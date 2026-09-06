@@ -17,6 +17,18 @@ namespace DoNotBeLazy.Core
 
         public float needThreshold = 0.05f;
         public float moodThreshold = 0.10f;
+
+        // Rest gets its own, higher threshold for the same reason mood does:
+        // 5% rest is not "getting tired", it is a pawn about to collapse
+        // where they stand. Added 2026-09-06 after a `* PackVehicle` sweep
+        // ran a pawn through fourteen consecutive LoadVehicle jobs with sleep
+        // under 10% - the sweep was behaving exactly as configured, and the
+        // configuration was wrong.
+        //
+        // This matters more for a sweep than for ordinary work: a swept pawn
+        // is on a FORCED job, and a forced job does not let the think tree
+        // send them to bed. NeedMonitor is the only thing that will.
+        public float restThreshold = 0.10f;
         public bool showSweepOverlay = true;
         public bool verboseLogging = false;
         public bool jobDiagnostics = false;
@@ -28,6 +40,7 @@ namespace DoNotBeLazy.Core
             Scribe_Values.Look(ref centerOutOrder, "centerOutOrder", true);
             Scribe_Values.Look(ref needThreshold, "needThreshold", 0.05f);
             Scribe_Values.Look(ref moodThreshold, "moodThreshold", 0.10f);
+            Scribe_Values.Look(ref restThreshold, "restThreshold", 0.10f);
             Scribe_Values.Look(ref showSweepOverlay, "showSweepOverlay", true);
             Scribe_Values.Look(ref verboseLogging, "verboseLogging", false);
             Scribe_Values.Look(ref jobDiagnostics, "jobDiagnostics", false);
@@ -80,8 +93,12 @@ namespace DoNotBeLazy.Core
             Text.Font = GameFont.Small;
 
             listing.Gap();
-            listing.Label($"Need interrupt threshold: {needThreshold:P0}");
+            listing.Label($"Need interrupt threshold (hunger, recreation): {needThreshold:P0}");
             needThreshold = listing.Slider(needThreshold, 0.01f, 0.20f);
+
+            listing.Gap();
+            listing.Label($"Sleep interrupt threshold: {restThreshold:P0}");
+            restThreshold = listing.Slider(restThreshold, 0.01f, 0.30f);
 
             listing.Gap();
             listing.Label($"Mood interrupt threshold: {moodThreshold:P0}");

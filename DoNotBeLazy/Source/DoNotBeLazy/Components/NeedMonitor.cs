@@ -5,9 +5,16 @@ using DoNotBeLazy.Core;
 namespace DoNotBeLazy.Components
 {
     // GameComponent: every 60 ticks, checks pawns currently in an active
-    // sweep for critical needs (hunger, recreation, sleep - vs needThreshold;
-    // mood has its own separate moodThreshold, since 5% mood is basically a
-    // mental break already and the player asked for a higher default there).
+    // sweep for critical needs. Hunger and recreation share needThreshold;
+    // mood and sleep each have their own, higher one (moodThreshold,
+    // restThreshold), because 5% of either is not "getting low" - it is a
+    // mental break and a collapse respectively. Sleep was split out
+    // 2026-09-06 after a pawn ran fourteen LoadVehicle jobs under 10% rest.
+    //
+    // A swept pawn is on a FORCED job, and a forced job does not let the
+    // vanilla think tree send them to bed. This class is the only thing that
+    // will, which is why its thresholds have to be generous rather than
+    // last-ditch.
     // If any is critical, the pawn's forced job is ended so vanilla AI takes
     // over - EndCurrentJob defaults to startNewJob:true, so the pawn's
     // normal think tree picks a new job immediately, which for hunger/rest/
@@ -61,6 +68,7 @@ namespace DoNotBeLazy.Components
 
             float threshold = DoNotBeLazyMod.Settings.needThreshold;
             float moodThreshold = DoNotBeLazyMod.Settings.moodThreshold;
+            float restThreshold = DoNotBeLazyMod.Settings.restThreshold;
 
             foreach (Map map in Find.Maps)
             {
@@ -79,7 +87,7 @@ namespace DoNotBeLazy.Components
                         continue;
                     }
 
-                    if (!NeedIsCritical(pawn, threshold, moodThreshold))
+                    if (!NeedIsCritical(pawn, threshold, moodThreshold, restThreshold))
                     {
                         continue;
                     }
@@ -90,11 +98,14 @@ namespace DoNotBeLazy.Components
             }
         }
 
-        private static bool NeedIsCritical(Pawn pawn, float threshold, float moodThreshold)
+        // Rest and mood each have their own threshold; hunger and
+        // recreation share needThreshold. Rest was split out 2026-09-06 - see
+        // the comment on DoNotBeLazySettings.restThreshold.
+        private static bool NeedIsCritical(Pawn pawn, float threshold, float moodThreshold, float restThreshold)
         {
             return NeedIsCritical(pawn.needs?.food, threshold)
                 || NeedIsCritical(pawn.needs?.joy, threshold)
-                || NeedIsCritical(pawn.needs?.rest, threshold)
+                || NeedIsCritical(pawn.needs?.rest, restThreshold)
                 || NeedIsCritical(pawn.needs?.mood, moodThreshold);
         }
 
@@ -109,8 +120,9 @@ namespace DoNotBeLazy.Components
 
             float threshold = DoNotBeLazyMod.Settings.needThreshold + ResumeMargin;
             float moodThreshold = DoNotBeLazyMod.Settings.moodThreshold + ResumeMargin;
+            float restThreshold = DoNotBeLazyMod.Settings.restThreshold + ResumeMargin;
 
-            return !NeedIsCritical(pawn, threshold, moodThreshold);
+            return !NeedIsCritical(pawn, threshold, moodThreshold, restThreshold);
         }
 
         private static bool NeedIsCritical(Need need, float threshold)
