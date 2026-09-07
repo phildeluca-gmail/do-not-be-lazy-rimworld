@@ -56,6 +56,26 @@ namespace DoNotBeLazy.Components
         // would otherwise hand out the same preparatory job forever.
         public HashSet<LocalTargetInfo> Requeued { get; } = new HashSet<LocalTargetInfo>();
 
+        // How many times each target has been handed out and come straight
+        // back as a recoverable failure. Added 2026-09-07.
+        //
+        // WHY. A target is removed from the pool when its job is issued, so
+        // one failure never repeated. The rescan put it back:
+        // AssignNextTask rescans when a pawn runs the pool dry, and a
+        // blueprint that cannot accept a delivery is found again every time,
+        // handed out again, and fails again. On 2026-09-07 one wall
+        // blueprint was issued FORTY times - 37 Incompletable, 1 Errored, 1
+        // Succeeded - Inga took five different blueprints inside a single
+        // tick, and four pawns tripped RimWorld's own "started 10 jobs in 10
+        // ticks" guard. Colony-wide that session: 1386 Incompletable against
+        // 4466 Succeeded.
+        //
+        // The count is per ORDER, not per pawn, on purpose. A target that
+        // one pawn cannot use is usually one no pawn can use, and the
+        // failures were spread across the whole sweep rather than
+        // concentrated on one colonist.
+        public Dictionary<LocalTargetInfo, int> TargetFailures { get; } = new Dictionary<LocalTargetInfo, int>();
+
         // Scanner orders only: the highest daysWorkingSinceLastFinding seen
         // on this station so far. A find resets that field to zero, so the
         // number going down is the completion condition - see
@@ -106,6 +126,14 @@ namespace DoNotBeLazy.Components
         // "this sweep isn't going to work" rather than "unlucky target".
         private const int MaxConsecutiveFailures = 8;
 
+        // How many recoverable failures one target may cost the sweep before
+        // it is dropped for good. Added 2026-09-07 - see
+        // SweepOrder.TargetFailures. Three rather than one because a
+        // genuinely transient failure exists: a blueprint whose cell is
+        // briefly occupied, a haul destination a teammate is standing on.
+        // Three consecutive is not transient.
+        private const int MaxTargetFailures = 3;
+
         // A pawn whose need never climbs back over the threshold - a mood
         // that just stays low - would otherwise hold a paused sweep, and its
         // share of the shared pool, forever. Half an in-game day.
@@ -142,6 +170,12 @@ namespace DoNotBeLazy.Components
         // against the others. Reset on any successful task.
         private readonly Dictionary<Pawn, int> consecutiveFailures = new Dictionary<Pawn, int>();
 
+        // The pooled target each pawn was last sent to. Notify_JobEnded is
+        // handed a pawn and a JobCondition and nothing else, so without this
+        // there is no way to charge a failure to the target that caused it.
+        private readonly Dictionary<Pawn, LocalTargetInfo> lastAssignedTarget =
+            new Dictionary<Pawn, LocalTargetInfo>();
+
         // pawns pulled out of their sweep job for a critical need but still
         // tracked in activeSweeps - NeedMonitor adds them here via
         // PauseForNeed instead of RemoveSweep, so the sweep can resume once
@@ -150,7 +184,18 @@ namespace DoNotBeLazy.Components
         //
         // (was a HashSet, and resumption was "first job end after a pause
         // wins". That's the bug - see Notify_JobEnded.)
-        private readonly Dictionary<Pawn, int> pausedForNeed = new Dictionary<Pawn, int>();
+        // Tick the pause started, and which need caused it. Both travel
+        // together in one entry on purpose: a second dictionary keyed by pawn
+        // would have to be cleared at all seven sites that drop a pause, and
+        // one missed site is a leak nobody would notice. Added 2026-09-07 -
+        // see NeedMonitor.CriticalNeedLabel for why the need is recorded.
+        private struct PauseInfo
+        {
+            public int tick;
+            public string need;
+        }
+
+        private readonly Dictionary<Pawn, PauseInfo> pausedForNeed = new Dictionary<Pawn, PauseInfo>();
 
         // Workstation orders whose station answered null, and the tick to ask
         // it again on. A workstation order has no pool, so nothing else would
@@ -428,6 +473,7 @@ namespace DoNotBeLazy.Components
             activeSweeps.Remove(pawn);
             pausedForNeed.Remove(pawn);
             consecutiveFailures.Remove(pawn);
+            lastAssignedTarget.Remove(pawn);
             workstationRetryAt.Remove(pawn);
             areaRetryAt.Remove(pawn);
             areaRetries.Remove(pawn);
@@ -446,14 +492,18 @@ namespace DoNotBeLazy.Components
         // GiveJob - without it, this EndCurrentJob call would trip
         // JobTrackerPatch's postfix immediately and read as "sweep task
         // ended", removing the sweep before the pawn even gets to eat.
-        public void PauseForNeed(Pawn pawn)
+        public void PauseForNeed(Pawn pawn, string need)
         {
             if (!activeSweeps.ContainsKey(pawn))
             {
                 return;
             }
 
-            pausedForNeed[pawn] = Find.TickManager.TicksGame;
+            pausedForNeed[pawn] = new PauseInfo
+            {
+                tick = Find.TickManager.TicksGame,
+                need = need
+            };
 
             if (pawn.jobs?.curJob == null)
             {
@@ -781,7 +831,7 @@ namespace DoNotBeLazy.Components
             // wandered off" reports are almost always answered by this line
             Logger.Message($"{pawn.LabelShort}: job ended {condition} ({order.WorkGiverDef.defName})");
 
-            if (pausedForNeed.TryGetValue(pawn, out int pausedAt))
+            if (pausedForNeed.TryGetValue(pawn, out PauseInfo paused))
             {
                 // This is NOT a sweep task ending - the pawn is off dealing
                 // with a need. Used to resume right here, on the first job
@@ -797,17 +847,17 @@ namespace DoNotBeLazy.Components
                 // A job end is only a prompt to look again now.
                 if (!NeedMonitor.NeedsSatisfied(pawn))
                 {
-                    if (Find.TickManager.TicksGame - pausedAt > MaxPauseTicks)
+                    if (Find.TickManager.TicksGame - paused.tick > MaxPauseTicks)
                     {
                         // need isn't recovering (a mood that just stays
                         // low). Don't hold the pool hostage over it.
-                        RemoveSweep(pawn, $"still under threshold after {MaxPauseTicks} ticks paused");
+                        RemoveSweep(pawn, $"{paused.need} still under threshold after {MaxPauseTicks} ticks paused");
                     }
                     return;
                 }
 
                 pausedForNeed.Remove(pawn);
-                Logger.Message($"{pawn.LabelShort}: needs satisfied, resuming sweep ({order.WorkGiverDef.defName})");
+                Logger.Message($"{pawn.LabelShort}: {paused.need} satisfied, resuming sweep ({order.WorkGiverDef.defName})");
                 AssignNextTask(pawn, order);
                 return;
             }
@@ -866,6 +916,8 @@ namespace DoNotBeLazy.Components
                 return;
             }
 
+            NoteTargetFailure(pawn, order, condition);
+
             consecutiveFailures.TryGetValue(pawn, out int failures);
             failures++;
             if (failures >= MaxConsecutiveFailures)
@@ -876,6 +928,41 @@ namespace DoNotBeLazy.Components
 
             consecutiveFailures[pawn] = failures;
             AssignNextTask(pawn, order);
+        }
+
+        // Charge one recoverable failure to whatever target this pawn was
+        // last sent to, and retire the target once it has cost the sweep
+        // MaxTargetFailures. Added 2026-09-07 - see SweepOrder.TargetFailures
+        // for the forty-times blueprint that made it necessary.
+        //
+        // Logged only on the retirement, never per failure: the per-target
+        // line is exactly the shape the standing rule forbids, and the
+        // failures themselves are already visible as "job ended
+        // Incompletable".
+        private void NoteTargetFailure(Pawn pawn, SweepOrder order, JobCondition condition)
+        {
+            if (!lastAssignedTarget.TryGetValue(pawn, out LocalTargetInfo target))
+            {
+                return;
+            }
+
+            lastAssignedTarget.Remove(pawn);
+
+            order.TargetFailures.TryGetValue(target, out int failures);
+            failures++;
+            order.TargetFailures[target] = failures;
+
+            if (failures != MaxTargetFailures)
+            {
+                return;
+            }
+
+            // Drop it from the pool now as well. AddNewTargets keeps it out
+            // from here on, but a copy may already be sitting in the pool -
+            // requeued as a preparatory job, or re-added by a rescan that
+            // ran before the count reached the cap.
+            order.SharedPool.Remove(target);
+            Logger.Message($"dropping {target} from the {order.WorkGiverDef.defName} pool - failed {failures} times ({condition})");
         }
 
         // Split JobCondition into "that target didn't work out" (keep the
@@ -1022,7 +1109,7 @@ namespace DoNotBeLazy.Components
                 // outside their allowed area, unreachable). Only the first
                 // kind leaves the pool - conflating the two is what the
                 // discard bug was.
-                if (TargetIsGone(target))
+                if (TargetIsGone(target) || IsRetired(order, target))
                 {
                     order.SharedPool.RemoveAt(i);
                     continue;
@@ -1088,6 +1175,7 @@ namespace DoNotBeLazy.Components
                     order.SharedPool.Add(target);
                 }
 
+                lastAssignedTarget[pawn] = target;
                 GiveJob(pawn, job);
                 return;
             }
@@ -1301,6 +1389,12 @@ namespace DoNotBeLazy.Components
         // the pool the moment it was handed out. It isn't now - a rescan
         // finds everything still sitting there and would double it every
         // time. Only take what we don't already have.
+        private static bool IsRetired(SweepOrder order, LocalTargetInfo target)
+        {
+            return order.TargetFailures.TryGetValue(target, out int failures)
+                && failures >= MaxTargetFailures;
+        }
+
         private static void AddNewTargets(SweepOrder order, List<LocalTargetInfo> found)
         {
             if (found == null || found.Count == 0)
@@ -1311,6 +1405,15 @@ namespace DoNotBeLazy.Components
             var have = new HashSet<LocalTargetInfo>(order.SharedPool);
             foreach (LocalTargetInfo target in found)
             {
+                // A retired target is found by every rescan for as long as it
+                // exists, which is precisely how it got handed out forty
+                // times. This is the gate that matters; the pool-walk check
+                // is only there for a copy that slipped in earlier.
+                if (IsRetired(order, target))
+                {
+                    continue;
+                }
+
                 if (have.Add(target))
                 {
                     order.SharedPool.Add(target);

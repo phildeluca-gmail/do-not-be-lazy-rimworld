@@ -92,8 +92,9 @@ namespace DoNotBeLazy.Components
                         continue;
                     }
 
-                    sweepManager.PauseForNeed(pawn);
-                    Logger.Message($"{pawn.LabelShort} paused from sweep: need at/below threshold. Will resume once addressed.");
+                    string need = CriticalNeedLabel(pawn, threshold, moodThreshold, restThreshold);
+                    sweepManager.PauseForNeed(pawn, need);
+                    Logger.Message($"{pawn.LabelShort} paused from sweep: {need} at/below threshold. Will resume once addressed.");
                 }
             }
         }
@@ -103,10 +104,51 @@ namespace DoNotBeLazy.Components
         // the comment on DoNotBeLazySettings.restThreshold.
         private static bool NeedIsCritical(Pawn pawn, float threshold, float moodThreshold, float restThreshold)
         {
-            return NeedIsCritical(pawn.needs?.food, threshold)
-                || NeedIsCritical(pawn.needs?.joy, threshold)
-                || NeedIsCritical(pawn.needs?.rest, restThreshold)
-                || NeedIsCritical(pawn.needs?.mood, moodThreshold);
+            return CriticalNeedLabel(pawn, threshold, moodThreshold, restThreshold) != null;
+        }
+
+        // Which need pushed the pawn under, and how far under it is.
+        //
+        // Added 2026-09-07 because the pause line said only "need at/below
+        // threshold". A Jazzy report - assigned a deconstruct, pulled out one
+        // second later, twice running - could not be answered from the log at
+        // all: nothing said whether it was food, rest, joy or mood, so there
+        // was no way to tell a working pause from a stuck one. The name is
+        // the whole diagnostic value of the line.
+        //
+        // Order matters only for the report: food first because it is the
+        // most common and the most actionable. Returns null when nothing is
+        // under, which is what NeedIsCritical above tests.
+        public static string CriticalNeedLabel(Pawn pawn, float threshold, float moodThreshold, float restThreshold)
+        {
+            if (NeedIsCritical(pawn?.needs?.food, threshold))
+            {
+                return Describe("Food", pawn.needs.food);
+            }
+
+            if (NeedIsCritical(pawn?.needs?.rest, restThreshold))
+            {
+                return Describe("Rest", pawn.needs.rest);
+            }
+
+            if (NeedIsCritical(pawn?.needs?.joy, threshold))
+            {
+                return Describe("Recreation", pawn.needs.joy);
+            }
+
+            if (NeedIsCritical(pawn?.needs?.mood, moodThreshold))
+            {
+                return Describe("Mood", pawn.needs.mood);
+            }
+
+            return null;
+        }
+
+        // "Food 14%" - the level is what says whether a pause was marginal or
+        // desperate, and it costs one call to read.
+        private static string Describe(string label, Need need)
+        {
+            return label + " " + (need.CurLevelPercentage * 100f).ToString("F0") + "%";
         }
 
         // What SweepManager asks before resuming a paused pawn. Same four
