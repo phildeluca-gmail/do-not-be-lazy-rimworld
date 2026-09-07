@@ -151,6 +151,26 @@ namespace DoNotBeLazy.Components
             return label + " " + (need.CurLevelPercentage * 100f).ToString("F0") + "%";
         }
 
+        // The same question GameComponentTick asks, but for a caller that
+        // does not have the thresholds to hand - BeginAreaSweep, deciding
+        // whether a pawn it is about to recruit is already under.
+        //
+        // Added 2026-09-07. Before it, sweep recruitment tested drafted,
+        // capable and work-type and nothing else, so a new * order pulled in
+        // a pawn at Rest 1% and set them hauling.
+        public static string CriticalNeedLabelFor(Pawn pawn)
+        {
+            if (pawn?.needs == null || DoNotBeLazyMod.Settings == null)
+            {
+                return null;
+            }
+
+            return CriticalNeedLabel(pawn,
+                DoNotBeLazyMod.Settings.needThreshold,
+                DoNotBeLazyMod.Settings.moodThreshold,
+                DoNotBeLazyMod.Settings.restThreshold);
+        }
+
         // What SweepManager asks before resuming a paused pawn. Same four
         // needs, thresholds raised by ResumeMargin - see the comment on it.
         public static bool NeedsSatisfied(Pawn pawn)

@@ -193,6 +193,13 @@ namespace DoNotBeLazy.Components
         {
             public int tick;
             public string need;
+
+            // Whether the long-pause line has already been emitted for this
+            // pause. Added 2026-09-07 with the give-up removal: the check now
+            // runs every StateCheckIntervalTicks for as long as the pause
+            // lasts, and a line per check is exactly the shape the standing
+            // rule forbids.
+            public bool warned;
         }
 
         private readonly Dictionary<Pawn, PauseInfo> pausedForNeed = new Dictionary<Pawn, PauseInfo>();
@@ -273,6 +280,17 @@ namespace DoNotBeLazy.Components
                 // null path) and bench orders are never scanner work, so
                 // these two are exclusive - the watchdog just returns on
                 // anything that isn't a scanner.
+                // Resuming used to happen ONLY on a job end. A pawn whose
+                // need recovered without ending a job we would hear about -
+                // or whose replacement jobs all ended while still under
+                // threshold - sat paused with nothing left to prompt a
+                // second look. Polled here for the same reason the three
+                // retries below are: there is no event to hang it on.
+                if (TryResumeFromNeed(pawn, activeSweeps[pawn]))
+                {
+                    continue;
+                }
+
                 TryScannerWatchdog(pawn);
                 TryWorkstationRetry(pawn);
                 TryAreaRetry(pawn);
@@ -798,8 +816,27 @@ namespace DoNotBeLazy.Components
             // with genuinely nothing to do drop out there instead.
             foreach (Pawn pawn in eligiblePawns)
             {
-                pausedForNeed.Remove(pawn);
                 activeSweeps[pawn] = order;
+
+                // A pawn already under threshold JOINS the sweep but does not
+                // start work - it is paused on the spot and picks the order
+                // up when the need is dealt with. Added 2026-09-07.
+                //
+                // This loop used to clear the pause unconditionally and
+                // assign immediately. Boom was paused on Rest 4% at 16:33,
+                // recruited by the next * haul at 16:38, and paused again one
+                // second later on Rest 1% - his rest fell while he hauled,
+                // because a new order simply forgot he was resting. Session
+                // total that day: 76 pauses against 30 resumes.
+                string need = NeedMonitor.CriticalNeedLabelFor(pawn);
+                if (need != null)
+                {
+                    PauseForNeed(pawn, need);
+                    Logger.Message($"{pawn.LabelShort} joined the sweep paused: {need} ({order.WorkGiverDef.defName})");
+                    continue;
+                }
+
+                pausedForNeed.Remove(pawn);
                 AssignNextTask(pawn, order);
             }
         }
@@ -847,12 +884,15 @@ namespace DoNotBeLazy.Components
                 // A job end is only a prompt to look again now.
                 if (!NeedMonitor.NeedsSatisfied(pawn))
                 {
-                    if (Find.TickManager.TicksGame - paused.tick > MaxPauseTicks)
-                    {
-                        // need isn't recovering (a mood that just stays
-                        // low). Don't hold the pool hostage over it.
-                        RemoveSweep(pawn, $"{paused.need} still under threshold after {MaxPauseTicks} ticks paused");
-                    }
+                    // Used to RemoveSweep here once MaxPauseTicks elapsed, on
+                    // the reasoning that a mood which never recovers would
+                    // hold the pool forever. Ordered changed 2026-09-07: the
+                    // sweep is meant to survive any number of need breaks and
+                    // end only when the WORK is done, so a long pause is now
+                    // reported once and waited out. A paused pawn holds no
+                    // target - its own was consumed when its job was issued -
+                    // so the pool is not actually hostage to it.
+                    WarnOnLongPause(pawn, paused);
                     return;
                 }
 
@@ -963,6 +1003,44 @@ namespace DoNotBeLazy.Components
             // ran before the count reached the cap.
             order.SharedPool.Remove(target);
             Logger.Message($"dropping {target} from the {order.WorkGiverDef.defName} pool - failed {failures} times ({condition})");
+        }
+
+        // Poll a paused pawn and put it back on its order once the need it
+        // stopped for is dealt with. Returns true when it acted, so the
+        // caller skips the retries - a pawn that just resumed has a job.
+        private bool TryResumeFromNeed(Pawn pawn, SweepOrder order)
+        {
+            if (!pausedForNeed.TryGetValue(pawn, out PauseInfo paused))
+            {
+                return false;
+            }
+
+            if (!NeedMonitor.NeedsSatisfied(pawn))
+            {
+                WarnOnLongPause(pawn, paused);
+                return true;
+            }
+
+            pausedForNeed.Remove(pawn);
+            Logger.Message($"{pawn.LabelShort}: {paused.need} satisfied, resuming sweep ({order.WorkGiverDef.defName})");
+            AssignNextTask(pawn, order);
+            return true;
+        }
+
+        // One line per pause, not one per check. A pause that outlives
+        // MaxPauseTicks is worth knowing about - it is usually a mood that
+        // will not climb - but it no longer ends the sweep, so it must not
+        // fill the log while it waits.
+        private void WarnOnLongPause(Pawn pawn, PauseInfo paused)
+        {
+            if (paused.warned || Find.TickManager.TicksGame - paused.tick <= MaxPauseTicks)
+            {
+                return;
+            }
+
+            paused.warned = true;
+            pausedForNeed[pawn] = paused;
+            Logger.Message($"{pawn.LabelShort}: {paused.need} still under threshold after {MaxPauseTicks} ticks - staying paused, sweep held");
         }
 
         // Split JobCondition into "that target didn't work out" (keep the
@@ -1157,7 +1235,22 @@ namespace DoNotBeLazy.Components
                 // bug turned on, so name it explicitly - "which crop did we
                 // actually tell them to plant, on which cell" is the single
                 // most useful line in a sow trace
+                // The cell and the two distances, added 2026-09-07. `target`
+                // prints coordinates for a CELL target but only a label and
+                // id for a THING target, so a tree-felling sweep left no
+                // record of where anything was - and a report that jobs were
+                // going to the pawn's own vicinity rather than the clicked
+                // centre could be neither confirmed nor refuted from the log.
+                // c= is distance from the order's scan centre, p= from the
+                // pawn; under centre-out, c should climb as the sweep runs
+                // and p should not.
+                float fromCentre = (target.Cell - order.ScanCenter).LengthHorizontal;
+                float fromPawn = (target.Cell - pawn.Position).LengthHorizontal;
+
                 Logger.Message($"{pawn.LabelShort}: {job.def.defName} on {target}"
+                    + $" at {target.Cell} c={fromCentre:F0} p={fromPawn:F0}"
+                    + DescribeQueue(job)
+                    + (order.CenterOut ? "" : " [pawn-nearest]")
                     + (job.plantDefToSow != null ? $" plant={job.plantDefToSow.defName}" : "")
                     + $" ({order.SharedPool.Count} left)"
                     // skips walked past on the way to this job, folded in
@@ -1449,6 +1542,44 @@ namespace DoNotBeLazy.Components
         // Same loop for both rather than two: the pawn distance is needed in
         // either case, so the modes differ only in which value ranks and
         // which one is the tie-break.
+        // What a multi-target job actually claimed, added 2026-09-07.
+        //
+        // Pick Up And Haul's HaulToInventory job does not carry one thing, it
+        // fills the pawn's inventory from a QUEUE and then makes a single
+        // delivery run. Our pool gives out one entry per assignment, so on
+        // 2026-09-07 a 285-target haul sweep with 43 pawns fell by eleven
+        // across fifty-six assignments and nothing in the log said why - the
+        // other stacks were claimed inside the job, invisible to us, and then
+        // skipped by everyone else as "reserved". Peak that session: 225 of
+        // 285 targets reserved.
+        //
+        // Read off vanilla's own Job fields (targetQueueA / countQueue,
+        // verified against lib\Assembly-CSharp.dll), so this names no Pick Up
+        // And Haul type and stays a soft dependency - the same rule
+        // PuahCompat, VehicleCompat and RimWarReader follow. Empty string for
+        // an ordinary single-target job, so no other sweep gains a character.
+        private static string DescribeQueue(Job job)
+        {
+            int queued = job?.targetQueueA?.Count ?? 0;
+            if (queued == 0)
+            {
+                return "";
+            }
+
+            int total = 0;
+            if (job.countQueue != null)
+            {
+                for (int i = 0; i < job.countQueue.Count; i++)
+                {
+                    total += job.countQueue[i];
+                }
+            }
+
+            return total > 0
+                ? $" +{queued} queued ({total} items)"
+                : $" +{queued} queued";
+        }
+
         private static int NextTargetIndex(IntVec3 center, IntVec3 pawnPos, List<LocalTargetInfo> pool, HashSet<LocalTargetInfo> skip, bool centerOut)
         {
             // LengthHorizontalSquared is int on IntVec3, so these compare
