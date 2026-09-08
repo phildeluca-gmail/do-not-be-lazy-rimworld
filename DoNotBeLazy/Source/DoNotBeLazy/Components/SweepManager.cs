@@ -510,7 +510,21 @@ namespace DoNotBeLazy.Components
         // GiveJob - without it, this EndCurrentJob call would trip
         // JobTrackerPatch's postfix immediately and read as "sweep task
         // ended", removing the sweep before the pawn even gets to eat.
-        public void PauseForNeed(Pawn pawn, string need)
+        // endCurrentJob distinguishes the two callers, and getting it wrong
+        // froze pawns on 2026-09-07.
+        //
+        // NeedMonitor calls this MID-SWEEP: the pawn is running a job WE gave
+        // it, and that job has to be ended or the pawn keeps hauling while
+        // starving. True.
+        //
+        // BeginAreaSweep calls it at RECRUITMENT: the pawn has not been given
+        // a sweep job at all, and pawn.jobs.curJob is whatever vanilla had it
+        // doing - very possibly walking to a meal, which is exactly the thing
+        // that would clear the pause. Ending it there cancels the cure. Both
+        // m Bacon and Ildiko accepted a * order and then stood still, because
+        // the order cancelled the job they were already on and the pause then
+        // waited for a need that nothing was left to satisfy. False.
+        public void PauseForNeed(Pawn pawn, string need, bool endCurrentJob = true)
         {
             if (!activeSweeps.ContainsKey(pawn))
             {
@@ -523,7 +537,7 @@ namespace DoNotBeLazy.Components
                 need = need
             };
 
-            if (pawn.jobs?.curJob == null)
+            if (!endCurrentJob || pawn.jobs?.curJob == null)
             {
                 return;
             }
@@ -831,8 +845,10 @@ namespace DoNotBeLazy.Components
                 string need = NeedMonitor.CriticalNeedLabelFor(pawn);
                 if (need != null)
                 {
-                    PauseForNeed(pawn, need);
-                    Logger.Message($"{pawn.LabelShort} joined the sweep paused: {need} ({order.WorkGiverDef.defName})");
+                    // false: leave the pawn on whatever it is already doing.
+                    // See PauseForNeed for why ending it here froze pawns.
+                    PauseForNeed(pawn, need, false);
+                    Logger.Message($"{pawn.LabelShort} joined the sweep paused: {need} ({order.WorkGiverDef.defName}) - left on its current job");
                     continue;
                 }
 
