@@ -23,13 +23,30 @@ namespace DoNotBeLazy.Components
         // Same target this many times in a row, inside the window below,
         // before we call it a loop. A pawn legitimately re-takes a target a
         // few times - a haul that gets interrupted, a bill re-issued - so the
-        // bar is set well above that. RimWorld's own guard fires at 10 in one
-        // tick; this is deliberately less trigger-happy than that.
-        private const int RepeatsBeforeSuspect = 25;
+        // bar is set above that.
+        //
+        // It was 25 until 2026-09-10, then 12, and both numbers were too high
+        // to ever be reached. Pawn_JobTracker.StartJob stops a pawn when
+        // jobsGivenThisTick is over 10, so the eleventh job in the same tick
+        // prints "started 10 jobs in one tick" and the pawn is given a wait
+        // job instead. Eleven jobs at the same target is therefore the most
+        // this counter can ever see in one tick, and asking for twelve asked
+        // for one more than the game allows. Read out of the decompiled
+        // StartJob on 2026-09-11, not from memory.
+        private const int RepeatsBeforeSuspect = 10;
 
         // Repeats only count while they keep arriving. A pawn that takes the
         // same target twice an hour is not looping.
-        private const int WindowTicks = 60;
+        //
+        // This was 60 ticks, one second, until 2026-09-11, and one second was
+        // too short. RimWorld cuts the pawn off after ten jobs in a tick, and
+        // the next ten do not arrive until three to six seconds later - so
+        // every group of ten was counted on its own and the count was thrown
+        // away before the next group arrived. Jerbear produced nine such
+        // groups on Thing_Bedroll9043738 between 22:16:42 and 22:17:18 and the
+        // count never got past eleven. Ten seconds holds the count across
+        // them.
+        private const int WindowTicks = 600;
 
         private struct Streak
         {
@@ -75,7 +92,16 @@ namespace DoNotBeLazy.Components
             Thing target = job.targetA.Thing;
             if (target == null)
             {
-                streaks.Remove(pawn);
+                // A job aimed at nothing tells us nothing, so leave the count
+                // where it is rather than throwing it away.
+                //
+                // WHY. This line used to be streaks.Remove(pawn) and it is why
+                // the watch recorded nothing on 2026-09-08 while a loop ran all
+                // evening. Vanilla stops a pawn at 10 jobs in one tick and
+                // immediately issues a recovery Wait, which has no target - so
+                // the count reached about eleven, was wiped, and started again
+                // at one. The count now ends only when the window below lapses
+                // or a different thing turns up.
                 return;
             }
 

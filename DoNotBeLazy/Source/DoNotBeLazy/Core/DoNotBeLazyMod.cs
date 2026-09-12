@@ -25,6 +25,10 @@ namespace DoNotBeLazy.Core
             // Framework is installed - see Patches/VehicleMenuPatch.
             Patches.VehicleMenuPatch.TryPatch(harmony);
 
+            // Same reason, for Use Bedrolls. No-op unless that mod is
+            // installed - see Patches/BedrollLoopPatch.
+            Patches.BedrollLoopPatch.TryPatch(harmony);
+
             Logger.Message("Harmony patches applied.");
         }
 
