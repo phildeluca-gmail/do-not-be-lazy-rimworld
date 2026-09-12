@@ -828,6 +828,12 @@ namespace DoNotBeLazy.Components
             // pawn - a 1-target pool dropped the other 35 without a word.
             // AssignNextTask rescans now, so let every pawn ask; the ones
             // with genuinely nothing to do drop out there instead.
+
+            // Counted so the player can be told once, after the loop, that
+            // the order took pawns it could not start - see the message
+            // below. Added 2026-09-12.
+            int joinedPaused = 0;
+
             foreach (Pawn pawn in eligiblePawns)
             {
                 activeSweeps[pawn] = order;
@@ -849,11 +855,33 @@ namespace DoNotBeLazy.Components
                     // See PauseForNeed for why ending it here froze pawns.
                     PauseForNeed(pawn, need, false);
                     Logger.Message($"{pawn.LabelShort} joined the sweep paused: {need} ({order.WorkGiverDef.defName}) - left on its current job");
+                    joinedPaused++;
                     continue;
                 }
 
                 pausedForNeed.Remove(pawn);
                 AssignNextTask(pawn, order);
+            }
+
+            // ONE message for the whole order, never one per pawn. Added
+            // 2026-09-12 on the user's words, which are the text verbatim: a
+            // clear-snow order took 31 pawns that day and 16 of them never
+            // moved, and the game said nothing at all - so an order that
+            // looked accepted just did less than it should have, with no way
+            // to tell that from a bug. Sixteen messages would be worse than
+            // the silence, and naming or counting the pawns was not asked
+            // for; the per-pawn log line above is where the names and the
+            // needs live. Architecture doc section 8.
+            //
+            // Same shape as the empty-scan rejection above: RejectInput, a
+            // look target on the clicked cell, not historical.
+            if (joinedPaused > 0)
+            {
+                Messages.Message(
+                    "Some pawns are too hungry, tired, or overworked.",
+                    new TargetInfo(clickCell, map),
+                    MessageTypeDefOf.RejectInput,
+                    false);
             }
         }
 
