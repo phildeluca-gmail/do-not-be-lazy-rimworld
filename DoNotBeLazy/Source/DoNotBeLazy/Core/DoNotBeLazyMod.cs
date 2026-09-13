@@ -39,7 +39,7 @@ namespace DoNotBeLazy.Core
 
         public override string SettingsCategory()
         {
-            return "Do Not Be Lazy";
+            return "Ketjak's Do Not Be Lazy";
         }
     }
 }

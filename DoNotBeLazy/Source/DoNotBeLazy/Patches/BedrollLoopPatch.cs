@@ -44,23 +44,37 @@ namespace DoNotBeLazy.Patches
     // throws away that pawn's whole job queue with it: 1,440 queued
     // vehicle-loading jobs died that way in twenty minutes on 2026-09-10.
     //
-    // WHAT THIS DOES. Two things, in this order, and only when the bed the
-    // job is aimed at is gone:
+    // WHAT THIS DOES. Two things, and they are decided by two DIFFERENT
+    // tests - see dnbl-architecture.md, "Refusing on the wrong test -
+    // corrected 2026-09-13", which is the authority here:
     //
-    //   1. Sets __result to null, so the pawn is not sent to fetch a bedroll
-    //      that does not exist. Every other case - a live bedroll, a null
-    //      result, Use Bedrolls not installed - is left exactly as it was.
-    //   2. Removes that pawn's entry from placedBeds, by reflection, so the
-    //      job giver stops producing the job at all rather than being
-    //      refused forever. PlacedBedsMapComponent.ExposeData saves that
-    //      dictionary, so the removal outlives the session once the game is
-    //      saved.
+    //   1. REFUSE, whenever the recorded bed is not itself standing on a
+    //      map: bed.Destroyed || !bed.Spawned. A TakeBedroll job aimed at a
+    //      thing that is not on the map ends the tick it starts, whatever
+    //      is holding it, so this covers destroyed, in an inventory, in a
+    //      carry tracker, minified, in a caravan and in a container alike.
+    //      __result is set to null. Every other case - a live bedroll, a
+    //      null result, Use Bedrolls not installed - is left exactly as it
+    //      was.
+    //   2. CLEAR that pawn's entry from placedBeds, by reflection, in two
+    //      cases only: the bed no longer exists anywhere (Destroyed, or
+    //      !SpawnedOrAnyParentSpawned), or THIS pawn is already holding it.
+    //      PlacedBedsMapComponent.ExposeData saves that dictionary, so the
+    //      removal outlives the session once the game is saved.
     //
-    // "Gone" is Thing.Destroyed, or !Thing.SpawnedOrAnyParentSpawned - the
-    // second covers a thing that was never destroyed but is no longer
-    // anywhere a pawn can walk to. A bedroll in a pawn's inventory or in a
-    // caravan is held by something spawned and is NOT touched; that is the
-    // ordinary, working case Use Bedrolls exists for.
+    // Anything ELSE holding the bedroll - a hauler carrying it to install
+    // it, a caravan, a shelf - is refused but NOT cleared. That record is
+    // still true and the bedroll will be spawned again shortly; Use
+    // Bedrolls only writes the record when the owner places the bedroll, so
+    // a record thrown away here is never written again and the pawn loses
+    // their bed for good. Refusing costs a few reference comparisons and
+    // starts no job, so there is no loop to pay for while the carry lasts.
+    //
+    // The 2026-09-11 build used !SpawnedOrAnyParentSpawned as the refusal
+    // test. A bedroll in a pawn's inventory has a spawned parent - the pawn
+    // - so that test passed and the job was allowed. Javelin looped on
+    // Bedroll9044091 over 170 times on 2026-09-13, and each burst ended ten
+    // of his queued LoadVehicle jobs as Incompletable.
     //
     // Everything is soft, the same way VehicleCompat and VehicleMenuPatch
     // are soft about Vehicle Framework: no UseBedrolls.dll in lib\, no type
@@ -75,6 +89,14 @@ namespace DoNotBeLazy.Patches
         private const string JobGiverTypeName = "UseBedrolls.JobGiver_TakeBedBack";
         private const string ComponentTypeName = "UseBedrolls.PlacedBedsMapComponent";
         private const string PlacedBedsFieldName = "placedBeds";
+
+        // How far up the chain of holders above a bedroll to walk before
+        // giving up. Bounded on purpose: the chain belongs to code we do not
+        // own and an unbounded walk up it is a hang waiting to happen. The
+        // real chains here are two or three links long - a bedroll in an
+        // inventory is Pawn_InventoryTracker then Pawn, and a minified one
+        // adds a MinifiedThing in between.
+        private const int MaxHolderSteps = 16;
 
         private static readonly Type JobGiverType = AccessTools.TypeByName(JobGiverTypeName);
         private static readonly Type ComponentType = AccessTools.TypeByName(ComponentTypeName);
@@ -158,14 +180,31 @@ namespace DoNotBeLazy.Patches
                 }
 
                 // The working case, and by far the common one: the bedroll is
-                // on the map, or is inside something that is. Nothing to do.
-                if (!bed.Destroyed && bed.SpawnedOrAnyParentSpawned)
+                // standing on a map, where the pawn can walk to it and pick
+                // it up. Nothing to do.
+                if (!bed.Destroyed && bed.Spawned)
                 {
                     return;
                 }
 
+                // Refuse first, and in every case below. The job cannot
+                // complete against a thing that is not on the map, whatever
+                // is holding it; only the clearing depends on what that is.
                 __result = null;
-                bool cleared = ForgetPlacedBed(pawn, bed);
+
+                bool heldByThisPawn;
+                Thing spawnedHolder;
+                FindHolder(bed, pawn, out heldByThisPawn, out spawnedHolder);
+
+                // "Gone" is the 2026-09-11 test, kept, and now only deciding
+                // whether to clear rather than whether to refuse.
+                bool gone = bed.Destroyed || (!heldByThisPawn && !bed.SpawnedOrAnyParentSpawned);
+                bool cleared = false;
+
+                if (gone || heldByThisPawn)
+                {
+                    cleared = ForgetPlacedBed(pawn, bed);
+                }
 
                 string key = pawn.ThingID + "/" + bed.ThingID;
                 if (!announced.Add(key))
@@ -176,12 +215,35 @@ namespace DoNotBeLazy.Patches
                 // ONE line per pawn and bed, on the first refusal only.
                 // JobLoopWatch.DescribeThing gives the id and the whereabouts
                 // in the same form the loop warnings already use, so the two
-                // can be read together.
-                Logger.Warning($"refused a Use Bedrolls TakeBedroll job for {pawn.LabelShort}: " +
-                    $"{JobLoopWatch.DescribeThing(bed)} is destroyed or off the map. " +
-                    (cleared
+                // can be read together. What that form cannot say is WHO is
+                // holding the bedroll, and that is the one fact needed to
+                // tell a stuck record from a bedroll in transit, so this line
+                // says it.
+                string why;
+                string outcome;
+
+                if (gone)
+                {
+                    why = "The bedroll no longer exists - it is destroyed, or it is inside something that is not on the map itself.";
+                    outcome = cleared
                         ? "Cleared that pawn's entry from PlacedBedsMapComponent.placedBeds, so it will not be offered again."
-                        : "Could NOT clear the entry from PlacedBedsMapComponent.placedBeds, so the job will keep being offered and refused."));
+                        : "Could NOT clear the entry from PlacedBedsMapComponent.placedBeds, so the job will keep being offered and refused.";
+                }
+                else if (heldByThisPawn)
+                {
+                    why = $"The bedroll is being carried by {pawn.LabelShort} already, so there is nothing to fetch.";
+                    outcome = cleared
+                        ? "Cleared that pawn's entry from PlacedBedsMapComponent.placedBeds, so it will not be offered again."
+                        : "Could NOT clear the entry from PlacedBedsMapComponent.placedBeds, so the job will keep being offered and refused.";
+                }
+                else
+                {
+                    why = $"The bedroll is being carried by {DescribeHolder(spawnedHolder)}, so there is nothing to fetch yet.";
+                    outcome = "Kept that pawn's entry in PlacedBedsMapComponent.placedBeds on purpose - it is still true and the bedroll should be back on the map shortly. The job stays refused until it is.";
+                }
+
+                Logger.Warning($"refused a Use Bedrolls TakeBedroll job for {pawn.LabelShort}: " +
+                    $"{JobLoopWatch.DescribeThing(bed)}. {why} {outcome}");
             }
             catch (Exception e)
             {
@@ -193,6 +255,56 @@ namespace DoNotBeLazy.Patches
                 postfixThrowReported = true;
                 Logger.Error("the Use Bedrolls bedroll loop postfix threw and is being ignored from here on: " + e);
             }
+        }
+
+        // Walks the chain of holders above a thing and answers two questions
+        // at once: is the pawn the job was offered to somewhere in it, and
+        // what is the first thing in it that is actually on the map.
+        //
+        // Verse.Thing.ParentHolder is a Verse.IThingHolder, and
+        // Verse.IThingHolder has a ParentHolder of its own - both read off
+        // lib\Assembly-CSharp.dll on 2026-09-13, not remembered. Verse.Pawn
+        // implements IThingHolder, and both Pawn_InventoryTracker and
+        // Pawn_CarryTracker report the pawn as their ParentHolder, so a
+        // bedroll in either is found in two steps. A MinifiedThing in
+        // between is walked straight through.
+        //
+        // Verse.ThingOwnerUtility.GetFirstSpawnedParentThing would answer the
+        // second question in one call and it does exist in this build. It is
+        // not used because its body was not read, and a signature you could
+        // not read is not a signature you may assume.
+        private static void FindHolder(Thing thing, Pawn pawn, out bool heldByPawn, out Thing spawnedHolder)
+        {
+            heldByPawn = false;
+            spawnedHolder = null;
+
+            IThingHolder holder = thing.ParentHolder;
+
+            for (int step = 0; step < MaxHolderSteps && holder != null; step++)
+            {
+                if (ReferenceEquals(holder, pawn))
+                {
+                    heldByPawn = true;
+                }
+
+                Thing holderThing = holder as Thing;
+                if (spawnedHolder == null && holderThing != null && holderThing.Spawned)
+                {
+                    spawnedHolder = holderThing;
+                }
+
+                holder = holder.ParentHolder;
+            }
+        }
+
+        // Names whatever is holding the bedroll, for the one warning line.
+        // Null when the walk found nothing on the map - a caravan or a world
+        // object holds things through something that is not a Thing at all.
+        private static string DescribeHolder(Thing holder)
+        {
+            return holder == null
+                ? "something that is not on this map"
+                : holder.LabelShort + " [" + holder.ThingID + "]";
         }
 
         // Removes this pawn's stale record from
