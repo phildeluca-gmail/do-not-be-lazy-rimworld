@@ -125,6 +125,73 @@ namespace DoNotBeLazy.Utility
             return constructors[0];
         }
 
+        // Vehicles.FloatMenuMulti.StillValid, or null when Vehicle Framework
+        // is absent or the method is not the shape this mod was built
+        // against. Returned rather than patched here, same as the
+        // constructor above.
+        //
+        // Read off the IL of the shipped 1.5 Vehicles.dll on 2026-09-13, not
+        // remembered:
+        //
+        //   private static bool StillValid(FloatMenuOption opt,
+        //                                  List<Pawn> pawns, Pawn ship)
+        //
+        // 87 bytes of IL, called only from FloatMenuMulti.DoWindowContents
+        // every third frame, which sets Disabled = true on any option it
+        // answers false for. It never reads `opt`: one downed pawn in the
+        // selection fails it for every option in the menu, ours included.
+        // Architecture doc section 11.
+        //
+        // DeclaredOnly, so nothing inherited from Verse.FloatMenu can be
+        // picked up in its place. Every part of the signature is checked,
+        // because the postfix binds `opt` and `ship` by name and position:
+        // a Vehicle Framework update that overloads, renames or reshapes the
+        // method gets a warning and no patch, never a patch on the wrong
+        // thing.
+        public static MethodInfo FloatMenuMultiStillValid()
+        {
+            if (FloatMenuMultiType == null)
+            {
+                return null;
+            }
+
+            MethodInfo found = null;
+            int count = 0;
+            foreach (MethodInfo method in FloatMenuMultiType.GetMethods(
+                BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.DeclaredOnly))
+            {
+                if (method.Name == "StillValid")
+                {
+                    found = method;
+                    count++;
+                }
+            }
+
+            if (count != 1)
+            {
+                Core.Logger.Warning($"Vehicles.FloatMenuMulti has {count} static StillValid methods, expected 1 - not patching, so a downed pawn in the selection will still grey out * options on a vehicle.");
+                return null;
+            }
+
+            ParameterInfo[] parameters = found.GetParameters();
+            bool shapeMatches = found.ReturnType == typeof(bool)
+                && parameters.Length == 3
+                && parameters[0].ParameterType == typeof(FloatMenuOption)
+                && parameters[0].Name == "opt"
+                && parameters[1].ParameterType == typeof(System.Collections.Generic.List<Pawn>)
+                && parameters[1].Name == "pawns"
+                && parameters[2].ParameterType == typeof(Pawn)
+                && parameters[2].Name == "ship";
+
+            if (!shapeMatches)
+            {
+                Core.Logger.Warning("Vehicles.FloatMenuMulti.StillValid is not (FloatMenuOption opt, List<Pawn> pawns, Pawn ship) returning bool - not patching, so a downed pawn in the selection will still grey out * options on a vehicle.");
+                return null;
+            }
+
+            return found;
+        }
+
         // Does this WorkGiver work one target over and over, rather than a
         // pool of separate targets? True for vehicle packing and upgrade
         // material delivery. Matched by base class, deliberately - not by

@@ -82,9 +82,23 @@ namespace DoNotBeLazy.Components
         // ScannerCompat.FoundSomething. Inert on every other order type.
         public float MaxScanDays;
 
+        // The player's order in words - PlantCompat.LabelFor of the clicked
+        // thing - or null when the def serves only one order. Exists only so
+        // a repeated click can be recognised as the same order: TargetFilter
+        // cannot be compared, because PlantCompat.FilterFor builds a new
+        // closure on every click. Added 2026-09-13, architecture section 12.
+        public string OrderKind { get; }
+
+        // The area wait line is written at most once per order per
+        // AreaRetryTicks, and the waits in between are counted rather than
+        // written. Added 2026-09-13: 13 pawns on one pool wrote that line
+        // about 130 times in five minutes. Architecture section 12.
+        public int NextWaitLogTick;
+        public int WaitsNotLogged;
+
         public SweepOrder(WorkGiverDef workGiverDef, List<LocalTargetInfo> sharedPool, Thing workstationTarget = null,
             IntVec3 scanCenter = default(IntVec3), int scanRadius = 0, bool centerOut = true,
-            Predicate<Thing> targetFilter = null)
+            Predicate<Thing> targetFilter = null, string orderKind = null)
         {
             WorkGiverDef = workGiverDef;
             SharedPool = sharedPool;
@@ -93,6 +107,7 @@ namespace DoNotBeLazy.Components
             ScanRadius = scanRadius;
             CenterOut = centerOut;
             TargetFilter = targetFilter;
+            OrderKind = orderKind;
         }
     }
 
@@ -163,7 +178,23 @@ namespace DoNotBeLazy.Components
         // of patience before the sweep is called finished for that pawn.
         private const int MaxAreaRetries = 10;
 
+        // How close two area orders' centres must be, in tiles, for a repeat
+        // click to count as the same order. Added 2026-09-13 - see SameOrder.
+        private const int DuplicateCentreTiles = 5;
+
         private readonly Dictionary<Pawn, SweepOrder> activeSweeps = new Dictionary<Pawn, SweepOrder>();
+
+        // The orders waiting behind each pawn's active one, oldest first.
+        // Added 2026-09-13 on the user's order that * orders queue rather
+        // than replace each other - architecture section 12.
+        //
+        // A queue exists only while its pawn has an active order. Nothing is
+        // queued for a pawn with no order - it starts instead - and every
+        // path that removes the active order either starts the next one
+        // (RemoveSweep) or drops the lot (ClearSweeps). That is why
+        // NeedMonitor, JobTrackerPatch and the tick pass needed no change:
+        // a pawn with a queue is always already in activeSweeps.
+        private readonly Dictionary<Pawn, List<SweepOrder>> queuedOrders = new Dictionary<Pawn, List<SweepOrder>>();
 
         // Per-pawn, not per-order: a SweepOrder is shared across everyone in
         // a group sweep, and one pawn hitting bad targets shouldn't count
@@ -267,7 +298,9 @@ namespace DoNotBeLazy.Components
             {
                 if (pawn.Dead || pawn.Downed || pawn.InMentalState || pawn.Drafted || pawn.Map != map)
                 {
-                    RemoveSweep(pawn,
+                    // the pawn is out of the work, so its queued orders go
+                    // too - architecture section 12, decision 4
+                    ClearSweeps(pawn,
                         pawn.Dead ? "dead"
                         : pawn.Downed ? "downed"
                         : pawn.InMentalState ? "mental break"
@@ -368,27 +401,32 @@ namespace DoNotBeLazy.Components
         // ended. A scanner job never ends on its own, so a completed scanner
         // order that only called RemoveSweep would leave the pawn scanning a
         // finished order forever.
+        //
+        // Order matters since 2026-09-13: the next queued order is started
+        // only AFTER the scanner job is ended. Starting it first, as a plain
+        // RemoveSweep now would, hands the pawn the new order's first job and
+        // then ends that job instead of the scan. Architecture section 12.
         private void EndSweepAndJob(Pawn pawn, string reason)
         {
-            RemoveSweep(pawn, reason);
+            EndOrder(pawn, reason);
 
-            if (pawn.jobs?.curJob == null)
+            if (pawn.jobs?.curJob != null)
             {
-                return;
+                // same self-caused-job-end suppression as GiveJob and
+                // PauseForNeed; without it JobTrackerPatch's postfix re-enters
+                // on our own EndCurrentJob call
+                AssigningJob = true;
+                try
+                {
+                    pawn.jobs.EndCurrentJob(JobCondition.Succeeded);
+                }
+                finally
+                {
+                    AssigningJob = false;
+                }
             }
 
-            // same self-caused-job-end suppression as GiveJob and
-            // PauseForNeed; without it JobTrackerPatch's postfix re-enters
-            // on our own EndCurrentJob call
-            AssigningJob = true;
-            try
-            {
-                pawn.jobs.EndCurrentJob(JobCondition.Succeeded);
-            }
-            finally
-            {
-                AssigningJob = false;
-            }
+            StartNextQueued(pawn);
         }
 
         // The one piece of chaining that is not event-driven, and it has to
@@ -479,7 +517,36 @@ namespace DoNotBeLazy.Components
         // a missed site instead of a player finding it. One line per sweep
         // ENDING - not per target, per def or per click - so this does not
         // reopen the message-cap problem that has cost five sessions.
+        //
+        // Since 2026-09-13 this is the ending that MOVES ON: the order is
+        // finished for this pawn, so its next queued order starts. The
+        // ending that drops the whole queue is ClearSweeps. Architecture
+        // section 12 lists which call site is which.
         public void RemoveSweep(Pawn pawn, string reason)
+        {
+            EndOrder(pawn, reason);
+            StartNextQueued(pawn);
+        }
+
+        // The pawn is out of action or something took it - dead, downed,
+        // broken, drafted, off the map, or a job ended by an interrupt. The
+        // active order ends and every queued order is dropped with it, in
+        // the one ending line. Added 2026-09-13, architecture section 12,
+        // decision 4.
+        public void ClearSweeps(Pawn pawn, string reason)
+        {
+            int dropped = queuedOrders.TryGetValue(pawn, out List<SweepOrder> queue) ? queue.Count : 0;
+            queuedOrders.Remove(pawn);
+
+            EndOrder(pawn, dropped == 0
+                ? reason
+                : $"{reason}, {dropped} queued order{(dropped == 1 ? "" : "s")} dropped");
+        }
+
+        // What RemoveSweep did in full before 2026-09-13: forget the active
+        // order and every piece of per-pawn state that goes with it. Touches
+        // neither the job nor the queue.
+        private void EndOrder(Pawn pawn, string reason)
         {
             // only speak if there was actually a sweep to end; RemoveSweep is
             // called defensively in places where there may be nothing to do
@@ -495,6 +562,156 @@ namespace DoNotBeLazy.Components
             workstationRetryAt.Remove(pawn);
             areaRetryAt.Remove(pawn);
             areaRetries.Remove(pawn);
+        }
+
+        // Put a pawn that can do a new order onto it. Added 2026-09-13,
+        // architecture section 12.
+        //
+        // Returns true when the pawn has no active order - the CALLER starts
+        // it, through the code each entry point already had, so a fresh
+        // start is unchanged. Otherwise returns false after either appending
+        // the order to the pawn's queue or, when the pawn already has the
+        // same order active or queued, doing nothing. `ahead` is how many
+        // orders stand in front of it: -1 for a duplicate, 0 for a start.
+        private bool JoinOrQueue(Pawn pawn, SweepOrder order, out int ahead)
+        {
+            ahead = 0;
+            if (!activeSweeps.TryGetValue(pawn, out SweepOrder current))
+            {
+                return true;
+            }
+
+            queuedOrders.TryGetValue(pawn, out List<SweepOrder> queue);
+
+            if (SameOrder(current, order))
+            {
+                ahead = -1;
+                return false;
+            }
+
+            if (queue != null)
+            {
+                foreach (SweepOrder queued in queue)
+                {
+                    if (SameOrder(queued, order))
+                    {
+                        ahead = -1;
+                        return false;
+                    }
+                }
+            }
+            else
+            {
+                queue = new List<SweepOrder>();
+                queuedOrders[pawn] = queue;
+            }
+
+            ahead = 1 + queue.Count;
+            queue.Add(order);
+            return false;
+        }
+
+        // A repeat click is the same order when it is the same WorkGiverDef
+        // and either the same station or vehicle, or - for an area order -
+        // the same player order with a centre within DuplicateCentreTiles.
+        // Section 12, decision 5.
+        private static bool SameOrder(SweepOrder a, SweepOrder b)
+        {
+            if (a.WorkGiverDef != b.WorkGiverDef)
+            {
+                return false;
+            }
+
+            if (a.WorkstationTarget != null || b.WorkstationTarget != null)
+            {
+                return a.WorkstationTarget == b.WorkstationTarget;
+            }
+
+            return a.OrderKind == b.OrderKind
+                && (a.ScanCenter - b.ScanCenter).LengthHorizontalSquared <= DuplicateCentreTiles * DuplicateCentreTiles;
+        }
+
+        // Start the order at the front of this pawn's queue, if there is one.
+        // Only ever called once the active order has gone.
+        //
+        // The start does what a fresh start does - clear leftover retry
+        // state, and for a scanner re-read the station now - and then
+        // applies the usual break rules before any work: a pawn already
+        // under a need threshold joins paused, on its current job, exactly as
+        // BeginAreaSweep does. Otherwise AssignNextTask, which is the
+        // re-validation of a pool that may be long stale: it drops gone
+        // targets, asks this pawn about the rest, rescans for this pawn when
+        // nothing is left, and ends the order through its normal ending if
+        // there is still nothing - which calls back in here for the order
+        // after. Each step takes one order off the queue, so the depth is
+        // bounded by the queue's length.
+        private void StartNextQueued(Pawn pawn)
+        {
+            if (activeSweeps.ContainsKey(pawn) || !queuedOrders.TryGetValue(pawn, out List<SweepOrder> queue))
+            {
+                return;
+            }
+
+            SweepOrder next = queue[0];
+            queue.RemoveAt(0);
+            if (queue.Count == 0)
+            {
+                queuedOrders.Remove(pawn);
+            }
+
+            // one line per pawn per move - never per target or per tick
+            Logger.Message($"{pawn.LabelShort}: starting queued order {next.WorkGiverDef.defName} at {DescribeWhere(next)}, {queue.Count} still queued");
+
+            activeSweeps[pawn] = next;
+            workstationRetryAt.Remove(pawn);
+            areaRetryAt.Remove(pawn);
+            areaRetries.Remove(pawn);
+            consecutiveFailures.Remove(pawn);
+            pausedForNeed.Remove(pawn);
+
+            // the same seeding BeginWorkstationSweep does, but read now: the
+            // station may have been worked since this order was queued
+            CompScanner scannerComp = ScannerCompat.ScannerOn(next.WorkstationTarget);
+            if (scannerComp != null)
+            {
+                next.MaxScanDays = 0f;
+                ScannerCompat.FoundSomething(scannerComp, ref next.MaxScanDays);
+            }
+
+            string need = NeedMonitor.CriticalNeedLabelFor(pawn);
+            if (need != null)
+            {
+                PauseForNeed(pawn, need, false);
+                Logger.Message($"{pawn.LabelShort} joined the sweep paused: {need} ({next.WorkGiverDef.defName}) - left on its current job");
+                return;
+            }
+
+            AssignNextTask(pawn, next);
+        }
+
+        private static string DescribeWhere(SweepOrder order)
+        {
+            return order.WorkstationTarget != null
+                ? order.WorkstationTarget.LabelShort
+                : order.ScanCenter.ToString();
+        }
+
+        // ", queued for 10 of 12 pawns behind 1-3 orders, 1 already had it",
+        // or "" when nobody queued and nobody had it already. Folded into
+        // each entry point's one summary line - section 12, Logging.
+        private static string QueueSummary(int queued, int of, int minAhead, int maxAhead, int duplicates)
+        {
+            string text = "";
+            if (queued > 0)
+            {
+                string behind = minAhead == maxAhead ? minAhead.ToString() : $"{minAhead}-{maxAhead}";
+                text += $", queued for {queued} of {of} pawns behind {behind} order{(maxAhead == 1 ? "" : "s")}";
+            }
+            if (duplicates > 0)
+            {
+                text += $", {duplicates} already had it";
+            }
+            return text;
         }
 
         public bool IsPaused(Pawn pawn)
@@ -597,7 +814,7 @@ namespace DoNotBeLazy.Components
                 // this is the last point that still has it. Null for every
                 // sweep that needs no narrowing.
                 BeginAreaSweep(eligiblePawns, clickedTarget.Cell, workGiverDef, scanner,
-                    PlantCompat.FilterFor(clickedTarget.Thing));
+                    PlantCompat.FilterFor(clickedTarget.Thing), PlantCompat.LabelFor(clickedTarget.Thing));
             }
         }
 
@@ -644,6 +861,10 @@ namespace DoNotBeLazy.Components
             var order = new SweepOrder(workGiverDef, new List<LocalTargetInfo>(), target);
             int joined = 0;
 
+            // architecture section 12 - pawns already on an order queue this
+            // one instead of starting it
+            int queued = 0, duplicates = 0, minAhead = int.MaxValue, maxAhead = 0;
+
             foreach (Pawn pawn in eligiblePawns)
             {
                 // Asked one pawn at a time, and the order matters: each
@@ -653,10 +874,34 @@ namespace DoNotBeLazy.Components
                 // gets null here is usually being told the cargo is already
                 // spoken for, which is the right answer rather than a
                 // failure - they simply do not join.
+                //
+                // Every pawn answers for itself, so this already keeps the
+                // pawns who can and drops the ones who cannot - checked
+                // 2026-09-13 against that rule, architecture doc section 9.
                 Job job = scanner.JobOnThing(pawn, target, true);
                 if (job == null)
                 {
                     Logger.Message($"BeginSweep {workGiverDef.defName}: no job on {target.LabelShort} for {pawn.LabelShort}, not joining");
+                    continue;
+                }
+
+                // A pawn already on an order is not handed this job: the
+                // order goes on its queue, and it is asked again when its
+                // turn comes. Its answer here could not see the jobs of the
+                // pawns starting in this same loop, which costs nothing for
+                // that reason. Section 12, decision 7.
+                if (!JoinOrQueue(pawn, order, out int ahead))
+                {
+                    if (ahead < 0)
+                    {
+                        duplicates++;
+                    }
+                    else
+                    {
+                        queued++;
+                        minAhead = Math.Min(minAhead, ahead);
+                        maxAhead = Math.Max(maxAhead, ahead);
+                    }
                     continue;
                 }
 
@@ -674,13 +919,14 @@ namespace DoNotBeLazy.Components
                 GiveJob(pawn, job);
             }
 
-            if (joined == 0)
+            if (joined == 0 && queued == 0 && duplicates == 0)
             {
                 Logger.Message($"BeginSweep {workGiverDef.defName}: no job on {target.LabelShort} for any of {eligiblePawns.Count} pawns, no sweep started");
                 return;
             }
 
-            Logger.Message($"BeginSweep {workGiverDef.defName} at {target.LabelShort}: {joined} of {eligiblePawns.Count} pawns joined");
+            Logger.Message($"BeginSweep {workGiverDef.defName} at {target.LabelShort}: {joined} of {eligiblePawns.Count} pawns joined"
+                + QueueSummary(queued, eligiblePawns.Count, minAhead, maxAhead, duplicates));
         }
 
         private void BeginWorkstationSweep(List<Pawn> eligiblePawns, Thing billGiver, WorkGiverDef workGiverDef, WorkGiver_Scanner scanner)
@@ -696,6 +942,10 @@ namespace DoNotBeLazy.Components
             // station, bill has a skill floor they miss) and the whole
             // command then silently did nothing. Rank them and take the
             // first that actually gets a job.
+            //
+            // One worker by design (architecture doc section 2), and each
+            // ranked pawn is asked for itself, so one pawn's "no" never stops
+            // the next being asked - checked 2026-09-13, section 9.
             List<Pawn> ranked = RankForWorkstation(eligiblePawns, workGiverDef);
 
             foreach (Pawn pawn in ranked)
@@ -709,11 +959,27 @@ namespace DoNotBeLazy.Components
 
                 // empty pool - see SweepOrder comment. billGiver is the
                 // order: every job after this one comes from AssignNextTask
-                // re-asking this same station. A fresh assignment always
-                // clears leftover pause and retry state from a previous order
+                // re-asking this same station.
+                var order = new SweepOrder(workGiverDef, new List<LocalTargetInfo>(), billGiver);
+
+                // The best-ranked pawn with a job takes the order even when
+                // it is busy: the order queues behind what it is doing,
+                // rather than falling to a lower-ranked idle pawn - that
+                // would change section 2's selection rule. Section 12,
+                // decision 7. The scan counter is read when a queued order
+                // starts, not here.
+                if (!JoinOrQueue(pawn, order, out int ahead))
+                {
+                    Logger.Message(ahead < 0
+                        ? $"BeginSweep {workGiverDef.defName} at {billGiver.LabelShort}: {pawn.LabelShort} of {ranked.Count} ranked already has it"
+                        : $"BeginSweep {workGiverDef.defName} at {billGiver.LabelShort}: {pawn.LabelShort} of {ranked.Count} ranked, queued behind {ahead} order{(ahead == 1 ? "" : "s")}");
+                    return;
+                }
+
+                // A fresh assignment always clears leftover pause and retry
+                // state from a previous order
                 pausedForNeed.Remove(pawn);
                 workstationRetryAt.Remove(pawn);
-                var order = new SweepOrder(workGiverDef, new List<LocalTargetInfo>(), billGiver);
 
                 // Seed the scan high-water mark from wherever this station
                 // already stands. Starting at zero would read the first
@@ -786,19 +1052,30 @@ namespace DoNotBeLazy.Components
             return record == null || record.TotallyDisabled ? 0 : record.Level;
         }
 
-        private void BeginAreaSweep(List<Pawn> eligiblePawns, IntVec3 clickCell, WorkGiverDef workGiverDef, WorkGiver_Scanner scanner, Predicate<Thing> targetFilter = null)
+        private void BeginAreaSweep(List<Pawn> eligiblePawns, IntVec3 clickCell, WorkGiverDef workGiverDef, WorkGiver_Scanner scanner, Predicate<Thing> targetFilter = null, string orderKind = null)
         {
-            // TaskScanner is pawn-scoped (PotentialWorkThingsGlobal takes a
-            // pawn) so we build the shared pool off whichever eligible pawn
-            // happens to be first - fine since the checks it applies
-            // (forbidden, reservable, radius) don't vary by which pawn asked
-            Pawn driver = eligiblePawns[0];
+            // THE RULE, in the user's words: "The group should drop the pawns
+            // who cannot but keep the pawns who can do a certain thing."
+            //
+            // This used to build the pool off eligiblePawns[0] alone, on the
+            // claim that the scan's checks "don't vary by which pawn asked".
+            // They all do - allowed area, forbidden, reservation,
+            // reachability, and the WorkGiver's own HasJobOn* for that pawn.
+            // On 2026-09-13 "scan HaulToInventory r=50 ... for Abi: 0
+            // targets" ended the order for the whole selection because Abi
+            // alone found nothing.
+            //
+            // Now the pool is every target ANY eligible pawn can do, and
+            // `able` is the pawns who can do at least one of them. Only they
+            // join; the rest are left exactly as they were - not added, and
+            // not struck off any order they were already on. Architecture doc
+            // section 9, which also carries why this stays cheap at radius 50.
             int radius = DoNotBeLazyMod.Settings.sweepRadius;
 
             // read once, here, and stamped onto the order below - see
             // SweepOrder.CenterOut
             bool centerOut = DoNotBeLazyMod.Settings.centerOutOrder;
-            List<LocalTargetInfo> pool = TaskScanner.FindTargets(clickCell, radius, map, workGiverDef, driver, 0, targetFilter);
+            List<LocalTargetInfo> pool = TaskScanner.FindTargetsForGroup(clickCell, radius, map, workGiverDef, eligiblePawns, out List<Pawn> able, 0, targetFilter);
             if (pool.Count == 0)
             {
                 // the clicked target had a job or the option wouldn't have
@@ -807,7 +1084,7 @@ namespace DoNotBeLazy.Components
                 // allowed area. Silence on this used to look identical to
                 // "the mod is broken"; the float menu is already gone by
                 // now, so a message is the only channel left.
-                Logger.Message($"BeginSweep {workGiverDef.defName}: scan found nothing, no sweep started");
+                Logger.Message($"BeginSweep {workGiverDef.defName}: scan found nothing any of {eligiblePawns.Count} pawns can do, no sweep started");
                 string what = workGiverDef.label.NullOrEmpty() ? workGiverDef.defName : workGiverDef.label.CapitalizeFirst();
                 Messages.Message(
                     "* " + what + ": nothing to do within " + radius + " tiles.",
@@ -817,11 +1094,15 @@ namespace DoNotBeLazy.Components
                 return;
             }
 
-            Logger.Message($"BeginSweep {workGiverDef.defName}: {pool.Count} targets, {eligiblePawns.Count} pawns, order {(centerOut ? "centre-out" : "pawn-nearest")}");
+            // ONE line for the whole order: how many can, and who was left
+            // out. The per-pawn scan line this replaces is gone - see
+            // TaskScanner.FindTargetsForGroup.
+            Logger.Message($"BeginSweep {workGiverDef.defName}: {pool.Count} targets, {able.Count} of {eligiblePawns.Count} pawns can do it, order {(centerOut ? "centre-out" : "pawn-nearest")}"
+                + DroppedSummary(eligiblePawns, able));
 
             // every area sweep rescans when a pawn runs the pool dry now, not
             // just fire
-            var order = new SweepOrder(workGiverDef, pool, null, clickCell, radius, centerOut, targetFilter);
+            var order = new SweepOrder(workGiverDef, pool, null, clickCell, radius, centerOut, targetFilter, orderKind);
 
             // was: break out of this loop the moment the pool emptied, which
             // is why "* haul until done" with 36 selected sent exactly one
@@ -834,9 +1115,49 @@ namespace DoNotBeLazy.Components
             // below. Added 2026-09-12.
             int joinedPaused = 0;
 
-            foreach (Pawn pawn in eligiblePawns)
+            // architecture section 12 - pawns already on an order queue this
+            // one instead of starting it
+            int queued = 0, duplicates = 0, minAhead = int.MaxValue, maxAhead = 0;
+
+            // `able`, not eligiblePawns: a pawn who can do nothing in this
+            // pool is left out of the order
+            foreach (Pawn pawn in able)
             {
+                // Was an unconditional activeSweeps[pawn] = order, which is
+                // how a rice haul 148 targets strong was thrown away by a
+                // corn haul 13 seconds later on 2026-09-13. A pawn already on
+                // an order keeps it, and this one waits behind it. Nothing
+                // below this runs for that pawn - it is not paused, not
+                // cleared, not assigned. Section 12.
+                if (!JoinOrQueue(pawn, order, out int ahead))
+                {
+                    if (ahead < 0)
+                    {
+                        duplicates++;
+                    }
+                    else
+                    {
+                        queued++;
+                        minAhead = Math.Min(minAhead, ahead);
+                        maxAhead = Math.Max(maxAhead, ahead);
+                    }
+                    continue;
+                }
+
                 activeSweeps[pawn] = order;
+
+                // A fresh order clears leftover retry state from the pawn's
+                // previous one, as the other two entry points already did.
+                // Without it a pawn still waiting on an old areaRetryAt had
+                // the end of its first job on THIS order ignored by
+                // Notify_JobEnded, and carried the old try count in. Rare
+                // until 2026-09-13, when a pawn facing only reserved targets
+                // started waiting too - architecture doc section 10. The
+                // pause is not cleared here; the need check below decides it.
+                workstationRetryAt.Remove(pawn);
+                areaRetryAt.Remove(pawn);
+                areaRetries.Remove(pawn);
+                consecutiveFailures.Remove(pawn);
 
                 // A pawn already under threshold JOINS the sweep but does not
                 // start work - it is paused on the spot and picks the order
@@ -863,6 +1184,14 @@ namespace DoNotBeLazy.Components
                 AssignNextTask(pawn, order);
             }
 
+            // ONE line for the whole order when anybody queued it or already
+            // had it - section 12, Logging
+            if (queued > 0 || duplicates > 0)
+            {
+                Logger.Message($"BeginSweep {workGiverDef.defName}: {able.Count - queued - duplicates} started now"
+                    + QueueSummary(queued, able.Count, minAhead, maxAhead, duplicates));
+            }
+
             // ONE message for the whole order, never one per pawn. Added
             // 2026-09-12 on the user's words, which are the text verbatim: a
             // clear-snow order took 31 pawns that day and 16 of them never
@@ -883,6 +1212,30 @@ namespace DoNotBeLazy.Components
                     MessageTypeDefOf.RejectInput,
                     false);
             }
+        }
+
+        // ", dropped: Abi, Kuba", or "" when every eligible pawn can do
+        // something in the pool. Names go in the one summary line rather than
+        // a line each - a line per pawn per click is the shape the standing
+        // logging rule forbids.
+        private static string DroppedSummary(List<Pawn> eligiblePawns, List<Pawn> able)
+        {
+            if (able.Count >= eligiblePawns.Count)
+            {
+                return "";
+            }
+
+            var kept = new HashSet<Pawn>(able);
+            var names = new List<string>();
+            foreach (Pawn pawn in eligiblePawns)
+            {
+                if (pawn != null && !kept.Contains(pawn))
+                {
+                    names.Add(pawn.LabelShort);
+                }
+            }
+
+            return names.Count == 0 ? "" : ", dropped: " + string.Join(", ", names.ToArray());
         }
 
         public void Notify_JobEnded(Pawn pawn, JobCondition condition)
@@ -996,7 +1349,12 @@ namespace DoNotBeLazy.Components
                 // took the pawn - a manual order, a draft, a mental break,
                 // another mod - and continuing would fight it. Fatal is
                 // right; silent was not.
-                RemoveSweep(pawn, $"job ended {condition}");
+                //
+                // Drops the queue as well since 2026-09-13: a manual order
+                // arrives as exactly this, and moving the pawn onto its next
+                // queued order would fight whatever took it. Section 12,
+                // decision 4.
+                ClearSweeps(pawn, $"job ended {condition}");
                 return;
             }
 
@@ -1119,9 +1477,23 @@ namespace DoNotBeLazy.Components
             {
                 // RefusalReason gives the player's own wording - "is drafted",
                 // "will never do butchering", "is not assigned to cooking".
-                RemoveSweep(pawn, !pawn.Spawned || pawn.Map != map
+                string refusal = !pawn.Spawned || pawn.Map != map
                     ? "no longer on this map"
-                    : PawnValidator.RefusalReason(pawn, order.WorkGiverDef) ?? "no longer eligible");
+                    : PawnValidator.RefusalReason(pawn, order.WorkGiverDef) ?? "no longer eligible";
+
+                // Two different things since 2026-09-13. A pawn that is gone,
+                // down, broken or drafted is out of the work, and its queue
+                // goes with the order. A pawn refused on work settings is
+                // refused for THIS order's work type only, and the next
+                // queued order may be one it can do. Section 12, decision 4.
+                if (!pawn.Spawned || pawn.Map != map || pawn.Dead || pawn.Downed || pawn.InMentalState || pawn.Drafted)
+                {
+                    ClearSweeps(pawn, refusal);
+                }
+                else
+                {
+                    RemoveSweep(pawn, refusal);
+                }
                 return;
             }
 
@@ -1218,6 +1590,12 @@ namespace DoNotBeLazy.Components
                         break;
                     }
 
+                    // One pawn, deliberately - the order's first scan asks
+                    // the whole group, but this rescan runs because THIS
+                    // pawn ran out. Targets only a teammate can do would not
+                    // help it and would multiply the cost by the group; each
+                    // teammate rescans for itself when it runs out.
+                    // Architecture doc section 9.
                     rescanned = true;
                     AddNewTargets(order, TaskScanner.FindTargets(order.ScanCenter, order.ScanRadius, map, order.WorkGiverDef, pawn, 0, order.TargetFilter));
                     continue;
@@ -1273,6 +1651,27 @@ namespace DoNotBeLazy.Components
                     continue;
                 }
 
+                // Leave out every queued target another pawn has reserved,
+                // BEFORE the job is issued. A sweep job is player-forced, and
+                // ReservationManager.Reserve takes a player-forced job's
+                // reservation from whoever holds it and ends that pawn's
+                // whole job - silently, because it happens inside GiveJob
+                // while AssigningJob is set. Seventeen pawns on one clean
+                // order spent 2026-09-13 ending each other's jobs and never
+                // cleaning the firefoam at the click. Architecture doc
+                // section 14.
+                int leftOut = DropQueuedTargetsReservedByOthers(pawn, job);
+                if (leftOut > 0 && !job.targetA.IsValid && job.targetQueueA.Count == 0)
+                {
+                    // nothing left for this job to do - it would end
+                    // Succeeded on its first toil. Treat the target as
+                    // reserved, the same as TargetRefusalReason would.
+                    refusalCounts.TryGetValue("reserved", out int seenReserved);
+                    refusalCounts["reserved"] = seenReserved + 1;
+                    refused.Add(target);
+                    continue;
+                }
+
                 order.SharedPool.RemoveAt(i);
 
                 // plantDefToSow is the field the whole GrowerSow static-state
@@ -1294,6 +1693,7 @@ namespace DoNotBeLazy.Components
                 Logger.Message($"{pawn.LabelShort}: {job.def.defName} on {target}"
                     + $" at {target.Cell} c={fromCentre:F0} p={fromPawn:F0}"
                     + DescribeQueue(job)
+                    + (leftOut > 0 ? $", {leftOut} reserved by others left out" : "")
                     + (order.CenterOut ? "" : " [pawn-nearest]")
                     + (job.plantDefToSow != null ? $" plant={job.plantDefToSow.defName}" : "")
                     + $" ({order.SharedPool.Count} left)"
@@ -1312,6 +1712,14 @@ namespace DoNotBeLazy.Components
                     order.SharedPool.Add(target);
                 }
 
+                // The retry budget counts looks IN A ROW that found nothing.
+                // It was documented that way from 2026-09-03 but never
+                // cleared here, so it counted every wait in the whole sweep -
+                // harmless while waiting was rare, and a pawn struck off
+                // mid-sweep once reserved targets started waiting as well.
+                // Architecture doc section 10.
+                areaRetries.Remove(pawn);
+
                 lastAssignedTarget[pawn] = target;
                 GiveJob(pawn, job);
                 return;
@@ -1320,7 +1728,18 @@ namespace DoNotBeLazy.Components
             // One line per call, naming each reason and how many targets it
             // accounted for - which is what the per-target version was
             // actually being read for anyway.
-            if (refusalCounts.Count > 0)
+            //
+            // Written only when the pawn is about to END its sweep since
+            // 2026-09-13. On the wait path below the same summary rides on
+            // the wait line, which is written at most once per order per
+            // round - otherwise this line alone would still be one per pawn
+            // per look. Section 12, Logging.
+            refusalCounts.TryGetValue("reserved", out int reservedCount);
+            areaRetries.TryGetValue(pawn, out int tries);
+            tries++;
+            bool poolBusy = order.SharedPool.Count > 0 && (noJobCount > 0 || reservedCount > 0);
+            bool willWait = poolBusy && tries <= MaxAreaRetries;
+            if (refusalCounts.Count > 0 && !willWait)
             {
                 Logger.Message($"{pawn.LabelShort}: skipped{RefusalSummary(refusalCounts)} ({order.WorkGiverDef.defName})");
             }
@@ -1339,16 +1758,55 @@ namespace DoNotBeLazy.Components
             // The same distinction the target path already makes (see
             // TargetIsGone) - gone for good, versus not available right now -
             // finally applied to pawns as well.
-            if (order.SharedPool.Count > 0 && noJobCount > 0)
+            //
+            // A target a teammate has RESERVED counts here too, since
+            // 2026-09-13 - architecture doc section 10. It used to fall
+            // through to "nothing left within N" below: 111 of the 132 such
+            // endings in that day's log came straight after a skip line
+            // whose only reason was "reserved". Pick Up And Haul reserves a
+            // whole queue of stacks per job, so most of a group haul's pool
+            // is reserved by someone for seconds at a time. CanReserve is
+            // false here only when another pawn holds the target (the pawn
+            // is spawned and TargetIsGone has already pruned the rest -
+            // read in the decompiled ReservationManager), and that always
+            // ends: the holder takes the thing, which despawns it and
+            // TargetIsGone drops it next look, or lets it go. The other
+            // refusals - forbidden, allowed area, unreachable - are about
+            // this pawn and do not clear on their own, so they still end it.
+            if (poolBusy)
             {
-                areaRetries.TryGetValue(pawn, out int tries);
-                tries++;
-
-                if (tries <= MaxAreaRetries)
+                if (willWait)
                 {
                     areaRetries[pawn] = tries;
-                    areaRetryAt[pawn] = Find.TickManager.TicksGame + AreaRetryTicks;
-                    Logger.Message($"{pawn.LabelShort}: all {noJobCount} of {order.SharedPool.Count} pooled targets refused ({order.WorkGiverDef.defName}), staying in the sweep, looking again in {AreaRetryTicks} ticks (try {tries})");
+                    int now = Find.TickManager.TicksGame;
+                    areaRetryAt[pawn] = now + AreaRetryTicks;
+
+                    // Was one line per look, per pawn: about 130 in five
+                    // minutes for 13 pawns on one pool on 2026-09-13. Now at
+                    // most one per order per AreaRetryTicks - the first wait
+                    // of a round writes it, the rest are counted and the
+                    // count rides on the next line written. Only the log
+                    // changes; every pawn still waits. Worded exactly as
+                    // before up to the try count, so existing test entries
+                    // still match. Section 12, Logging.
+                    if (now < order.NextWaitLogTick)
+                    {
+                        order.WaitsNotLogged++;
+                        return;
+                    }
+
+                    string waitingOn = reservedCount == 0
+                        ? $"all {noJobCount} of {order.SharedPool.Count} pooled targets refused"
+                        : $"{reservedCount} of {order.SharedPool.Count} pooled targets reserved by others, {noJobCount} refused";
+                    string unlogged = order.WaitsNotLogged == 0
+                        ? ""
+                        : $" (and {order.WaitsNotLogged} more wait{(order.WaitsNotLogged == 1 ? "" : "s")} on this order since the last such line)";
+                    Logger.Message($"{pawn.LabelShort}: {waitingOn} ({order.WorkGiverDef.defName}), staying in the sweep, looking again in {AreaRetryTicks} ticks (try {tries})"
+                        + unlogged
+                        + RefusalSummary(refusalCounts));
+
+                    order.NextWaitLogTick = now + AreaRetryTicks;
+                    order.WaitsNotLogged = 0;
                     return;
                 }
 
@@ -1434,7 +1892,10 @@ namespace DoNotBeLazy.Components
             Logger.Message($"{pawn.LabelShort}: no job at {station} (try {failures}), asking again in {WorkstationRetryTicks} ticks");
         }
 
-        // The pool is built once, against one driver pawn, at sweep start.
+        // The pool is built at sweep start as every target ANY pawn on the
+        // order can do (2026-09-13, architecture doc section 9), so a target
+        // in it may be one only a teammate can do. That is why the pawn is
+        // asked here, and why a refusal leaves the target for someone else.
         // Everything re-checked here is something that can differ per pawn
         // (allowed area, reachability) or drift while the sweep runs (the
         // target getting destroyed, forbidden, reserved, or its zone's sow
@@ -1622,6 +2083,38 @@ namespace DoNotBeLazy.Components
             return total > 0
                 ? $" +{queued} queued ({total} items)"
                 : $" +{queued} queued";
+        }
+
+        // Removes from the job's target queue A every target another pawn has
+        // reserved, and returns how many went. Added 2026-09-13, architecture
+        // doc section 14.
+        //
+        // WHY. WorkGiver_CleanFilth.JobOnThing (and GrowerHarvest.JobOnCell)
+        // fill the queue with forced: true, which their HasJobOn* passes to
+        // CanReserve as ignoreOtherReservations - so a teammate's targets get
+        // in. The driver then calls ReserveAsManyAsPossible over the queue,
+        // and for a player-forced job Verse.AI.ReservationManager.Reserve
+        // does not skip a held target: it takes it and calls
+        // EndCurrentOrQueuedJob(InterruptForced) on the holder. Read in the
+        // decompiled assembly, not remembered.
+        //
+        // Only a queue with no countQueue. Without counts the entries are
+        // independent targets and any can go; with counts (Pick Up And Haul)
+        // each target is paired with a count by index, and that driver was
+        // not read. CanReserve with its defaults is exactly what
+        // ReserveAsManyAsPossible reserves with, and it answers true for the
+        // pawn's own reservations.
+        private int DropQueuedTargetsReservedByOthers(Pawn pawn, Job job)
+        {
+            List<LocalTargetInfo> queue = job.targetQueueA;
+            if (queue == null || queue.Count == 0 || (job.countQueue != null && job.countQueue.Count > 0))
+            {
+                return 0;
+            }
+
+            int before = queue.Count;
+            queue.RemoveAll(queued => !map.reservationManager.CanReserve(pawn, queued));
+            return before - queue.Count;
         }
 
         private static int NextTargetIndex(IntVec3 center, IntVec3 pawnPos, List<LocalTargetInfo> pool, HashSet<LocalTargetInfo> skip, bool centerOut)

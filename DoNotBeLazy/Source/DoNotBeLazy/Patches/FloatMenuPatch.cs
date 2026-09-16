@@ -715,6 +715,11 @@ namespace DoNotBeLazy.Patches
                 bool firefighting = FireCompat.IsFirefighting(def);
                 ThingRequest req = scanner.PotentialWorkThingRequest;
 
+                // Architecture section 13. A haul refused without any
+                // reason (unreachable, cannot reserve) - kept aside and
+                // only spoken if nobody gave a real reason or took the job.
+                Thing silentHaulRefusal = null;
+
                 foreach (Thing thing in thingsHere)
                 {
                     foreach (Pawn pawn in pawns)
@@ -745,11 +750,20 @@ namespace DoNotBeLazy.Patches
                             // sane - without it every def in the game gets
                             // to explain itself about every click. Vanilla
                             // scopes its own version the same way.
+                            //
+                            // WorkGiver_Haul has no thing request at all (it
+                            // finds work through listerHaulables), so for a
+                            // haul def HaulWantsThing stands in for it -
+                            // otherwise "no empty place" was thrown away and
+                            // a stored stack opened no menu. Section 13.
+                            bool scoped = req.IsUndefined
+                                ? HaulWantsThing(def, thing)
+                                : req.Accepts(thing);
+
                             if (failReason == null
                                 && JobFailReason.HaveReason
                                 && !JobFailReason.Silent
-                                && !req.IsUndefined
-                                && req.Accepts(thing))
+                                && scoped)
                             {
                                 failReason = JobFailReason.Reason;
                                 failThing = thing;
@@ -782,12 +796,36 @@ namespace DoNotBeLazy.Patches
                                 failReason = "unreachable, or already being dealt with";
                                 failThing = thing;
                             }
+
+                            // CanReach and CanReserve inside
+                            // HaulAIUtility.PawnCanAutomaticallyHaulFast
+                            // refuse without writing any reason. Remembered
+                            // here, spoken after the loops only if nothing
+                            // better turned up.
+                            if (silentHaulRefusal == null
+                                && req.IsUndefined
+                                && scoped
+                                && !JobFailReason.HaveReason
+                                && !JobFailReason.Silent)
+                            {
+                                silentHaulRefusal = thing;
+                            }
                         }
                         catch
                         {
                             // swallow
                         }
                     }
+                }
+
+                // Reaching here means no pawn had a job on anything in the
+                // cell. Hardcoded English, same as the firefighting line
+                // above - the game has no string for a refusal it never
+                // explains.
+                if (failReason == null && silentHaulRefusal != null)
+                {
+                    failReason = "unreachable, or in use";
+                    failThing = silentHaulRefusal;
                 }
             }
 
@@ -824,6 +862,16 @@ namespace DoNotBeLazy.Patches
                 ThingRequest req = ((WorkGiver_Scanner)def.Worker).PotentialWorkThingRequest;
                 if (req.IsUndefined)
                 {
+                    // WorkGiver_Haul never defines one - without this
+                    // "is not assigned to hauling" was silent. Every other
+                    // def with no request still says nothing. Section 13.
+                    foreach (Thing thing in thingsHere)
+                    {
+                        if (HaulWantsThing(def, thing))
+                        {
+                            return true;
+                        }
+                    }
                     return false;
                 }
                 foreach (Thing thing in thingsHere)
@@ -841,6 +889,44 @@ namespace DoNotBeLazy.Patches
             }
 
             return false;
+        }
+
+        // Does this haul def want this thing? Stands in for the thing
+        // request WorkGiver_Haul never defines (it inherits the scanner's
+        // Undefined one and finds work through listerHaulables instead).
+        // False for every def that is not a haul def, so no other work type
+        // gains a greyed line. Architecture section 13.
+        //
+        // The corpse split copies vanilla's own JobOnThing overrides, read
+        // out of lib\Assembly-CSharp.dll: HaulGeneral returns null for a
+        // Corpse and HaulCorpses returns null for anything else, both
+        // without a reason. Those are the only two WorkGiver_Haul subclasses
+        // in the assembly. Pick Up And Haul's worker derives HaulGeneral, so
+        // it is covered without naming it.
+        private static bool HaulWantsThing(WorkGiverDef def, Thing thing)
+        {
+            if (thing?.def == null || !(def?.Worker is WorkGiver_Haul worker))
+            {
+                return false;
+            }
+
+            // alwaysHaulable || designateHaulable - false for walls, plants,
+            // pawns and filth
+            if (!thing.def.EverHaulable)
+            {
+                return false;
+            }
+
+            if (worker is WorkGiver_HaulCorpses)
+            {
+                return thing is Corpse;
+            }
+            if (worker is WorkGiver_HaulGeneral)
+            {
+                return !(thing is Corpse);
+            }
+
+            return true;
         }
 
         // First pawn in the selection with something to say, not a tally of
