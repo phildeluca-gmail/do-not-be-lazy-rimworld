@@ -40,7 +40,8 @@ namespace DoNotBeLazy.Patches
     //
     // Depends on SweepManager (Phase 3), which must expose:
     //   bool TryGetActiveSweep(Pawn pawn, out SweepOrder order)
-    //   void Notify_JobEnded(Pawn pawn, JobCondition condition)
+    //   void Notify_JobEnded(Pawn pawn, JobCondition condition, Job endedJob)
+    //   void Notify_JobEndDiscarded(Pawn pawn, Job endedJob, JobCondition condition)
     [HarmonyPatch(typeof(Pawn_JobTracker), nameof(Pawn_JobTracker.EndCurrentJob))]
     public static class JobTrackerPatch
     {
@@ -52,14 +53,6 @@ namespace DoNotBeLazy.Patches
 
         public static void Postfix(JobCondition condition, Pawn ___pawn, Job __state)
         {
-            // we're inside our own TryTakeOrderedJob - this job end is the
-            // interrupt we caused, not the pawn finishing something. Acting
-            // on it cancels the sweep we're in the middle of handing out.
-            if (SweepManager.AssigningJob)
-            {
-                return;
-            }
-
             Job endedJob = __state;
 
             Pawn pawn = ___pawn;
@@ -84,7 +77,29 @@ namespace DoNotBeLazy.Patches
                 return;
             }
 
-            sweepManager.Notify_JobEnded(pawn, condition);
+            // we're inside our own TryTakeOrderedJob - this job end is the
+            // interrupt we caused, not the pawn finishing something. Acting
+            // on it cancels the sweep we're in the middle of handing out.
+            //
+            // AssigningJob is ONE static flag for the whole game, so this
+            // also swallows the job end of any OTHER pawn whose job happens
+            // to end inside that window, and the sweep goes on believing it
+            // holds a pawn whose job is over. That is what lost Pelican on
+            // 2026-09-17, while 39 pawns were being handed a packing order in
+            // the same second. The flag is deliberately NOT changed here -
+            // narrowing it is an open decision for the user - but the loss is
+            // now written down. Architecture section 15.
+            //
+            // The order of the checks moved for it: the sweep lookup happens
+            // first now, so nothing at all is said about a pawn this mod does
+            // not hold, which is almost every pawn on the map.
+            if (SweepManager.AssigningJob)
+            {
+                sweepManager.Notify_JobEndDiscarded(pawn, endedJob, condition);
+                return;
+            }
+
+            sweepManager.Notify_JobEnded(pawn, condition, endedJob);
         }
     }
 }

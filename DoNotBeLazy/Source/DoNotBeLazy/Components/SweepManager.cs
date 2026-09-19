@@ -259,6 +259,53 @@ namespace DoNotBeLazy.Components
         // Cleared by any successful assignment.
         private readonly Dictionary<Pawn, int> areaRetries = new Dictionary<Pawn, int>();
 
+        // How many times one order may say that something else is driving a
+        // pawn this mod still believes it holds. Three rather than one: the
+        // first line is the moment the disagreement starts, and a second or
+        // third says it is still going on rather than being a single
+        // handover. A hard cap per pawn per order, so the line cannot turn
+        // into a per-tick report however badly the sweep is losing its pawns.
+        // Added 2026-09-18 - architecture section 15.
+        private const int MaxForeignJobReports = 3;
+
+        // How long one pawn stays quiet after a line saying a job end was
+        // thrown away because AssigningJob was set. 600 ticks, the same round
+        // as AreaRetryTicks. Added 2026-09-18 - architecture section 15.
+        private const int DiscardedEndQuietTicks = 600;
+
+        // The last job this mod handed the pawn. Read by one thing only: the
+        // tick check that asks whether something else has taken the pawn
+        // over. A reference comparison against pawn.CurJob, which is exact
+        // and costs nothing - the job object is never reused. Added
+        // 2026-09-18 - architecture section 15.
+        private readonly Dictionary<Pawn, Job> ourJob = new Dictionary<Pawn, Job>();
+
+        // One entry per pawn already reported as taken over on its current
+        // order, rather than a second dictionary - the same shape, and for
+        // the same reason, as PauseInfo.
+        private struct ForeignJobInfo
+        {
+            // the foreign job the last line named, so the same job running on
+            // for minutes writes one line and not one per state check
+            public Job job;
+
+            // how many of this order's MaxForeignJobReports have been spent
+            public int reports;
+        }
+
+        private readonly Dictionary<Pawn, ForeignJobInfo> foreignJob = new Dictionary<Pawn, ForeignJobInfo>();
+
+        // Job ends thrown away because AssigningJob was set while some other
+        // pawn was being handed a job. The tick to write the next line on,
+        // and how many were thrown away and not written since the last one.
+        private struct DiscardedEndInfo
+        {
+            public int nextLogTick;
+            public int suppressed;
+        }
+
+        private readonly Dictionary<Pawn, DiscardedEndInfo> discardedEnds = new Dictionary<Pawn, DiscardedEndInfo>();
+
         // TryTakeOrderedJob interrupts whatever the pawn is doing right now,
         // and that fires EndCurrentJob(InterruptForced) -> JobTrackerPatch's
         // postfix -> Notify_JobEnded -> RemoveSweep. So handing a pawn a
@@ -266,6 +313,15 @@ namespace DoNotBeLazy.Components
         // against the DLL: TryTakeOrderedJob -> StartJob -> EndCurrentJob.
         // This flag lets JobTrackerPatch ignore the job end it caused itself.
         public static bool AssigningJob;
+
+        // Who the mod is handing a job to while AssigningJob is set. Written
+        // for the log and read by nothing that branches - added 2026-09-18 so
+        // the line reporting a thrown-away job end can name the pawn whose
+        // assignment threw it away. AssigningJob is one flag for the whole
+        // map, so a job end belonging to a completely different pawn is
+        // discarded too; naming both pawns is what makes that readable.
+        // Architecture section 15.
+        public static Pawn AssigningTo;
 
         public SweepManager(Map map) : base(map)
         {
@@ -275,6 +331,7 @@ namespace DoNotBeLazy.Components
         public static void GiveJob(Pawn pawn, Job job)
         {
             AssigningJob = true;
+            AssigningTo = pawn;
             try
             {
                 pawn.jobs.TryTakeOrderedJob(job, JobTag.Misc);
@@ -282,7 +339,45 @@ namespace DoNotBeLazy.Components
             finally
             {
                 AssigningJob = false;
+                AssigningTo = null;
             }
+        }
+
+        // "DoBill Make_ComponentIndustrial", "HaulToCell", or "no job".
+        //
+        // job.def alone was what every assignment and job-ended line carried,
+        // and for a bench order that is the word "DoBill" and nothing else -
+        // which recipe the pawn was actually making was never written down.
+        // On 2026-09-17 that was the one question the evening's log could not
+        // answer. job.bill and Bill.recipe are both plain fields (read off
+        // lib\Assembly-CSharp.dll, not remembered), so this cannot throw and
+        // allocates only when there is a bill. Added 2026-09-18.
+        private static string DescribeJob(Job job)
+        {
+            if (job?.def == null)
+            {
+                return "no job";
+            }
+
+            RecipeDef recipe = job.bill?.recipe;
+            return recipe == null ? job.def.defName : $"{job.def.defName} {recipe.defName}";
+        }
+
+        // "JobGiver_Work [Assembly-CSharp]" - the ThinkNode that issued a job
+        // and the assembly that node came from, which is what names the mod
+        // responsible when it is not vanilla. Same idea as JobSourcePatch,
+        // read off Job.jobGiver, which is a plain ThinkNode field on Job.
+        // Added 2026-09-18.
+        private static string DescribeJobSource(Job job)
+        {
+            ThinkNode giver = job?.jobGiver;
+            if (giver == null)
+            {
+                return job != null && job.playerForced ? "no job giver (player-forced)" : "no job giver";
+            }
+
+            Type type = giver.GetType();
+            return $"{type.Name} [{type.Assembly.GetName().Name}]";
         }
 
         public override void MapComponentTick()
@@ -327,7 +422,131 @@ namespace DoNotBeLazy.Components
                 TryScannerWatchdog(pawn);
                 TryWorkstationRetry(pawn);
                 TryAreaRetry(pawn);
+
+                // last, because the three above can end the order or hand
+                // the pawn a fresh job in this same pass, and either answers
+                // the question this one asks
+                TryReportForeignJob(pawn);
             }
+        }
+
+        // Say so when this mod still holds a pawn and something else is
+        // driving it. Added 2026-09-18 - architecture section 15.
+        //
+        // This is the case that cost the evening of 2026-09-17: Pelican was
+        // on a "* fabricate things until done" order, stopped fabricating,
+        // was handed flak jackets by vanilla instead, and the mod went on
+        // believing it held him with not one line written about any of it.
+        //
+        // Why a tick check and not a hook on the job starting.
+        // Pawn_JobTracker.EndCurrentJob calls TryFindAndStartJob inside its
+        // own body - read out of lib\Assembly-CSharp.dll, not remembered - so
+        // vanilla has already started a replacement job by the time this
+        // mod's postfix on EndCurrentJob runs and hands out the next sweep
+        // job. Asking the question as the job starts would therefore be true
+        // on every ordinary handover, which is once per target. Asking it
+        // 60 ticks later asks it of a settled pawn, and the answer is a real
+        // disagreement rather than a moment in the handover.
+        //
+        // Never fires while the mod has deliberately let go of the pawn: a
+        // need pause, a workstation retry and an area retry all mean vanilla
+        // is meant to be driving. Scanner orders are left to
+        // TryScannerWatchdog, because a scanner job's 1500-tick expiry swaps
+        // the Job object for an identical one without the pawn moving, and
+        // the reference comparison below would read that as a takeover.
+        private void TryReportForeignJob(Pawn pawn)
+        {
+            if (!activeSweeps.TryGetValue(pawn, out SweepOrder order)
+                || pausedForNeed.ContainsKey(pawn)
+                || workstationRetryAt.ContainsKey(pawn)
+                || areaRetryAt.ContainsKey(pawn)
+                || ScannerCompat.IsScannerWork(order.WorkGiverDef))
+            {
+                return;
+            }
+
+            Job current = pawn.jobs?.curJob;
+            ourJob.TryGetValue(pawn, out Job mine);
+            if (current != null && ReferenceEquals(current, mine))
+            {
+                return;
+            }
+
+            foreignJob.TryGetValue(pawn, out ForeignJobInfo seen);
+
+            // the same foreign job still running is the same disagreement,
+            // not a new one - one line, however long it lasts
+            if (seen.reports >= MaxForeignJobReports || (seen.job != null && ReferenceEquals(seen.job, current)))
+            {
+                return;
+            }
+
+            seen.job = current;
+            seen.reports++;
+            foreignJob[pawn] = seen;
+
+            string now = current == null
+                ? "has no job at all"
+                : $"is on {DescribeJob(current)} from {DescribeJobSource(current)}";
+
+            Logger.Message($"{pawn.LabelShort}: we still hold the {order.WorkGiverDef.defName} order"
+                + (order.WorkstationTarget != null ? $" at {order.WorkstationTarget.LabelShort}" : "")
+                + $", but the pawn {now}"
+                + (mine == null ? " - we have given it no job yet" : $" - the last job we gave was {DescribeJob(mine)}")
+                + $" (report {seen.reports} of {MaxForeignJobReports} for this order)");
+        }
+
+        // A job end was thrown away because AssigningJob was set. Added
+        // 2026-09-18 - architecture section 15.
+        //
+        // AssigningJob is one static flag for the whole game, set while this
+        // mod hands ANY pawn a job, and JobTrackerPatch's postfix returns on
+        // it for EVERY pawn. So while a large order is being handed out, an
+        // unrelated pawn's job can end inside that window and this mod never
+        // hears about it - it goes on believing it holds a pawn whose job is
+        // over. That is what happened on 2026-09-17: 39 pawns joined a
+        // vehicle-packing order in one second and Pelican's fabrication job
+        // end fell in the window.
+        //
+        // The flag is NOT changed here. Whether to narrow it to one pawn is
+        // an open decision for the user; this only makes the loss visible.
+        //
+        // Volume: nothing at all unless the pawn whose job ended is one we
+        // hold, and then at most one line per pawn per DiscardedEndQuietTicks
+        // - the ones in between are counted and the count rides on the next
+        // line, the same way the area wait line collapses its repeats.
+        public void Notify_JobEndDiscarded(Pawn pawn, Job endedJob, JobCondition condition)
+        {
+            if (!activeSweeps.TryGetValue(pawn, out SweepOrder order))
+            {
+                return;
+            }
+
+            int now = Find.TickManager.TicksGame;
+            discardedEnds.TryGetValue(pawn, out DiscardedEndInfo info);
+            if (now < info.nextLogTick)
+            {
+                info.suppressed++;
+                discardedEnds[pawn] = info;
+                return;
+            }
+
+            string alsoLost = info.suppressed == 0
+                ? ""
+                : $" (and {info.suppressed} more job end{(info.suppressed == 1 ? "" : "s")} of this pawn's thrown away since the last such line)";
+
+            Pawn assigningTo = AssigningTo;
+            Logger.Message($"{pawn.LabelShort}: job end {condition} on {DescribeJob(endedJob)} was THROWN AWAY"
+                + (assigningTo == null || assigningTo == pawn
+                    ? " - we were handing out a job at the time"
+                    : $" - we were handing {assigningTo.LabelShort} a job at the time")
+                + $"; {pawn.LabelShort} is still registered on the {order.WorkGiverDef.defName} order"
+                + (order.WorkstationTarget != null ? $" at {order.WorkstationTarget.LabelShort}" : "")
+                + alsoLost);
+
+            info.suppressed = 0;
+            info.nextLogTick = now + DiscardedEndQuietTicks;
+            discardedEnds[pawn] = info;
         }
 
         // The scanner equivalent of TryWorkstationRetry, and polled for the
@@ -416,6 +635,7 @@ namespace DoNotBeLazy.Components
                 // PauseForNeed; without it JobTrackerPatch's postfix re-enters
                 // on our own EndCurrentJob call
                 AssigningJob = true;
+                AssigningTo = pawn;
                 try
                 {
                     pawn.jobs.EndCurrentJob(JobCondition.Succeeded);
@@ -423,6 +643,7 @@ namespace DoNotBeLazy.Components
                 finally
                 {
                     AssigningJob = false;
+                    AssigningTo = null;
                 }
             }
 
@@ -487,7 +708,13 @@ namespace DoNotBeLazy.Components
             }
 
             areaRetryAt.Remove(pawn);
-            AssignNextTask(pawn, order);
+
+            // The resume is named on whichever assignment line comes out of
+            // this call, rather than getting a line of its own: an area wait
+            // resumes up to MaxAreaRetries times per pawn per order, and a
+            // line each is exactly the volume the wait line itself was cut
+            // down from on 2026-09-13. Architecture section 15.
+            AssignNextTask(pawn, order, "an area wait");
         }
 
         public bool TryGetActiveSweep(Pawn pawn, out SweepOrder order)
@@ -552,7 +779,19 @@ namespace DoNotBeLazy.Components
             // called defensively in places where there may be nothing to do
             if (activeSweeps.TryGetValue(pawn, out SweepOrder ending))
             {
-                Logger.Message($"{pawn.LabelShort}: sweep ended - {reason} ({ending.WorkGiverDef.defName})");
+                // What the pawn is doing at the moment we let go of it, but
+                // only when it is not the job we gave it. That is the whole
+                // disagreement stated in one place: we are releasing a pawn
+                // that vanilla has already been driving. Costs no extra line
+                // and says nothing at all in the ordinary case. Added
+                // 2026-09-18 - architecture section 15.
+                Job current = pawn.jobs?.curJob;
+                ourJob.TryGetValue(pawn, out Job mine);
+                string doingNow = ReferenceEquals(current, mine)
+                    ? ""
+                    : $", the pawn is now on {DescribeJob(current)}";
+
+                Logger.Message($"{pawn.LabelShort}: sweep ended - {reason} ({ending.WorkGiverDef.defName}){doingNow}");
             }
 
             activeSweeps.Remove(pawn);
@@ -562,6 +801,9 @@ namespace DoNotBeLazy.Components
             workstationRetryAt.Remove(pawn);
             areaRetryAt.Remove(pawn);
             areaRetries.Remove(pawn);
+            ourJob.Remove(pawn);
+            foreignJob.Remove(pawn);
+            discardedEnds.Remove(pawn);
         }
 
         // Put a pawn that can do a new order onto it. Added 2026-09-13,
@@ -760,6 +1002,7 @@ namespace DoNotBeLazy.Components
             }
 
             AssigningJob = true;
+            AssigningTo = pawn;
             try
             {
                 pawn.jobs.EndCurrentJob(JobCondition.InterruptForced);
@@ -767,6 +1010,7 @@ namespace DoNotBeLazy.Components
             finally
             {
                 AssigningJob = false;
+                AssigningTo = null;
             }
         }
 
@@ -915,7 +1159,8 @@ namespace DoNotBeLazy.Components
                 activeSweeps[pawn] = order;
                 joined++;
 
-                Logger.Message($"BeginSweep {workGiverDef.defName} at {target.LabelShort}: {pawn.LabelShort} joined, first job {job.def.defName}");
+                Logger.Message($"BeginSweep {workGiverDef.defName} at {target.LabelShort}: {pawn.LabelShort} joined, first job {DescribeJob(job)}");
+                ourJob[pawn] = job;
                 GiveJob(pawn, job);
             }
 
@@ -999,9 +1244,10 @@ namespace DoNotBeLazy.Components
                 // an order had even started. job.def matters here: DoBill
                 // means the bill itself, anything else means the WorkGiver
                 // wants a haul-off or a refuel first.
-                Logger.Message($"BeginSweep {workGiverDef.defName} at {billGiver.LabelShort}: {pawn.LabelShort} of {ranked.Count} ranked, first job {job.def.defName}");
+                Logger.Message($"BeginSweep {workGiverDef.defName} at {billGiver.LabelShort}: {pawn.LabelShort} of {ranked.Count} ranked, first job {DescribeJob(job)}");
                 areaRetryAt.Remove(pawn);
                 areaRetries.Remove(pawn);
+                ourJob[pawn] = job;
                 GiveJob(pawn, job);
                 return;
             }
@@ -1238,7 +1484,15 @@ namespace DoNotBeLazy.Components
             return names.Count == 0 ? "" : ", dropped: " + string.Join(", ", names.ToArray());
         }
 
-        public void Notify_JobEnded(Pawn pawn, JobCondition condition)
+        // endedJob is the job JobTrackerPatch's prefix captured before
+        // EndCurrentJob cleared it. Optional only so an older call site
+        // cannot fail to compile; JobTrackerPatch always passes it. Added
+        // 2026-09-18: the line below named the ORDER's WorkGiverDef and
+        // nothing about the job, so on 2026-09-17 a flak jacket job ending
+        // was written as "job ended InterruptForced
+        // (DoBillsFabricationBench)" and read as the fabrication order
+        // ending. Architecture section 15.
+        public void Notify_JobEnded(Pawn pawn, JobCondition condition, Job endedJob = null)
         {
             if (!activeSweeps.TryGetValue(pawn, out SweepOrder order))
             {
@@ -1263,7 +1517,17 @@ namespace DoNotBeLazy.Components
 
             // the condition is what decides continue-vs-stop, and "the pawn
             // wandered off" reports are almost always answered by this line
-            Logger.Message($"{pawn.LabelShort}: job ended {condition} ({order.WorkGiverDef.defName})");
+            //
+            // The job that actually ended is named alongside the order it is
+            // being attributed to, and when it is not the job this mod gave
+            // the pawn, the line says so. A stale attribution then reads as
+            // one instead of being invisible. Architecture section 15.
+            ourJob.TryGetValue(pawn, out Job gaveThem);
+            string mismatch = endedJob == null || ReferenceEquals(endedJob, gaveThem)
+                ? ""
+                : $" - NOT the job we gave, which was {DescribeJob(gaveThem)}";
+
+            Logger.Message($"{pawn.LabelShort}: job ended {condition} on {DescribeJob(endedJob)} ({order.WorkGiverDef.defName}){mismatch}");
 
             if (pausedForNeed.TryGetValue(pawn, out PauseInfo paused))
             {
@@ -1354,7 +1618,7 @@ namespace DoNotBeLazy.Components
                 // arrives as exactly this, and moving the pawn onto its next
                 // queued order would fight whatever took it. Section 12,
                 // decision 4.
-                ClearSweeps(pawn, $"job ended {condition}");
+                ClearSweeps(pawn, $"job ended {condition} on {DescribeJob(endedJob)}");
                 return;
             }
 
@@ -1463,8 +1727,16 @@ namespace DoNotBeLazy.Components
                 || condition == JobCondition.ErroredPather;      // couldn't path to this one target
         }
 
-        private void AssignNextTask(Pawn pawn, SweepOrder order)
+        // resumedBecause names what the pawn is coming back from - "an area
+        // wait" - and is folded into whichever assignment line this call
+        // writes, so a resume costs no line of its own. Null on every call
+        // that is a plain continuation. Added 2026-09-18, architecture
+        // section 15. The need-pause resume and the workstation retry resume
+        // already write their own line and do not use this.
+        private void AssignNextTask(Pawn pawn, SweepOrder order, string resumedBecause = null)
         {
+            string resumed = resumedBecause == null ? "" : $", resumed after {resumedBecause}";
+
             if (!(order.WorkGiverDef.Worker is WorkGiver_Scanner scanner))
             {
                 RemoveSweep(pawn, "the WorkGiver is no longer a scanner");
@@ -1535,7 +1807,12 @@ namespace DoNotBeLazy.Components
 
                 consecutiveFailures.Remove(pawn);
                 workstationRetryAt.Remove(pawn);
-                Logger.Message($"{pawn.LabelShort}: {resumeJob.def.defName} at {order.WorkstationTarget.LabelShort} ({order.WorkGiverDef.defName})");
+
+                // DescribeJob, not resumeJob.def.defName: for a bench order
+                // the def is the word "DoBill" and the recipe is the thing
+                // anyone reading this line wants. Architecture section 15.
+                Logger.Message($"{pawn.LabelShort}: {DescribeJob(resumeJob)} at {order.WorkstationTarget.LabelShort} ({order.WorkGiverDef.defName}){resumed}");
+                ourJob[pawn] = resumeJob;
                 GiveJob(pawn, resumeJob);
                 return;
             }
@@ -1690,8 +1967,10 @@ namespace DoNotBeLazy.Components
                 float fromCentre = (target.Cell - order.ScanCenter).LengthHorizontal;
                 float fromPawn = (target.Cell - pawn.Position).LengthHorizontal;
 
-                Logger.Message($"{pawn.LabelShort}: {job.def.defName} on {target}"
+                Logger.Message($"{pawn.LabelShort}: {DescribeJob(job)} on {target}"
                     + $" at {target.Cell} c={fromCentre:F0} p={fromPawn:F0}"
+                    + $" for the {order.WorkGiverDef.defName} order"
+                    + resumed
                     + DescribeQueue(job)
                     + (leftOut > 0 ? $", {leftOut} reserved by others left out" : "")
                     + (order.CenterOut ? "" : " [pawn-nearest]")
@@ -1721,6 +2000,7 @@ namespace DoNotBeLazy.Components
                 areaRetries.Remove(pawn);
 
                 lastAssignedTarget[pawn] = target;
+                ourJob[pawn] = job;
                 GiveJob(pawn, job);
                 return;
             }
