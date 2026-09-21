@@ -30,7 +30,7 @@ namespace DoNotBeLazy.Core
         // send them to bed. NeedMonitor is the only thing that will.
         public float restThreshold = 0.10f;
         public bool showSweepOverlay = true;
-        public bool verboseLogging = false;
+        public bool verboseLogging = true;
         public bool jobDiagnostics = false;
 
         // Widgets.TextFieldNumeric and Widgets.TextFieldPercent both take a
@@ -70,7 +70,7 @@ namespace DoNotBeLazy.Core
             Scribe_Values.Look(ref moodThreshold, "moodThreshold", 0.10f);
             Scribe_Values.Look(ref restThreshold, "restThreshold", 0.10f);
             Scribe_Values.Look(ref showSweepOverlay, "showSweepOverlay", true);
-            Scribe_Values.Look(ref verboseLogging, "verboseLogging", false);
+            Scribe_Values.Look(ref verboseLogging, "verboseLogging", true);
             Scribe_Values.Look(ref jobDiagnostics, "jobDiagnostics", false);
 
             // the toggle only exists to drive this - keep them in sync on

@@ -81,19 +81,28 @@ namespace DoNotBeLazy.Patches
             // interrupt we caused, not the pawn finishing something. Acting
             // on it cancels the sweep we're in the middle of handing out.
             //
-            // AssigningJob is ONE static flag for the whole game, so this
-            // also swallows the job end of any OTHER pawn whose job happens
-            // to end inside that window, and the sweep goes on believing it
-            // holds a pawn whose job is over. That is what lost Pelican on
-            // 2026-09-17, while 39 pawns were being handed a packing order in
-            // the same second. The flag is deliberately NOT changed here -
-            // narrowing it is an open decision for the user - but the loss is
-            // now written down. Architecture section 15.
+            // Narrowed 2026-09-19 from one static bool for the whole game to
+            // one entry per pawn (SweepManager.IsBeingAssigned) - see the
+            // Dictionary<Pawn, int> and comments in SweepManager.cs. Before
+            // the narrowing this check ignored EVERY pawn's job ending while
+            // ANY pawn was being handed a job, so the sweep went on believing
+            // it held a pawn whose job was long over. That lost Pelican on
+            // 2026-09-17 (39 pawns handed a packing order in one second) and
+            // a tamed kangaroo on 2026-09-19, confirmed live. Now this only
+            // swallows THIS pawn's own job ending, caused by THIS pawn's own
+            // assignment - the case GiveJob, EndSweepAndJob and PauseForNeed
+            // rely on. A different pawn's job ending during the same window
+            // (for example, a player-forced job stealing its reservation and
+            // ending its job with JobCondition.InterruptForced - verified
+            // from the IL of ReservationManager.Reserve and
+            // Pawn_JobTracker.TryTakeOrderedJob) now falls through to
+            // Notify_JobEnded below, exactly as any other job ending does.
+            // Architecture sections 14 and 15.
             //
             // The order of the checks moved for it: the sweep lookup happens
             // first now, so nothing at all is said about a pawn this mod does
             // not hold, which is almost every pawn on the map.
-            if (SweepManager.AssigningJob)
+            if (SweepManager.IsBeingAssigned(pawn))
             {
                 sweepManager.Notify_JobEndDiscarded(pawn, endedJob, condition);
                 return;

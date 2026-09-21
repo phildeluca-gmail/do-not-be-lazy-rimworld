@@ -358,7 +358,19 @@ namespace DoNotBeLazy.Patches
                             Logger.Warning("no SweepManager on map, sweep ignored");
                             return;
                         }
-                        mgr.BeginSweep(eligiblePawns, capturedTarget, capturedDef);
+
+                        // Read here, and nowhere deeper - this lambda runs
+                        // synchronously on the click, inside the same live
+                        // GUI event vanilla's own queue-vs-replace check
+                        // uses (Pawn_JobTracker.TryTakeOrderedJob).
+                        // KeyBindingDefOf.QueueOrder.IsDownEvent answers
+                        // false once that event is gone, which is true
+                        // everywhere else BeginSweep's call chain runs (the
+                        // tick pass, a job-ended callback). Verified
+                        // 2026-09-20 against lib\Assembly-CSharp.dll.
+                        // Architecture section 16.
+                        bool queueOrder = KeyBindingDefOf.QueueOrder.IsDownEvent;
+                        mgr.BeginSweep(eligiblePawns, capturedTarget, capturedDef, queueOrder);
                     },
                     MenuOptionPriority.Low));
             }
@@ -485,6 +497,17 @@ namespace DoNotBeLazy.Patches
         // drafted pawn to eat/take a combat drug in vanilla too) and doesn't
         // check hunger level (a manual order works regardless of need, same
         // as vanilla).
+        //
+        // When nobody selected qualifies, the option used to simply not be
+        // drawn - "nobody here can eat this" and "the mod is broken" looked
+        // identical, which cost half an hour on 2026-09-19. Ordered that
+        // day, verbatim: "Yes, please show." Same mechanism and style as the
+        // greyed sweep entries (architecture doc decision 4.1, 2026-09-13) -
+        // see DisabledConsumeOption. Does NOT look inside a container or a
+        // vehicle's cargo for something else to offer - rejected the same
+        // day: "No this opens problems like loading a transport pod and
+        // having things eat from the pod. Makes for confusing loads."
+        // FindIngestibleThing still scans only the clicked cell.
         private static void AddConsumeOption(List<Pawn> pawns, Map map, List<Thing> thingsHere, List<FloatMenuOption> options)
         {
             Thing ingestible = FindIngestibleThing(thingsHere);
@@ -494,16 +517,24 @@ namespace DoNotBeLazy.Patches
             }
 
             var canEat = new List<Pawn>();
+            var refusalCounts = new Dictionary<string, int>();
             foreach (Pawn pawn in pawns)
             {
-                if (pawn != null && pawn.Map == map && CanConsume(pawn, ingestible))
+                if (pawn == null || pawn.Map != map)
+                {
+                    continue;
+                }
+
+                string refusal = ConsumeRefusalReason(pawn, ingestible);
+                if (refusal == null)
                 {
                     canEat.Add(pawn);
                 }
-            }
-            if (canEat.Count == 0)
-            {
-                return;
+                else
+                {
+                    refusalCounts.TryGetValue(refusal, out int seen);
+                    refusalCounts[refusal] = seen + 1;
+                }
             }
 
             string commandFormat = ingestible.def.ingestible.ingestCommandString;
@@ -511,11 +542,62 @@ namespace DoNotBeLazy.Patches
                 ? "Consume " + ingestible.LabelShort
                 : string.Format(commandFormat, ingestible.LabelShort);
 
+            if (canEat.Count == 0)
+            {
+                options.Add(DisabledConsumeOption(label, SummarizeConsumeRefusal(refusalCounts, pawns.Count)));
+                return;
+            }
+
             Thing capturedThing = ingestible;
             options.Add(new FloatMenuOption(
                 "* " + label,
                 () => ConsumeAll(canEat, capturedThing),
                 MenuOptionPriority.Low));
+        }
+
+        // The reason across the whole selection, when nobody can eat it: the
+        // one reason if every pawn who has one shares it (the user's own
+        // example - "everyone is a Teetotaler"), the most common one if a
+        // clear majority share it, or the user's own catch-all - "nobody is
+        // able" - when the reasons genuinely differ. Not asked to pick one
+        // specific rule beyond that; this is the judgement call the order
+        // asked for.
+        private static string SummarizeConsumeRefusal(Dictionary<string, int> refusalCounts, int selectionCount)
+        {
+            if (refusalCounts.Count == 0)
+            {
+                return "nobody here is able to";
+            }
+
+            string best = null;
+            int bestCount = 0;
+            foreach (KeyValuePair<string, int> pair in refusalCounts)
+            {
+                if (pair.Value > bestCount)
+                {
+                    best = pair.Key;
+                    bestCount = pair.Value;
+                }
+            }
+
+            return bestCount * 2 > selectionCount ? best : "nobody here is able to";
+        }
+
+        // Same mechanism and style as DisabledOption above - architecture
+        // doc decision 4.1: a null action plus Disabled = true greys the
+        // entry, MenuOptionPriority.Low keeps it below any real option, and
+        // the reason follows a dash. No WorkGiverDef here (Consume isn't a
+        // WorkGiver order) and no "until done" - Consume is a one-shot
+        // order, not an ongoing sweep, so that wording doesn't apply.
+        private static FloatMenuOption DisabledConsumeOption(string label, string reason)
+        {
+            return new FloatMenuOption(
+                "* " + label + " - " + reason,
+                null,
+                MenuOptionPriority.Low)
+            {
+                Disabled = true,
+            };
         }
 
         private static Thing FindIngestibleThing(List<Thing> thingsHere)
@@ -530,15 +612,37 @@ namespace DoNotBeLazy.Patches
             return null;
         }
 
-        private static bool CanConsume(Pawn pawn, Thing thing)
+        // Returns null when the pawn can consume the thing, otherwise the
+        // reason why not, in the same plain-English style DisabledOption
+        // already uses for the sweep options.
+        //
+        // Checked against RimWorld.FoodUtility.WillEat, decompiled from
+        // lib\Assembly-CSharp.dll on 2026-09-19 rather than remembered: the
+        // food-policy check
+        // (foodRestriction.GetCurrentRespectedRestriction(pawn).Allows(thing))
+        // is named here explicitly because it is the user's own example
+        // wording ("the food policy forbids it"). Everything else WillEat
+        // checks - species diet, preferability, baby restrictions, a royal
+        // title's dining rules - is folded into one generic reason instead
+        // of a reason each, since none of those were named and guessing
+        // their wording risks being wrong.
+        private static string ConsumeRefusalReason(Pawn pawn, Thing thing)
         {
-            if (pawn.Dead || pawn.Downed || pawn.InMentalState)
+            if (pawn.Dead)
             {
-                return false;
+                return "is dead";
+            }
+            if (pawn.Downed)
+            {
+                return "is downed";
+            }
+            if (pawn.InMentalState)
+            {
+                return "is having a mental break";
             }
             if (pawn.RaceProps == null || !pawn.RaceProps.Humanlike)
             {
-                return false;
+                return "can't eat";
             }
 
             // WillEat is a food-appetite check (preferability/nutrition) and
@@ -552,10 +656,19 @@ namespace DoNotBeLazy.Patches
                 // the "forced to take drugs" thought - it's allowed, just
                 // gives a mood hit) but skip them here rather than force it
                 bool isTeetotaler = pawn.story?.traits != null && pawn.story.traits.HasTrait(TraitDefOf.DrugDesire, -1);
-                return !isTeetotaler;
+                return isTeetotaler ? "is a Teetotaler" : null;
             }
 
-            return FoodUtility.WillEat(pawn, thing, pawn);
+            if (pawn.foodRestriction != null && !pawn.IsMutant && !pawn.DevelopmentalStage.Baby())
+            {
+                FoodPolicy respected = pawn.foodRestriction.GetCurrentRespectedRestriction(pawn);
+                if (respected != null && !respected.Allows(thing))
+                {
+                    return "the food policy forbids it";
+                }
+            }
+
+            return FoodUtility.WillEat(pawn, thing, pawn) ? null : "is unable to eat it";
         }
 
         // one dose each, taken directly from the clicked stack - not looped

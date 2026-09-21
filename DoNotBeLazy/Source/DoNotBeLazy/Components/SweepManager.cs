@@ -295,9 +295,10 @@ namespace DoNotBeLazy.Components
 
         private readonly Dictionary<Pawn, ForeignJobInfo> foreignJob = new Dictionary<Pawn, ForeignJobInfo>();
 
-        // Job ends thrown away because AssigningJob was set while some other
-        // pawn was being handed a job. The tick to write the next line on,
-        // and how many were thrown away and not written since the last one.
+        // Job ends thrown away because this pawn was being handed a job at
+        // the moment its own prior job ended. The tick to write the next
+        // line on, and how many were thrown away and not written since the
+        // last one.
         private struct DiscardedEndInfo
         {
             public int nextLogTick;
@@ -306,40 +307,108 @@ namespace DoNotBeLazy.Components
 
         private readonly Dictionary<Pawn, DiscardedEndInfo> discardedEnds = new Dictionary<Pawn, DiscardedEndInfo>();
 
+        // How long one pawn stays quiet after a line saying its target was
+        // taken by another job and it was retargeted to the next-closest
+        // one. Same round number as DiscardedEndQuietTicks, for the same
+        // reason - a pawn whose resource keeps getting stolen over a long
+        // order would otherwise write one line per incident. Added
+        // 2026-09-19 - architecture section 14, the open question answered.
+        private const int RetargetQuietTicks = 600;
+
+        // A retarget line already written for this pawn, and how many more
+        // happened since - same shape as DiscardedEndInfo, for the same
+        // reason.
+        private struct RetargetInfo
+        {
+            public int nextLogTick;
+            public int suppressed;
+        }
+
+        private readonly Dictionary<Pawn, RetargetInfo> retargets = new Dictionary<Pawn, RetargetInfo>();
+
         // TryTakeOrderedJob interrupts whatever the pawn is doing right now,
         // and that fires EndCurrentJob(InterruptForced) -> JobTrackerPatch's
         // postfix -> Notify_JobEnded -> RemoveSweep. So handing a pawn a
         // sweep job was cancelling the sweep that handed it out. Verified
         // against the DLL: TryTakeOrderedJob -> StartJob -> EndCurrentJob.
-        // This flag lets JobTrackerPatch ignore the job end it caused itself.
-        public static bool AssigningJob;
+        // This lets JobTrackerPatch ignore the job end it caused itself.
+        //
+        // Narrowed from one static bool for the whole game to one entry per
+        // pawn, 2026-09-19 - architecture section 14, "Seen while diagnosing,
+        // not changed" and section 15. The old single flag silenced every
+        // OTHER pawn's job ending too while any one pawn was being handed a
+        // job, which is what lost a tamed kangaroo on 2026-09-19: it stayed
+        // registered on a sweep order after its own job ended for an
+        // unrelated reason, because the ignore window belonged to whichever
+        // pawn was being assigned at that moment, not to the kangaroo.
+        // Confirmed live the same day: a player-forced job (every sweep job
+        // is one, see section 14) really does take another pawn's
+        // reservation and end that pawn's current job with
+        // JobCondition.InterruptForced - verified from the IL of
+        // ReservationManager.Reserve and Pawn_JobTracker.TryTakeOrderedJob.
+        // That ending is real and now reaches JobTrackerPatch's normal path
+        // instead of being thrown away.
+        //
+        // The value is a depth, not a bool, so a pawn's own assignment can
+        // nest - PauseForNeed can end a job while GiveJob is already
+        // suppressing for the same pawn - without the inner call's finally
+        // block clearing the outer call's suppression early. A pawn absent
+        // from the dictionary, or present with 0, is not being assigned.
+        private static readonly Dictionary<Pawn, int> assigningJobDepth = new Dictionary<Pawn, int>();
 
-        // Who the mod is handing a job to while AssigningJob is set. Written
-        // for the log and read by nothing that branches - added 2026-09-18 so
-        // the line reporting a thrown-away job end can name the pawn whose
-        // assignment threw it away. AssigningJob is one flag for the whole
-        // map, so a job end belonging to a completely different pawn is
-        // discarded too; naming both pawns is what makes that readable.
-        // Architecture section 15.
-        public static Pawn AssigningTo;
+        // Read by JobTrackerPatch to decide whether THIS pawn's job ending
+        // is the one this mod is causing right now, rather than some other
+        // pawn's job ending for an unrelated reason during the same window.
+        public static bool IsBeingAssigned(Pawn pawn)
+        {
+            return pawn != null && assigningJobDepth.TryGetValue(pawn, out int depth) && depth > 0;
+        }
+
+        // Marks pawn as "being assigned" for the duration of the caller's
+        // try block. Always paired with EndAssigningJob in a finally, so the
+        // marker is cleared even if the assignment throws - a leaked entry
+        // would silence every future job ending for that pawn forever, which
+        // is the same bug this change removes, just scoped to one pawn
+        // instead of the whole map.
+        private static void BeginAssigningJob(Pawn pawn)
+        {
+            assigningJobDepth.TryGetValue(pawn, out int depth);
+            assigningJobDepth[pawn] = depth + 1;
+        }
+
+        private static void EndAssigningJob(Pawn pawn)
+        {
+            if (!assigningJobDepth.TryGetValue(pawn, out int depth))
+            {
+                return;
+            }
+
+            if (depth <= 1)
+            {
+                assigningJobDepth.Remove(pawn);
+            }
+            else
+            {
+                assigningJobDepth[pawn] = depth - 1;
+            }
+        }
 
         public SweepManager(Map map) : base(map)
         {
         }
 
-        // every TryTakeOrderedJob in the mod goes through here - see AssigningJob
+        // every TryTakeOrderedJob in the mod goes through here - see
+        // BeginAssigningJob / EndAssigningJob above
         public static void GiveJob(Pawn pawn, Job job)
         {
-            AssigningJob = true;
-            AssigningTo = pawn;
+            BeginAssigningJob(pawn);
             try
             {
                 pawn.jobs.TryTakeOrderedJob(job, JobTag.Misc);
             }
             finally
             {
-                AssigningJob = false;
-                AssigningTo = null;
+                EndAssigningJob(pawn);
             }
         }
 
@@ -496,25 +565,31 @@ namespace DoNotBeLazy.Components
                 + $" (report {seen.reports} of {MaxForeignJobReports} for this order)");
         }
 
-        // A job end was thrown away because AssigningJob was set. Added
-        // 2026-09-18 - architecture section 15.
+        // A job end was thrown away because this pawn's own assignment
+        // caused it. Added 2026-09-18 - architecture section 15. Narrowed
+        // 2026-09-19 - architecture section 14 - when AssigningJob became
+        // per-pawn instead of one flag for the whole game.
         //
-        // AssigningJob is one static flag for the whole game, set while this
-        // mod hands ANY pawn a job, and JobTrackerPatch's postfix returns on
-        // it for EVERY pawn. So while a large order is being handed out, an
-        // unrelated pawn's job can end inside that window and this mod never
-        // hears about it - it goes on believing it holds a pawn whose job is
-        // over. That is what happened on 2026-09-17: 39 pawns joined a
-        // vehicle-packing order in one second and Pelican's fabrication job
-        // end fell in the window.
-        //
-        // The flag is NOT changed here. Whether to narrow it to one pawn is
-        // an open decision for the user; this only makes the loss visible.
+        // Before the narrowing, JobTrackerPatch called this for ANY pawn
+        // whose job ended while this mod was handing ANY pawn a job, so the
+        // text here used to have to say whether the job that ended belonged
+        // to the pawn being assigned or to some other pawn caught in the
+        // same window - that was the loss that cost a tamed kangaroo its
+        // hauling order on 2026-09-19 (and Pelican's fabrication order on
+        // 2026-09-17). Now JobTrackerPatch only calls this when the ended
+        // job's own pawn is the one SweepManager.IsBeingAssigned says is
+        // being handed a job right now, so it is always this pawn's own
+        // assignment ending its own prior job - the legitimate case GiveJob,
+        // EndSweepAndJob and PauseForNeed all rely on. A job ending for an
+        // unrelated pawn no longer reaches here at all; it goes to
+        // Notify_JobEnded like any other ending.
         //
         // Volume: nothing at all unless the pawn whose job ended is one we
         // hold, and then at most one line per pawn per DiscardedEndQuietTicks
         // - the ones in between are counted and the count rides on the next
-        // line, the same way the area wait line collapses its repeats.
+        // line, the same way the area wait line collapses its repeats. This
+        // should now be close to the number of assignments made, not the
+        // number of pawns handed a job anywhere on the map at the same time.
         public void Notify_JobEndDiscarded(Pawn pawn, Job endedJob, JobCondition condition)
         {
             if (!activeSweeps.TryGetValue(pawn, out SweepOrder order))
@@ -535,11 +610,8 @@ namespace DoNotBeLazy.Components
                 ? ""
                 : $" (and {info.suppressed} more job end{(info.suppressed == 1 ? "" : "s")} of this pawn's thrown away since the last such line)";
 
-            Pawn assigningTo = AssigningTo;
             Logger.Message($"{pawn.LabelShort}: job end {condition} on {DescribeJob(endedJob)} was THROWN AWAY"
-                + (assigningTo == null || assigningTo == pawn
-                    ? " - we were handing out a job at the time"
-                    : $" - we were handing {assigningTo.LabelShort} a job at the time")
+                + " - we were handing this pawn a job at the time"
                 + $"; {pawn.LabelShort} is still registered on the {order.WorkGiverDef.defName} order"
                 + (order.WorkstationTarget != null ? $" at {order.WorkstationTarget.LabelShort}" : "")
                 + alsoLost);
@@ -634,16 +706,14 @@ namespace DoNotBeLazy.Components
                 // same self-caused-job-end suppression as GiveJob and
                 // PauseForNeed; without it JobTrackerPatch's postfix re-enters
                 // on our own EndCurrentJob call
-                AssigningJob = true;
-                AssigningTo = pawn;
+                BeginAssigningJob(pawn);
                 try
                 {
                     pawn.jobs.EndCurrentJob(JobCondition.Succeeded);
                 }
                 finally
                 {
-                    AssigningJob = false;
-                    AssigningTo = null;
+                    EndAssigningJob(pawn);
                 }
             }
 
@@ -804,18 +874,29 @@ namespace DoNotBeLazy.Components
             ourJob.Remove(pawn);
             foreignJob.Remove(pawn);
             discardedEnds.Remove(pawn);
+            retargets.Remove(pawn);
         }
 
         // Put a pawn that can do a new order onto it. Added 2026-09-13,
-        // architecture section 12.
+        // architecture section 12. Given a shift/replace choice 2026-09-20,
+        // architecture section 16 ("Queueing and replacing a forced order").
         //
         // Returns true when the pawn has no active order - the CALLER starts
         // it, through the code each entry point already had, so a fresh
-        // start is unchanged. Otherwise returns false after either appending
-        // the order to the pawn's queue or, when the pawn already has the
-        // same order active or queued, doing nothing. `ahead` is how many
-        // orders stand in front of it: -1 for a duplicate, 0 for a start.
-        private bool JoinOrQueue(Pawn pawn, SweepOrder order, out int ahead)
+        // start is unchanged. It also returns true when a non-shift click
+        // just REPLACED the pawn's active order: ClearSweeps has already
+        // ended that order and dropped the pawn's queue below, so the
+        // caller's fresh-start code is exactly what should run for the new
+        // order too. Otherwise returns false after either appending the
+        // order to the pawn's queue or, when the pawn already has the same
+        // order active or queued, doing nothing. `ahead` is how many orders
+        // stand in front of it: -1 for a duplicate, 0 for a start or a
+        // replace.
+        //
+        // queueOrder is the shift state captured at the click, not read
+        // here - by the time this runs the click's GUI event may be long
+        // gone. See BeginSweep.
+        private bool JoinOrQueue(Pawn pawn, SweepOrder order, bool queueOrder, out int ahead)
         {
             ahead = 0;
             if (!activeSweeps.TryGetValue(pawn, out SweepOrder current))
@@ -823,14 +904,34 @@ namespace DoNotBeLazy.Components
                 return true;
             }
 
-            queuedOrders.TryGetValue(pawn, out List<SweepOrder> queue);
-
             if (SameOrder(current, order))
             {
+                // A repeat of the pawn's own active order never restarts
+                // it - merge by ignoring the repeat (section 12, decision
+                // 5). Whether shift was held makes no difference: nothing
+                // is being replaced, so a non-shift click has nothing to
+                // destroy.
                 ahead = -1;
                 return false;
             }
 
+            if (!queueOrder)
+            {
+                // Settled 2026-09-20, section 16: a click without shift
+                // ends this pawn's active order and destroys whatever it
+                // had queued behind it, and the new order takes over now.
+                // ClearSweeps touches only this pawn's own entries - the
+                // old order's shared pool and every other pawn still on it
+                // are untouched, so a group order loses only the one pawn
+                // being redirected.
+                ClearSweeps(pawn, $"replaced by a new {order.WorkGiverDef.defName} order");
+                return true;
+            }
+
+            // Shift held - stack behind whatever the pawn is already
+            // running or already has queued, a forced order and an
+            // ordinary order alike (section 16, decisions 2 and 3).
+            queuedOrders.TryGetValue(pawn, out List<SweepOrder> queue);
             if (queue != null)
             {
                 foreach (SweepOrder queued in queue)
@@ -1001,16 +1102,14 @@ namespace DoNotBeLazy.Components
                 return;
             }
 
-            AssigningJob = true;
-            AssigningTo = pawn;
+            BeginAssigningJob(pawn);
             try
             {
                 pawn.jobs.EndCurrentJob(JobCondition.InterruptForced);
             }
             finally
             {
-                AssigningJob = false;
-                AssigningTo = null;
+                EndAssigningJob(pawn);
             }
         }
 
@@ -1019,7 +1118,13 @@ namespace DoNotBeLazy.Components
         // (WorkGiver_DoBill) get single-pawn best-of selection per
         // architecture doc 2; everything else fans the group out across
         // targets found within sweepRadius of clickedTarget.
-        public void BeginSweep(List<Pawn> eligiblePawns, LocalTargetInfo clickedTarget, WorkGiverDef workGiverDef)
+        //
+        // queueOrder is the queue-order key (shift) state at the moment of
+        // the click, read by the caller inside its own FloatMenuOption
+        // action - KeyBindingDefOf.QueueOrder.IsDownEvent only answers
+        // correctly inside a live GUI event, which no longer exists by the
+        // time a call reaches this deep. Section 16, settled 2026-09-20.
+        public void BeginSweep(List<Pawn> eligiblePawns, LocalTargetInfo clickedTarget, WorkGiverDef workGiverDef, bool queueOrder)
         {
             if (map == null || eligiblePawns == null || eligiblePawns.Count == 0)
             {
@@ -1043,13 +1148,13 @@ namespace DoNotBeLazy.Components
             // runs out of bills, a scanner finds something. See ScannerCompat.
             if (scanner is WorkGiver_DoBill || ScannerCompat.IsScannerWork(workGiverDef))
             {
-                BeginWorkstationSweep(eligiblePawns, clickedTarget.Thing, workGiverDef, scanner);
+                BeginWorkstationSweep(eligiblePawns, clickedTarget.Thing, workGiverDef, scanner, queueOrder);
             }
             else if (VehicleCompat.IsPersistentTargetWork(workGiverDef))
             {
                 // Same "keep coming back to this one thing" shape, but this
                 // one takes the whole selection - see the method comment.
-                BeginPersistentTargetSweep(eligiblePawns, clickedTarget.Thing, workGiverDef, scanner);
+                BeginPersistentTargetSweep(eligiblePawns, clickedTarget.Thing, workGiverDef, scanner, queueOrder);
             }
             else
             {
@@ -1058,7 +1163,7 @@ namespace DoNotBeLazy.Components
                 // this is the last point that still has it. Null for every
                 // sweep that needs no narrowing.
                 BeginAreaSweep(eligiblePawns, clickedTarget.Cell, workGiverDef, scanner,
-                    PlantCompat.FilterFor(clickedTarget.Thing), PlantCompat.LabelFor(clickedTarget.Thing));
+                    PlantCompat.FilterFor(clickedTarget.Thing), PlantCompat.LabelFor(clickedTarget.Thing), queueOrder);
             }
         }
 
@@ -1095,7 +1200,7 @@ namespace DoNotBeLazy.Components
         // pool stays empty and unread; per-pawn retry and failure counts live
         // in SweepManager's own dictionaries, so one pawn giving up does not
         // touch the others.
-        private void BeginPersistentTargetSweep(List<Pawn> eligiblePawns, Thing target, WorkGiverDef workGiverDef, WorkGiver_Scanner scanner)
+        private void BeginPersistentTargetSweep(List<Pawn> eligiblePawns, Thing target, WorkGiverDef workGiverDef, WorkGiver_Scanner scanner, bool queueOrder)
         {
             if (target == null)
             {
@@ -1133,8 +1238,10 @@ namespace DoNotBeLazy.Components
                 // order goes on its queue, and it is asked again when its
                 // turn comes. Its answer here could not see the jobs of the
                 // pawns starting in this same loop, which costs nothing for
-                // that reason. Section 12, decision 7.
-                if (!JoinOrQueue(pawn, order, out int ahead))
+                // that reason. Section 12, decision 7. Unless queueOrder is
+                // false, in which case this pawn's active order is replaced
+                // instead - section 16.
+                if (!JoinOrQueue(pawn, order, queueOrder, out int ahead))
                 {
                     if (ahead < 0)
                     {
@@ -1174,7 +1281,7 @@ namespace DoNotBeLazy.Components
                 + QueueSummary(queued, eligiblePawns.Count, minAhead, maxAhead, duplicates));
         }
 
-        private void BeginWorkstationSweep(List<Pawn> eligiblePawns, Thing billGiver, WorkGiverDef workGiverDef, WorkGiver_Scanner scanner)
+        private void BeginWorkstationSweep(List<Pawn> eligiblePawns, Thing billGiver, WorkGiverDef workGiverDef, WorkGiver_Scanner scanner, bool queueOrder)
         {
             if (billGiver == null)
             {
@@ -1212,8 +1319,11 @@ namespace DoNotBeLazy.Components
                 // rather than falling to a lower-ranked idle pawn - that
                 // would change section 2's selection rule. Section 12,
                 // decision 7. The scan counter is read when a queued order
-                // starts, not here.
-                if (!JoinOrQueue(pawn, order, out int ahead))
+                // starts, not here. Unless queueOrder is false, in which
+                // case this pawn's active order is replaced instead, and
+                // JoinOrQueue returns true so the join code below runs -
+                // section 16.
+                if (!JoinOrQueue(pawn, order, queueOrder, out int ahead))
                 {
                     Logger.Message(ahead < 0
                         ? $"BeginSweep {workGiverDef.defName} at {billGiver.LabelShort}: {pawn.LabelShort} of {ranked.Count} ranked already has it"
@@ -1298,7 +1408,7 @@ namespace DoNotBeLazy.Components
             return record == null || record.TotallyDisabled ? 0 : record.Level;
         }
 
-        private void BeginAreaSweep(List<Pawn> eligiblePawns, IntVec3 clickCell, WorkGiverDef workGiverDef, WorkGiver_Scanner scanner, Predicate<Thing> targetFilter = null, string orderKind = null)
+        private void BeginAreaSweep(List<Pawn> eligiblePawns, IntVec3 clickCell, WorkGiverDef workGiverDef, WorkGiver_Scanner scanner, Predicate<Thing> targetFilter, string orderKind, bool queueOrder)
         {
             // THE RULE, in the user's words: "The group should drop the pawns
             // who cannot but keep the pawns who can do a certain thing."
@@ -1372,10 +1482,10 @@ namespace DoNotBeLazy.Components
                 // Was an unconditional activeSweeps[pawn] = order, which is
                 // how a rice haul 148 targets strong was thrown away by a
                 // corn haul 13 seconds later on 2026-09-13. A pawn already on
-                // an order keeps it, and this one waits behind it. Nothing
-                // below this runs for that pawn - it is not paused, not
-                // cleared, not assigned. Section 12.
-                if (!JoinOrQueue(pawn, order, out int ahead))
+                // an order keeps it, and this one waits behind it if the
+                // player held shift - or the order is replaced, and its
+                // queue destroyed, if not (section 16, settled 2026-09-20).
+                if (!JoinOrQueue(pawn, order, queueOrder, out int ahead))
                 {
                     if (ahead < 0)
                     {
@@ -1515,20 +1625,6 @@ namespace DoNotBeLazy.Components
                 return;
             }
 
-            // the condition is what decides continue-vs-stop, and "the pawn
-            // wandered off" reports are almost always answered by this line
-            //
-            // The job that actually ended is named alongside the order it is
-            // being attributed to, and when it is not the job this mod gave
-            // the pawn, the line says so. A stale attribution then reads as
-            // one instead of being invisible. Architecture section 15.
-            ourJob.TryGetValue(pawn, out Job gaveThem);
-            string mismatch = endedJob == null || ReferenceEquals(endedJob, gaveThem)
-                ? ""
-                : $" - NOT the job we gave, which was {DescribeJob(gaveThem)}";
-
-            Logger.Message($"{pawn.LabelShort}: job ended {condition} on {DescribeJob(endedJob)} ({order.WorkGiverDef.defName}){mismatch}");
-
             if (pausedForNeed.TryGetValue(pawn, out PauseInfo paused))
             {
                 // This is NOT a sweep task ending - the pawn is off dealing
@@ -1598,29 +1694,56 @@ namespace DoNotBeLazy.Components
             // the replacement job has not started yet, so pawn.CurJob is
             // still the one that just ended. TryScannerWatchdog looks 60
             // ticks later, when it has, and ends the sweep then if the pawn
-            // really did walk off. InterruptForced is left fatal - that is
-            // the player manually ordering them elsewhere, and it means it.
+            // really did walk off. InterruptForced no longer reaches this
+            // check at all - see TargetFailureIsRecoverable, changed
+            // 2026-09-19.
             if (condition == JobCondition.InterruptOptional
                 && ScannerCompat.IsScannerWork(order.WorkGiverDef))
             {
                 return;
             }
 
-            if (!TargetFailureIsRecoverable(condition))
+            if (!TargetFailureIsRecoverable(condition, endedJob))
             {
                 // This is the site that ended legua's butcher sweep on
-                // 2026-09-05 without a word. InterruptForced means something
-                // took the pawn - a manual order, a draft, a mental break,
-                // another mod - and continuing would fight it. Fatal is
+                // 2026-09-05 without a word. What is left here after
+                // 2026-09-19 - InterruptOptional off a scanner, or Errored -
+                // means something took the pawn or the job system itself
+                // broke, and continuing would fight it or loop. Fatal is
                 // right; silent was not.
+                //
+                // Since 2026-09-20, InterruptForced can also mean the player
+                // gave this pawn a different order directly (rather than
+                // through this mod's own menu, which JoinOrQueue already
+                // handles before a job is touched) - endedJob.
+                // playerInterruptedForced true, read by
+                // TargetFailureIsRecoverable. Said plainly rather than as
+                // the generic wording below, so the log reads as "the
+                // player did this" and not as a fault.
                 //
                 // Drops the queue as well since 2026-09-13: a manual order
                 // arrives as exactly this, and moving the pawn onto its next
                 // queued order would fight whatever took it. Section 12,
                 // decision 4.
-                ClearSweeps(pawn, $"job ended {condition} on {DescribeJob(endedJob)}");
+                string reason = condition == JobCondition.InterruptForced
+                    ? $"the player gave this pawn a different order (ended {DescribeJob(endedJob)})"
+                    : $"job ended {condition} on {DescribeJob(endedJob)}";
+                ClearSweeps(pawn, reason);
                 return;
             }
+
+            // The target this pawn was working on, captured before
+            // NoteTargetFailure clears it - only meaningful for
+            // InterruptForced, and only for as long as it takes to write the
+            // dedicated retarget line below. lastAssignedTarget holds
+            // nothing for a workstation or persistent-target order (they
+            // have no pool), so endedJob.targetA is the fallback - usually
+            // the station or the specific item the job was engaged with.
+            LocalTargetInfo lostTarget = condition != JobCondition.InterruptForced
+                ? LocalTargetInfo.Invalid
+                : lastAssignedTarget.TryGetValue(pawn, out LocalTargetInfo pooled)
+                    ? pooled
+                    : endedJob?.targetA ?? LocalTargetInfo.Invalid;
 
             NoteTargetFailure(pawn, order, condition);
 
@@ -1628,12 +1751,71 @@ namespace DoNotBeLazy.Components
             failures++;
             if (failures >= MaxConsecutiveFailures)
             {
-                RemoveSweep(pawn, $"{failures} sweep tasks failed in a row ({condition})");
+                RemoveSweep(pawn, condition == JobCondition.InterruptForced
+                    ? $"{failures} sweep tasks in a row had their target taken by another job"
+                    : $"{failures} sweep tasks failed in a row ({condition})");
                 return;
             }
 
             consecutiveFailures[pawn] = failures;
             AssignNextTask(pawn, order);
+
+            // One dedicated line per retarget, naming what was lost and
+            // what replaced it - ordered 2026-09-19, architecture section
+            // 14. Only written when AssignNextTask actually handed out a
+            // fresh job on THIS SAME order: not when it ended the order
+            // (RemoveSweep/ClearSweeps already said why, immediately
+            // above), armed a retry wait (the wait line already says the
+            // pawn is staying in the sweep), or paused the pawn for a need
+            // (PauseForNeed already said so, and section 12's pause/resume
+            // machinery is not to be fought here). Reaching this point with
+            // condition InterruptForced is now guaranteed (2026-09-20) to be
+            // a teammate's reservation steal, never a direct player order -
+            // TargetFailureIsRecoverable already sent that case to
+            // ClearSweeps above, so this is never mislabelled as a retarget.
+            if (condition == JobCondition.InterruptForced
+                && activeSweeps.TryGetValue(pawn, out SweepOrder stillOn) && stillOn == order
+                && !workstationRetryAt.ContainsKey(pawn) && !areaRetryAt.ContainsKey(pawn)
+                && !pausedForNeed.ContainsKey(pawn))
+            {
+                string newWork = order.WorkstationTarget != null
+                    ? order.WorkstationTarget.LabelShort
+                    : lastAssignedTarget.TryGetValue(pawn, out LocalTargetInfo newTarget)
+                        ? newTarget.ToString()
+                        : "the next target";
+
+                LogRetarget(pawn, order, lostTarget, newWork);
+            }
+        }
+
+        // Throttled the same way Notify_JobEndDiscarded is: at most one line
+        // per pawn per RetargetQuietTicks, with the count of retargets in
+        // between carried onto the next line. Without this, a pawn whose
+        // target keeps getting taken over a long-running order would write
+        // one line per incident - the standing rule against a line per
+        // target, per def or per click applies here too. Added 2026-09-19 -
+        // architecture section 14.
+        private void LogRetarget(Pawn pawn, SweepOrder order, LocalTargetInfo lost, string newWork)
+        {
+            int now = Find.TickManager.TicksGame;
+            retargets.TryGetValue(pawn, out RetargetInfo info);
+            if (now < info.nextLogTick)
+            {
+                info.suppressed++;
+                retargets[pawn] = info;
+                return;
+            }
+
+            string alsoLost = info.suppressed == 0
+                ? ""
+                : $" (and {info.suppressed} more retarget{(info.suppressed == 1 ? "" : "s")} for this pawn since the last such line)";
+
+            Logger.Message($"{pawn.LabelShort}: {(lost.IsValid ? lost.ToString() : "its target")} was taken by another job"
+                + $" - retargeted to {newWork} ({order.WorkGiverDef.defName}){alsoLost}");
+
+            info.suppressed = 0;
+            info.nextLogTick = now + RetargetQuietTicks;
+            retargets[pawn] = info;
         }
 
         // Charge one recoverable failure to whatever target this pawn was
@@ -1713,18 +1895,60 @@ namespace DoNotBeLazy.Components
         // sweep, try the next one) and "something took this pawn away from
         // us" (stop - continuing would fight the player or the AI).
         //
-        // Deliberately conservative on the interrupt conditions: both
-        // InterruptForced and InterruptOptional mean something else decided
-        // this pawn should be doing something different - a manual order,
-        // drafting, a mental break, another mod. Retrying there would have
-        // the sweep tug-of-war with whatever interrupted it. Errored means
-        // a genuine exception in the job system, where retrying risks a
-        // loop rather than a recovery.
-        private static bool TargetFailureIsRecoverable(JobCondition condition)
+        // InterruptForced moved into the recoverable set on 2026-09-19.
+        // Verified from the IL, architecture section 14: every sweep job is
+        // player-forced, and a player-forced job's own reservation can be
+        // taken by ANOTHER player-forced job - ours or anyone else's -
+        // which ends the holder's job with exactly this condition. The
+        // user's words, answering the open question left at the end of
+        // section 14: "If a resource needed to complete a job is consumed
+        // by another job, the pawn should find the next closest resource of
+        // that type and continue rather than abandon the job. This is
+        // especially true of forced jobs." So this is no longer treated as
+        // the player manually pulling the pawn away - it is coped with, the
+        // same as any other target that stopped being workable. See
+        // Notify_JobEnded for the dedicated retarget line this now writes.
+        //
+        // But InterruptForced is not ALWAYS a stolen target - a direct
+        // player order replacing this pawn's job ends it with the identical
+        // condition (section 16, "the hard part"). Verse.AI.
+        // Job.playerInterruptedForced is vanilla's own way of telling them
+        // apart. Verified 2026-09-20 by decompiling lib\Assembly-CSharp.dll
+        // with ilspycmd (707,563 lines): Pawn_JobTracker.TryTakeOrderedJob's
+        // replace-without-shift branch is the ONLY place in the whole
+        // assembly that writes it - `curJob.playerInterruptedForced = true;`
+        // on the pawn's OUTGOING job, immediately before
+        // `curDriver.EndJobWith(JobCondition.InterruptForced)` ends it. The
+        // reservation-steal path (ReservationManager.Reserve's player-forced
+        // branch) ends the holder's job through
+        // Pawn_JobTracker.EndCurrentOrQueuedJob -> EndCurrentJob directly and
+        // never reads or writes the field. So false here (the common case)
+        // means a teammate merely took the target - recoverable, same as
+        // before. True means a direct player order took this pawn's job -
+        // not recoverable, whether that order came through this mod's own
+        // menu (JoinOrQueue's replace branch already handled that case
+        // before a job was even touched, so this path is not reached for
+        // it) or through anything else the player can do to a pawn -
+        // matching the top-level rule that the player's own orders always
+        // interrupt.
+        //
+        // InterruptOptional is left out on purpose: for a scanner order it
+        // is handled two lines above (the 1500-tick expiry swap), and for
+        // everything else it still means something else decided this pawn
+        // should be doing something different - the same reasoning that
+        // used to cover InterruptForced too. Errored means a genuine
+        // exception in the job system, where retrying risks a loop rather
+        // than a recovery.
+        private static bool TargetFailureIsRecoverable(JobCondition condition, Job endedJob)
         {
-            return condition == JobCondition.Incompletable      // target no longer workable
-                || condition == JobCondition.QueuedNoLongerValid // target invalidated before we got there
-                || condition == JobCondition.ErroredPather;      // couldn't path to this one target
+            if (condition == JobCondition.InterruptForced)
+            {
+                return endedJob == null || !endedJob.playerInterruptedForced;
+            }
+
+            return condition == JobCondition.Incompletable       // target no longer workable
+                || condition == JobCondition.QueuedNoLongerValid  // target invalidated before we got there
+                || condition == JobCondition.ErroredPather;       // couldn't path to this one target
         }
 
         // resumedBecause names what the pawn is coming back from - "an area
@@ -1964,6 +2188,15 @@ namespace DoNotBeLazy.Components
                 // c= is distance from the order's scan centre, p= from the
                 // pawn; under centre-out, c should climb as the sweep runs
                 // and p should not.
+                //
+                // Cut on 2026-09-20 as one of two unthrottled lines, and
+                // restored the same day - it was the only record of which
+                // target a pawn was actually given, and losing it meant
+                // "is she hauling farther out because the near stuff is
+                // gone, or because something refused it" had no answer.
+                // Fires once per job actually handed to a pawn, via the
+                // return two statements below it - never once per candidate
+                // looked at in the loop above.
                 float fromCentre = (target.Cell - order.ScanCenter).LengthHorizontal;
                 float fromPawn = (target.Cell - pawn.Position).LengthHorizontal;
 
