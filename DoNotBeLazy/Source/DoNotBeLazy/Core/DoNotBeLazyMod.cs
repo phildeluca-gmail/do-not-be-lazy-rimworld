@@ -30,6 +30,13 @@ namespace DoNotBeLazy.Core
             Patches.BedrollLoopPatch.TryPatch(harmony);
 
             Logger.Message("Harmony patches applied.");
+
+            // Kill switch state, once at load - dnbl-architecture.md
+            // section 18. Answers "was stuff-first hauling even on?" from
+            // the log without asking the player, the same reason
+            // verboseLogging's own no-op history is called out in section 4
+            // of the coding guide.
+            Logger.Message($"Stuff-first hauling: {(Settings.stuffFirstHauling ? "on" : "off")}.");
         }
 
         public override void DoSettingsWindowContents(Rect inRect)

@@ -29,9 +29,20 @@ namespace DoNotBeLazy.Core
         // is on a FORCED job, and a forced job does not let the think tree
         // send them to bed. NeedMonitor is the only thing that will.
         public float restThreshold = 0.10f;
-        public bool showSweepOverlay = true;
         public bool verboseLogging = true;
         public bool jobDiagnostics = false;
+
+        // Kill switch, added 2026-09-22 after stuff-first hauling crashed
+        // the game three times in one night - dnbl-architecture.md section
+        // 18. Defaults true so a player who never opens the settings sees
+        // no change. Read directly by HaulInterceptPatch.TrySubstitute,
+        // TransporterInterceptPatch.TrySubstitute and
+        // SweepManager.WrapForVehicleStuffing before any of the three build
+        // a stuffing job; when off, each leaves vanilla's own job alone,
+        // same as the CanPickUpAtLeastOne guard beside it. A stuffing job
+        // already under way when this is switched off is not interrupted -
+        // it finishes on its own, and no new one starts.
+        public bool stuffFirstHauling = true;
 
         // Widgets.TextFieldNumeric and Widgets.TextFieldPercent both take a
         // "ref string buffer" next to the value, and it is not optional. The
@@ -69,9 +80,9 @@ namespace DoNotBeLazy.Core
             Scribe_Values.Look(ref needThreshold, "needThreshold", 0.05f);
             Scribe_Values.Look(ref moodThreshold, "moodThreshold", 0.10f);
             Scribe_Values.Look(ref restThreshold, "restThreshold", 0.10f);
-            Scribe_Values.Look(ref showSweepOverlay, "showSweepOverlay", true);
             Scribe_Values.Look(ref verboseLogging, "verboseLogging", true);
             Scribe_Values.Look(ref jobDiagnostics, "jobDiagnostics", false);
+            Scribe_Values.Look(ref stuffFirstHauling, "stuffFirstHauling", true);
 
             // the toggle only exists to drive this - keep them in sync on
             // load as well as on change, or a saved "on" reads as off until
@@ -133,7 +144,8 @@ namespace DoNotBeLazy.Core
             moodThreshold = SliderWithPercentBox(listing, moodThreshold, 0.01f, 0.30f, ref moodThresholdBuffer);
 
             listing.Gap();
-            listing.CheckboxLabeled("Show sweep radius overlay on hover", ref showSweepOverlay);
+            listing.CheckboxLabeled("Stuff-first hauling and loading", ref stuffFirstHauling,
+                "When on, a pawn hauling or loading fills its inventory with extra items along the way instead of carrying one at a time. Turn off to go back to vanilla one-item-at-a-time hauling if this causes a problem.");
 
             listing.Gap();
             listing.CheckboxLabeled("Verbose logging (for bug reports)", ref verboseLogging,

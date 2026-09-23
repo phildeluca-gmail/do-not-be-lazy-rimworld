@@ -4,6 +4,7 @@ using RimWorld;
 using Verse;
 using Verse.AI;
 using DoNotBeLazy.Core;
+using DoNotBeLazy.Jobs;
 using DoNotBeLazy.Utility;
 
 namespace DoNotBeLazy.Components
@@ -399,12 +400,23 @@ namespace DoNotBeLazy.Components
 
         // every TryTakeOrderedJob in the mod goes through here - see
         // BeginAssigningJob / EndAssigningJob above
-        public static void GiveJob(Pawn pawn, Job job)
+        //
+        // appendBehindCurrentJob is TryTakeOrderedJob's own requestQueueing
+        // parameter, passed through. Added 2026-09-21. Verified against
+        // Pawn_JobTracker.TryTakeOrderedJob in this build by decompiling
+        // Assembly-CSharp.dll: when requestQueueing is true and the pawn is
+        // NOT idle, the method skips the branch that ends the pawn's current
+        // job and instead calls jobQueue.EnqueueLast(job, tag) - the job is
+        // appended behind the pawn's current job and whatever else is
+        // already in its queue, and nothing is interrupted. When the pawn
+        // IS idle (no current job, or an idle job), it starts the job right
+        // away regardless of this flag - there is nothing to queue behind.
+        public static void GiveJob(Pawn pawn, Job job, bool appendBehindCurrentJob = false)
         {
             BeginAssigningJob(pawn);
             try
             {
-                pawn.jobs.TryTakeOrderedJob(job, JobTag.Misc);
+                pawn.jobs.TryTakeOrderedJob(job, JobTag.Misc, appendBehindCurrentJob);
             }
             finally
             {
@@ -896,11 +908,26 @@ namespace DoNotBeLazy.Components
         // queueOrder is the shift state captured at the click, not read
         // here - by the time this runs the click's GUI event may be long
         // gone. See BeginSweep.
-        private bool JoinOrQueue(Pawn pawn, SweepOrder order, bool queueOrder, out int ahead)
+        //
+        // appendBehindCurrentJob answers a question this method used to
+        // ignore: a pawn with no active DNBL order still has whatever
+        // vanilla job it was already doing, and until 2026-09-21 that job
+        // was force-interrupted even when the player held shift, because
+        // this method returned "start now" without ever looking at
+        // queueOrder. With the whole colony selected, most pawns are on an
+        // ordinary job, so shift-click behaved exactly like a plain click.
+        // The order still starts now - there is nothing of ours to queue it
+        // behind - but when true, the caller must hand the FIRST job to
+        // GiveJob with appendBehindCurrentJob so it queues behind the
+        // pawn's current job (TryTakeOrderedJob's requestQueueing) instead
+        // of interrupting it.
+        private bool JoinOrQueue(Pawn pawn, SweepOrder order, bool queueOrder, out int ahead, out bool appendBehindCurrentJob)
         {
             ahead = 0;
+            appendBehindCurrentJob = false;
             if (!activeSweeps.TryGetValue(pawn, out SweepOrder current))
             {
+                appendBehindCurrentJob = queueOrder;
                 return true;
             }
 
@@ -1131,11 +1158,11 @@ namespace DoNotBeLazy.Components
                 return;
             }
 
-            // Pick Up And Haul, when installed, takes over a general haul
-            // order - see PuahCompat. Done before the scanner cast because
-            // the substituted def brings its own worker, and before the pool
-            // is built because the pool comes from that worker's scan.
-            workGiverDef = PuahCompat.Substitute(workGiverDef);
+            // No PUAH redirect here any more (dnbl-architecture.md section
+            // 18, decision 6) - DNBL stuffs inventory itself now, for a
+            // general haul order same as any other, via
+            // Patches/HaulInterceptPatch.cs postfixing the vanilla
+            // HaulAIUtility methods this order's own WorkGiver calls.
 
             if (!(workGiverDef?.Worker is WorkGiver_Scanner scanner))
             {
@@ -1200,6 +1227,73 @@ namespace DoNotBeLazy.Components
         // pool stays empty and unread; per-pawn retry and failure counts live
         // in SweepManager's own dictionaries, so one pawn giving up does not
         // touch the others.
+        // Stuff-first hauling and loading (dnbl-architecture.md section 18).
+        // Wraps a persistent-target job in DNBL's own stuffing job
+        // (Jobs/JobDriver_StuffAndHaul, fixed-destination mode) when the
+        // order is vehicle-packing work, so one trip carries several items
+        // instead of one - the original reported symptom. Called from both
+        // the first job a pawn gets (below) and every resumed one
+        // (AssignNextTask); returns the raw job untouched for a bench or
+        // scanner order, and for a vehicle order whose target does not
+        // expose a ThingOwner to deliver into (see the driver's own
+        // comment on why that check cannot be verified against Vehicle
+        // Framework's DLL directly).
+        private Job WrapForVehicleStuffing(Pawn pawn, Job rawJob, WorkGiverDef workGiverDef, Thing persistentTarget)
+        {
+            // Kill switch, dnbl-architecture.md section 18. Cheapest check
+            // first - a static bool read, before touching the job.
+            if (!DoNotBeLazyMod.Settings.stuffFirstHauling)
+            {
+                return rawJob;
+            }
+
+            if (rawJob == null || !VehicleCompat.IsPersistentTargetWork(workGiverDef))
+            {
+                return rawJob;
+            }
+
+            if (!(rawJob.targetA.Thing is Thing primary) || primary == persistentTarget)
+            {
+                return rawJob;
+            }
+
+            if (persistentTarget.TryGetInnerInteractableThingOwner() == null)
+            {
+                Logger.Message($"BeginSweep {workGiverDef.defName} at {persistentTarget.LabelShort}: target exposes no ThingOwner, stuffing skipped for this trip");
+                return rawJob;
+            }
+
+            // Fixed 2026-09-22 - the same shape of same-tick crash fixed in
+            // HaulInterceptPatch and TransporterInterceptPatch
+            // (dnbl-architecture.md section 18). Same guard, same shared
+            // calculation as the driver's own PickUpToil: a pawn who can't
+            // carry even one unit of the primary target keeps the vehicle's
+            // own raw job instead.
+            if (!JobDriver_StuffAndHaul.CanPickUpAtLeastOne(pawn, primary))
+            {
+                Logger.Message($"BeginSweep {workGiverDef.defName} at {persistentTarget.LabelShort}: {primary.LabelCap} would overencumber {pawn.LabelShort} before even one unit, stuffing skipped for this trip");
+                return rawJob;
+            }
+
+            // Independent backstop, in case some other path still produces
+            // a zero-progress trip for this pawn/target pair.
+            if (JobDriver_StuffAndHaul.IsZeroProgressSuppressed(pawn, primary))
+            {
+                return rawJob;
+            }
+
+            Job stuffJob = JobMaker.MakeJob(DnblJobDefOf.StuffAndHaul, primary, persistentTarget);
+            stuffJob.count = rawJob.count > 0 ? rawJob.count : primary.stackCount;
+            stuffJob.haulMode = HaulMode.ToContainer; // signal to the driver: fixed-destination mode
+            stuffJob.workGiverDef = workGiverDef;
+            stuffJob.playerForced = rawJob.playerForced;
+
+            PuahCompat.WarnIfCoexisting();
+            Logger.Message($"BeginSweep {workGiverDef.defName} at {persistentTarget.LabelShort}: stuffing job created for {primary.LabelCap}");
+
+            return stuffJob;
+        }
+
         private void BeginPersistentTargetSweep(List<Pawn> eligiblePawns, Thing target, WorkGiverDef workGiverDef, WorkGiver_Scanner scanner, bool queueOrder)
         {
             if (target == null)
@@ -1227,7 +1321,7 @@ namespace DoNotBeLazy.Components
                 // Every pawn answers for itself, so this already keeps the
                 // pawns who can and drops the ones who cannot - checked
                 // 2026-09-13 against that rule, architecture doc section 9.
-                Job job = scanner.JobOnThing(pawn, target, true);
+                Job job = WrapForVehicleStuffing(pawn, scanner.JobOnThing(pawn, target, true), workGiverDef, target);
                 if (job == null)
                 {
                     Logger.Message($"BeginSweep {workGiverDef.defName}: no job on {target.LabelShort} for {pawn.LabelShort}, not joining");
@@ -1241,7 +1335,7 @@ namespace DoNotBeLazy.Components
                 // that reason. Section 12, decision 7. Unless queueOrder is
                 // false, in which case this pawn's active order is replaced
                 // instead - section 16.
-                if (!JoinOrQueue(pawn, order, queueOrder, out int ahead))
+                if (!JoinOrQueue(pawn, order, queueOrder, out int ahead, out bool appendBehindCurrentJob))
                 {
                     if (ahead < 0)
                     {
@@ -1266,9 +1360,10 @@ namespace DoNotBeLazy.Components
                 activeSweeps[pawn] = order;
                 joined++;
 
-                Logger.Message($"BeginSweep {workGiverDef.defName} at {target.LabelShort}: {pawn.LabelShort} joined, first job {DescribeJob(job)}");
+                Logger.Message($"BeginSweep {workGiverDef.defName} at {target.LabelShort}: {pawn.LabelShort} joined, first job {DescribeJob(job)}"
+                    + (appendBehindCurrentJob ? $" - queued behind {pawn.LabelShort}'s current job, not interrupting it" : ""));
                 ourJob[pawn] = job;
-                GiveJob(pawn, job);
+                GiveJob(pawn, job, appendBehindCurrentJob);
             }
 
             if (joined == 0 && queued == 0 && duplicates == 0)
@@ -1323,7 +1418,7 @@ namespace DoNotBeLazy.Components
                 // case this pawn's active order is replaced instead, and
                 // JoinOrQueue returns true so the join code below runs -
                 // section 16.
-                if (!JoinOrQueue(pawn, order, queueOrder, out int ahead))
+                if (!JoinOrQueue(pawn, order, queueOrder, out int ahead, out bool appendBehindCurrentJob))
                 {
                     Logger.Message(ahead < 0
                         ? $"BeginSweep {workGiverDef.defName} at {billGiver.LabelShort}: {pawn.LabelShort} of {ranked.Count} ranked already has it"
@@ -1354,11 +1449,12 @@ namespace DoNotBeLazy.Components
                 // an order had even started. job.def matters here: DoBill
                 // means the bill itself, anything else means the WorkGiver
                 // wants a haul-off or a refuel first.
-                Logger.Message($"BeginSweep {workGiverDef.defName} at {billGiver.LabelShort}: {pawn.LabelShort} of {ranked.Count} ranked, first job {DescribeJob(job)}");
+                Logger.Message($"BeginSweep {workGiverDef.defName} at {billGiver.LabelShort}: {pawn.LabelShort} of {ranked.Count} ranked, first job {DescribeJob(job)}"
+                    + (appendBehindCurrentJob ? $" - queued behind {pawn.LabelShort}'s current job, not interrupting it" : ""));
                 areaRetryAt.Remove(pawn);
                 areaRetries.Remove(pawn);
                 ourJob[pawn] = job;
-                GiveJob(pawn, job);
+                GiveJob(pawn, job, appendBehindCurrentJob);
                 return;
             }
 
@@ -1485,7 +1581,7 @@ namespace DoNotBeLazy.Components
                 // an order keeps it, and this one waits behind it if the
                 // player held shift - or the order is replaced, and its
                 // queue destroyed, if not (section 16, settled 2026-09-20).
-                if (!JoinOrQueue(pawn, order, queueOrder, out int ahead))
+                if (!JoinOrQueue(pawn, order, queueOrder, out int ahead, out bool appendBehindCurrentJob))
                 {
                     if (ahead < 0)
                     {
@@ -1537,7 +1633,7 @@ namespace DoNotBeLazy.Components
                 }
 
                 pausedForNeed.Remove(pawn);
-                AssignNextTask(pawn, order);
+                AssignNextTask(pawn, order, null, appendBehindCurrentJob);
             }
 
             // ONE line for the whole order when anybody queued it or already
@@ -1957,9 +2053,18 @@ namespace DoNotBeLazy.Components
         // that is a plain continuation. Added 2026-09-18, architecture
         // section 15. The need-pause resume and the workstation retry resume
         // already write their own line and do not use this.
-        private void AssignNextTask(Pawn pawn, SweepOrder order, string resumedBecause = null)
+        //
+        // appendBehindCurrentJob is only ever true for a freshly joined
+        // pawn's very first job on this order (BeginAreaSweep passes it
+        // through from JoinOrQueue - see GiveJob). Every other caller
+        // (a retry, a resume, a retarget after failure) defaults it false,
+        // which is correct: by the time those run, this order's own prior
+        // job on this pawn has already ended, so there is nothing of the
+        // pawn's own to preserve. Added 2026-09-21.
+        private void AssignNextTask(Pawn pawn, SweepOrder order, string resumedBecause = null, bool appendBehindCurrentJob = false)
         {
             string resumed = resumedBecause == null ? "" : $", resumed after {resumedBecause}";
+            string queuedNote = appendBehindCurrentJob ? ", queued behind current job" : "";
 
             if (!(order.WorkGiverDef.Worker is WorkGiver_Scanner scanner))
             {
@@ -2022,7 +2127,7 @@ namespace DoNotBeLazy.Components
                 // first, or a refuel. The old code read a null here as the
                 // end of the order; see WorkstationHadNoJob for why it
                 // usually isn't one.
-                Job resumeJob = scanner.JobOnThing(pawn, order.WorkstationTarget, true);
+                Job resumeJob = WrapForVehicleStuffing(pawn, scanner.JobOnThing(pawn, order.WorkstationTarget, true), order.WorkGiverDef, order.WorkstationTarget);
                 if (resumeJob == null)
                 {
                     WorkstationHadNoJob(pawn, order);
@@ -2035,9 +2140,9 @@ namespace DoNotBeLazy.Components
                 // DescribeJob, not resumeJob.def.defName: for a bench order
                 // the def is the word "DoBill" and the recipe is the thing
                 // anyone reading this line wants. Architecture section 15.
-                Logger.Message($"{pawn.LabelShort}: {DescribeJob(resumeJob)} at {order.WorkstationTarget.LabelShort} ({order.WorkGiverDef.defName}){resumed}");
+                Logger.Message($"{pawn.LabelShort}: {DescribeJob(resumeJob)} at {order.WorkstationTarget.LabelShort} ({order.WorkGiverDef.defName}){resumed}{queuedNote}");
                 ourJob[pawn] = resumeJob;
-                GiveJob(pawn, resumeJob);
+                GiveJob(pawn, resumeJob, appendBehindCurrentJob);
                 return;
             }
 
@@ -2204,6 +2309,7 @@ namespace DoNotBeLazy.Components
                     + $" at {target.Cell} c={fromCentre:F0} p={fromPawn:F0}"
                     + $" for the {order.WorkGiverDef.defName} order"
                     + resumed
+                    + queuedNote
                     + DescribeQueue(job)
                     + (leftOut > 0 ? $", {leftOut} reserved by others left out" : "")
                     + (order.CenterOut ? "" : " [pawn-nearest]")
@@ -2234,7 +2340,7 @@ namespace DoNotBeLazy.Components
 
                 lastAssignedTarget[pawn] = target;
                 ourJob[pawn] = job;
-                GiveJob(pawn, job);
+                GiveJob(pawn, job, appendBehindCurrentJob);
                 return;
             }
 

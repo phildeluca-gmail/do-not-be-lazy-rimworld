@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Stuff-first hauling and loading - dnbl-architecture.md section 18.
+  Vanilla XML patch (not Harmony) adding DNBL's own cargo-protection comp
+  to every humanlike pawn ThingDef, the same mechanism Pick Up And Haul
+  uses for its CompHauledToInventory (Patches/PickUpAndHaul.xml in its own
+  mod folder, read for inspiration only - no PUAH type or file referenced
+  here).
+
+  Narrowed 2026-09-22 to colonists only, on the user's order. "Colonist"
+  is a runtime fact (faction, slave/guest status) that no ThingDef can
+  express, so this xpath only narrows as far as a ThingDef can: humanlike
+  race, which drops every animal and mechanoid ThingDef. The remaining
+  runtime narrowing - player faction, not a raider or prisoner - is done
+  in CompDnblCargo itself. race/intelligence="Humanlike" (not a hardcoded
+  defName="Human") so a modded humanlike race keeps working; verified
+  against lib\Assembly-CSharp.dll that ThingDef's race field is
+  Verse.RaceProperties with a public field named intelligence of enum
+  Verse.Intelligence (Animal, ToolUser, Humanlike), defaulting to Animal,
+  so any def actually meaning to be humanlike must write it out in XML.
+-->
+<Patch>
+
+	<Operation Class="PatchOperationAdd">
+		<xpath>Defs/ThingDef[thingClass="Pawn" and race/intelligence="Humanlike"]/comps</xpath>
+		<value>
+			<li Class="DoNotBeLazy.Comps.CompProperties_DnblCargo" />
+		</value>
+	</Operation>
+
+</Patch>

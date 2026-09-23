@@ -64,18 +64,29 @@ namespace DoNotBeLazy.Utility
 
         public static bool IsInstalled => PuahDef != null;
 
-        // Called at the top of BeginSweep. Hands back the WorkGiverDef the
-        // sweep should actually run on: PUAH's when the order was a general
-        // haul and PUAH is installed, otherwise the def the player picked,
-        // untouched.
-        public static WorkGiverDef Substitute(WorkGiverDef workGiverDef)
+        // Removed 2026-09-22 (dnbl-architecture.md section 18, decision 6):
+        // BeginSweep no longer redirects a general haul order to PUAH's own
+        // WorkGiverDef. DNBL stuffs inventory itself now
+        // (Patches/HaulInterceptPatch.cs, Jobs/JobDriver_StuffAndHaul.cs),
+        // so the redirect would just be DNBL competing with itself.
+
+        private static bool coexistenceWarned;
+
+        // Called once, the first time a stuffing job is created
+        // (HaulInterceptPatch). DNBL takes over hauling/loading
+        // unconditionally regardless of PUAH - no defer logic - but if PUAH
+        // is also installed and active, both mods intercept the same haul
+        // jobs with no ordering guarantee between them; this names that
+        // accepted, known risk once per session rather than silently.
+        public static void WarnIfCoexisting()
         {
-            if (workGiverDef == null || workGiverDef.defName != VanillaHaulDefName)
+            if (coexistenceWarned || !IsInstalled)
             {
-                return workGiverDef;
+                return;
             }
 
-            return PuahDef ?? workGiverDef;
+            coexistenceWarned = true;
+            Core.Logger.Warning("Pick Up And Haul is also active - both mods intercept haul jobs and may overlap. See dnbl-architecture.md section 18.");
         }
 
         // With the substitution in place, PUAH's own entry and the vanilla
