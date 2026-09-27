@@ -196,9 +196,28 @@ namespace DoNotBeLazy.Patches
             for (int i = 0; i < pawns.Count; i++)
             {
                 Pawn pawn = pawns[i];
-                if (pawn != null && !pawn.Dead && !pawn.Downed && !pawn.InMentalState)
+                if (pawn == null)
                 {
-                    return true;
+                    continue;
+                }
+
+                // Wrapped 2026-09-27 per user order: "yes, fix the
+                // right-click menu gap too" (architecture doc section 22).
+                // Runs every third frame per option while a vehicle menu is
+                // open, so an unhandled exception here would repeat, not
+                // just fire once - reuses FloatMenuPatch's throttled logger
+                // rather than a second copy. On exception this pawn is
+                // skipped, same as everywhere else in this pass.
+                try
+                {
+                    if (!pawn.Dead && !pawn.Downed && !pawn.InMentalState)
+                    {
+                        return true;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    FloatMenuPatch.PawnExceptionCaught(pawn, "VehicleMenuPatch.AnyoneCanAct", ex);
                 }
             }
 

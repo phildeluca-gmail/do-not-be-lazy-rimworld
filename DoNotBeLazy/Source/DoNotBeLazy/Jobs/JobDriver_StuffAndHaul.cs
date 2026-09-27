@@ -66,6 +66,9 @@ namespace DoNotBeLazy.Jobs
         // only to key the zero-progress backstop below at trip end.
         private Thing primaryTarget;
 
+        // Logged at most once per trip - see the Reserve skip below.
+        private bool transporterReserveSkipLogged;
+
         // Backstop for the 2026-09-22 same-tick crash (dnbl-architecture.md
         // section 18) - independent of CanPickUpAtLeastOne below, which is
         // the actual fix for the case that crashed the game. A trip that
@@ -118,6 +121,78 @@ namespace DoNotBeLazy.Jobs
             return pawn != null && thing != null && MassUtility.CountToPickUpUntilOverEncumbered(pawn, thing) > 0;
         }
 
+        // Fixed 2026-09-24, dnbl-architecture.md section 18 (defect 2 of
+        // two). Shared by all three substitution points (HaulInterceptPatch,
+        // TransporterInterceptPatch, SweepManager.WrapForVehicleStuffing) for
+        // the same reason CanPickUpAtLeastOne above is: TryMakePreToilReservations
+        // (line ~161) only reserves job.targetA, so a stuffing job built for
+        // an item another pawn already holds is guaranteed to fail its own
+        // pre-toil reservation the instant it starts. Before this fix nothing
+        // checked that in advance, so the job giver rebuilt the same doomed
+        // stuffing job up to several times a second until the item freed up.
+        // Checking first and
+        // leaving vanilla's own job in place matches the CanPickUpAtLeastOne
+        // guard beside it - never substitute a job we already know will fail.
+        internal static bool CanReserveItem(Pawn pawn, Thing thing)
+        {
+            return pawn != null && thing != null && pawn.Map != null
+                && pawn.Map.reservationManager.CanReserve(pawn, thing);
+        }
+
+        // Throttle for the "can't reserve, leaving vanilla's job" log line -
+        // same tick-expiry shape as zeroProgressExpiry below, kept separate
+        // because it answers a different question (can this pawn reserve the
+        // item right now) and must not be confused with "did the last trip
+        // make progress". Without this, the log line above would just
+        // replace one per-rebuild spam with another.
+        private static readonly Dictionary<Pawn, Dictionary<Thing, int>> reserveSkipLogExpiry
+            = new Dictionary<Pawn, Dictionary<Thing, int>>();
+
+        // Fixed 2026-09-24, dnbl-architecture.md section 18. Elliott's log
+        // showed "would overencumber before even one unit" ~100 times a
+        // second for the same component - CanPickUpAtLeastOne is re-checked
+        // on every job-giver evaluation, not once per job start, so an
+        // un-throttled line there is exactly the per-evaluation spam the
+        // logging standard forbids. Own table, not reserveSkipLogExpiry
+        // above - the two guards answer different questions for the same
+        // pawn/target pair and must not suppress each other's first line.
+        private static readonly Dictionary<Pawn, Dictionary<Thing, int>> overencumberSkipLogExpiry
+            = new Dictionary<Pawn, Dictionary<Thing, int>>();
+
+        private const int SkipLogThrottleTicks = 250;
+
+        internal static void LogReserveSkipThrottled(Pawn pawn, Thing thing, string message)
+        {
+            LogSkipThrottled(reserveSkipLogExpiry, pawn, thing, message);
+        }
+
+        // Shared by all three substitution points (HaulInterceptPatch,
+        // TransporterInterceptPatch, SweepManager.WrapForVehicleStuffing) -
+        // same reason CanReserveItem's log throttle is shared.
+        internal static void LogOverencumberSkipThrottled(Pawn pawn, Thing thing, string message)
+        {
+            LogSkipThrottled(overencumberSkipLogExpiry, pawn, thing, message);
+        }
+
+        private static void LogSkipThrottled(Dictionary<Pawn, Dictionary<Thing, int>> expiryTable, Pawn pawn, Thing thing, string message)
+        {
+            if (pawn == null || thing == null)
+            {
+                return;
+            }
+            if (!expiryTable.TryGetValue(pawn, out Dictionary<Thing, int> byTarget))
+            {
+                byTarget = new Dictionary<Thing, int>();
+                expiryTable[pawn] = byTarget;
+            }
+            if (byTarget.TryGetValue(thing, out int expiryTick) && Find.TickManager.TicksGame < expiryTick)
+            {
+                return;
+            }
+            byTarget[thing] = Find.TickManager.TicksGame + SkipLogThrottleTicks;
+            Logger.Message(message);
+        }
+
         internal static bool IsZeroProgressSuppressed(Pawn pawn, Thing target)
         {
             if (pawn == null || target == null
@@ -160,7 +235,27 @@ namespace DoNotBeLazy.Jobs
 
         public override bool TryMakePreToilReservations(bool errorOnFailed)
         {
-            return pawn.Reserve(job.targetA, job, errorOnFailed: errorOnFailed);
+            bool reserved = pawn.Reserve(job.targetA, job, errorOnFailed: errorOnFailed);
+
+            // The one line for this event, fixed 2026-09-27 (dnbl-architecture.md
+            // section 18): every substitution point (HaulInterceptPatch,
+            // TransporterInterceptPatch, SweepManager.WrapForVehicleStuffing)
+            // used to log "stuffing job created..." itself, once per WorkGiver
+            // candidate evaluation rather than once per job actually started -
+            // Pelican logged ~70 distinct items in under 2 seconds. This runs
+            // once, here, when the job starts for real. Storage mode
+            // (haulMode == ToCellStorage) has no fixed destination yet - each
+            // item's destination is looked up fresh at delivery time - so only
+            // the fixed-destination mode names one.
+            if (reserved)
+            {
+                string destination = job.haulMode == HaulMode.ToContainer && job.targetB.Thing != null
+                    ? job.targetB.Thing.LabelShort
+                    : "storage (destination chosen per item)";
+                Logger.Message($"{pawn.LabelShort}: stuffing job started for {job.targetA.Thing?.LabelCap}, destination {destination}");
+            }
+
+            return reserved;
         }
 
         protected override IEnumerable<Toil> MakeNewToils()
@@ -245,6 +340,29 @@ namespace DoNotBeLazy.Jobs
                         return;
                     }
 
+                    // Fixed 2026-09-27, dnbl-architecture.md section 18 -
+                    // same reservation gap as the storage-mode gather loop
+                    // above, here for fixed-destination mode (vehicle
+                    // packing, transport pods). The scanner's own
+                    // JobOnThing never reserves foundThing for this pawn -
+                    // its returned Job is discarded, never started, so its
+                    // TryMakePreToilReservations never runs - so nothing
+                    // held this item between being offered here and being
+                    // picked up. Reserve it now; released in PickUpToil
+                    // right after pickup. A failure is treated like an
+                    // overencumber refusal: excluded from being re-offered,
+                    // and the gather retries rather than ends, since the
+                    // scanner may still have something else to offer.
+                    if (!pawn.Map.reservationManager.Reserve(pawn, job, foundThing, errorOnFailed: false))
+                    {
+                        if (refused.Add(foundThing))
+                        {
+                            Logger.Message($"{pawn.LabelShort}: {foundThing.LabelCap} is already reserved, leaving it");
+                        }
+                        pawn.jobs.curDriver.JumpToToil(loopStart);
+                        return;
+                    }
+
                     job.SetTarget(TargetIndex.A, foundThing);
                     job.count = found.count > 0 ? found.count : foundThing.stackCount;
                 };
@@ -321,6 +439,16 @@ namespace DoNotBeLazy.Jobs
                     {
                         Logger.Message($"{pawn.LabelShort}: {thing.LabelCap} would overencumber, leaving it");
                     }
+                    // Same release as below - an opportunistic item reserved
+                    // in GatherStorageCandidatesToil or the askScanner loop
+                    // that turns out refused here must not stay reserved by
+                    // this pawn for the rest of the trip; the job-end
+                    // cleanup would release it eventually, but there is no
+                    // reason to make some other pawn wait that long.
+                    if (pawn.Map.reservationManager.ReservedBy(thing, pawn, job))
+                    {
+                        pawn.Map.reservationManager.Release(thing, pawn, job);
+                    }
                     return;
                 }
 
@@ -331,6 +459,24 @@ namespace DoNotBeLazy.Jobs
                 if (!isPrimary)
                 {
                     opportunisticPicked++;
+                }
+
+                // Fixed 2026-09-27, dnbl-architecture.md section 18.
+                // Release whatever reservation covered this item - the
+                // primary's own pre-toil reservation (TryMakePreToilReservations
+                // above, on job.targetA before any toil ran), or the one
+                // just taken on it in GatherStorageCandidatesToil or the
+                // fixed-destination askScanner loop for an opportunistic
+                // item. The item is off the map now (or reduced to
+                // whatever's left of its stack); holding the reservation
+                // any longer only blocks other pawns from the remainder for
+                // no reason. Mirrors vanilla's own Toils_Haul.StartCarryThing,
+                // which does the identical ReservedBy-guarded Release after
+                // a partial pickup (verified by ildasm against
+                // lib\Assembly-CSharp.dll).
+                if (pawn.Map.reservationManager.ReservedBy(thing, pawn, job))
+                {
+                    pawn.Map.reservationManager.Release(thing, pawn, job);
                 }
 
                 Logger.Message($"{pawn.LabelShort} stuffed {picked.LabelCap} x{take} into inventory ({MassUtility.EncumbrancePercent(pawn):P0} full)");
@@ -383,6 +529,32 @@ namespace DoNotBeLazy.Jobs
                         continue;
                     }
                     if (MassUtility.WillBeOverEncumberedAfterPickingUp(pawn, candidate, 1))
+                    {
+                        continue;
+                    }
+
+                    // Fixed 2026-09-27, dnbl-architecture.md section 18 -
+                    // "X tried to start carry Y which isn't spawned" seen in
+                    // Player.log for steel, corn, meat, cloth, silver and
+                    // hay. PawnCanAutomaticallyHaulFast above only calls
+                    // ReservationManager.CanReserve (verified by ildasm
+                    // against lib\Assembly-CSharp.dll,
+                    // Verse.AI.HaulAIUtility line 81) - a check, not a
+                    // claim. Nothing held this candidate between this scan
+                    // and its turn in the queue, so a vanilla hauler could
+                    // reserve and start walking to the same item, and this
+                    // pawn would still take it first when its turn came,
+                    // despawning it out from under the other pawn's already
+                    // running StartCarryThing toil
+                    // (Verse.AI.Toils_Haul.ErrorCheckForCarry, verified by
+                    // ildasm as the exact source of that log line). Reserve
+                    // it now for the rest of this trip; released in
+                    // PickUpToil right after the item is actually picked
+                    // up. A failure here means another pawn won the race in
+                    // the instant since the check above - skip the
+                    // candidate, no error (errorOnFailed: false - CanReserve
+                    // already filtered the ordinary case just above).
+                    if (!pawn.Map.reservationManager.Reserve(pawn, job, candidate, errorOnFailed: false))
                     {
                         continue;
                     }
@@ -489,7 +661,36 @@ namespace DoNotBeLazy.Jobs
                     return;
                 }
 
-                if (!pawn.Map.reservationManager.Reserve(pawn, job, dest))
+                // Fixed 2026-09-24, dnbl-architecture.md section 18 (defect 1
+                // of two). Vanilla's own RimWorld.JobDriver_HaulToTransporter
+                // never reserves the transporter/pod itself - verified by
+                // ildasm against lib\Assembly-CSharp.dll: its
+                // TryMakePreToilReservations only calls
+                // ReservationUtility.ReserveAsManyAsPossible on the item
+                // queues, and Notify_Starting only reserves the item
+                // (job.targetA). Before this fix, this toil reserved `dest`
+                // with the ordinary single-claimant reservation regardless of
+                // what it was, so the first colonist to reach a transport pod
+                // locked it and every other colonist loading the same pod
+                // failed this Reserve call, dropped their cargo and ended
+                // their trip. Skipping the reservation for a transporter
+                // destination only - never for a vehicle or any other
+                // destination, whose concurrency is unverified - matches
+                // vanilla exactly. FinishDeliveryToil below already guards
+                // its Release with ReservedBy, so nothing there needed to
+                // change.
+                bool isTransporterDestination = fixedDestination && dest.Thing != null
+                    && dest.Thing.TryGetComp<CompTransporter>() != null;
+
+                if (isTransporterDestination)
+                {
+                    if (!transporterReserveSkipLogged)
+                    {
+                        transporterReserveSkipLogged = true;
+                        Logger.Message($"{pawn.LabelShort}: not reserving {dest.Thing.LabelShort} - matches vanilla transport pod loading, which reserves only the item");
+                    }
+                }
+                else if (!pawn.Map.reservationManager.Reserve(pawn, job, dest))
                 {
                     // A reservation failure ends the trip - fixed
                     // 2026-09-22, third defect that night (dnbl-architecture.md

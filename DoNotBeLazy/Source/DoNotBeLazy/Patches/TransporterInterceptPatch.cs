@@ -149,7 +149,24 @@ namespace DoNotBeLazy.Patches
             // shared calculation as the driver's own PickUpToil.
             if (!JobDriver_StuffAndHaul.CanPickUpAtLeastOne(pawn, toLoad.Thing))
             {
-                Logger.Message($"{pawn.LabelShort}: {toLoad.Thing.LabelCap} would overencumber before even one unit - leaving vanilla's own load job in place");
+                // Throttled 2026-09-24 (dnbl-architecture.md section 18) -
+                // same per-evaluation spam as HaulInterceptPatch's line.
+                JobDriver_StuffAndHaul.LogOverencumberSkipThrottled(pawn, toLoad.Thing,
+                    $"{pawn.LabelShort}: {toLoad.Thing.LabelCap} would overencumber before even one unit - leaving vanilla's own load job in place");
+                return;
+            }
+
+            // Fixed 2026-09-24, dnbl-architecture.md section 18 (defect 2 of
+            // two). Without this, a stuffing job built for an item another
+            // pawn already holds fails its own TryMakePreToilReservations the
+            // instant it starts, and the job giver rebuilds this exact job -
+            // up to several times a second - until the item frees up. Leave
+            // vanilla's own job in place instead, same idea as
+            // CanPickUpAtLeastOne above.
+            if (!JobDriver_StuffAndHaul.CanReserveItem(pawn, toLoad.Thing))
+            {
+                JobDriver_StuffAndHaul.LogReserveSkipThrottled(pawn, toLoad.Thing,
+                    $"{pawn.LabelShort}: {toLoad.Thing.LabelCap} is already reserved - leaving vanilla's own load job in place");
                 return;
             }
 
@@ -169,8 +186,11 @@ namespace DoNotBeLazy.Patches
             stuffJob.ignoreForbidden = true;
             stuffJob.playerForced = __result.playerForced;
 
-            Logger.Message($"{pawn.LabelShort}: stuffing job created for {toLoad.Thing.LabelCap} x{toLoad.Count}, loading {transporter.parent.LabelShort}");
-
+            // Fixed 2026-09-27, dnbl-architecture.md section 18: same
+            // per-candidate spam as HaulInterceptPatch's line, same fix -
+            // the one line for this event now lives in
+            // JobDriver_StuffAndHaul.TryMakePreToilReservations, which fires
+            // once when the job actually starts.
             __result = stuffJob;
         }
     }

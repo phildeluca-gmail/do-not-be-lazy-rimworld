@@ -1,3 +1,4 @@
+using System;
 using System.Text;
 using RimWorld;
 using Verse;
@@ -38,12 +39,24 @@ namespace DoNotBeLazy.Components
 
             foreach (Pawn pawn in map.mapPawns.FreeColonistsSpawned)
             {
-                if (pawn?.jobs == null || pawn.jobs.curJob != null)
+                // Wrapped per-pawn 2026-09-27 per user order: "Don't end all
+                // pawn's activities because one pawn stopped." This probe is
+                // read-only and diagnostic-only, but it is still a per-pawn
+                // loop on the tick path - one pawn's bad state should not
+                // stop the rest of the map from being probed.
+                try
                 {
-                    continue;
-                }
+                    if (pawn?.jobs == null || pawn.jobs.curJob != null)
+                    {
+                        continue;
+                    }
 
-                Logger.Diag("idle " + pawn.LabelShort + ": no job - " + Describe(pawn));
+                    Logger.Diag("idle " + pawn.LabelShort + ": no job - " + Describe(pawn));
+                }
+                catch (Exception ex)
+                {
+                    Logger.Diag("idle probe: exception describing " + (pawn?.LabelShort ?? "unknown pawn") + " - skipping: " + ex);
+                }
             }
         }
 

@@ -1,5 +1,7 @@
 using System.Collections.Generic;
 using Verse;
+using DoNotBeLazy.Components;
+using DoNotBeLazy.Patches;
 
 namespace DoNotBeLazy.Comps
 {
@@ -78,6 +80,38 @@ namespace DoNotBeLazy.Comps
         {
             carrying.RemoveWhere(t => t == null || t.Destroyed);
             return carrying;
+        }
+
+        // dnbl-architecture.md section 20, built 2026-09-27. One line on a
+        // paused pawn's inspect pane: "Returns to: <the same wording the
+        // order's own float menu entry used>". No new Harmony patch -
+        // ThingWithComps.GetInspectString already calls
+        // CompInspectStringExtra on every comp unconditionally (verified
+        // against lib\Assembly-CSharp.dll: Pawn.GetInspectString calls
+        // base.GetInspectString(), which on ThingWithComps appends
+        // InspectStringPartsFromComps(), which calls this on every entry in
+        // `comps` regardless of any per-comp state) - so the comp reads its
+        // own applicability instead of needing a patch to be skipped.
+        //
+        // Cheap on purpose - this runs every frame the pawn is selected:
+        // two dictionary lookups (IsPaused, TryGetActiveSweep) and no
+        // allocation on the common "not paused" path, which returns null
+        // before touching the map or the sweep manager. No log line - a
+        // display, not an event, per section 20.
+        public override string CompInspectStringExtra()
+        {
+            if (!AppliesToThisPawn || !(parent is Pawn pawn))
+            {
+                return null;
+            }
+
+            SweepManager mgr = pawn.Map?.GetComponent<SweepManager>();
+            if (mgr == null || !mgr.IsPaused(pawn) || !mgr.TryGetActiveSweep(pawn, out SweepOrder order))
+            {
+                return null;
+            }
+
+            return "Returns to: " + FloatMenuPatch.DescribeSweepOrder(order.WorkGiverDef, order.OrderKind);
         }
 
         public override void PostExposeData()

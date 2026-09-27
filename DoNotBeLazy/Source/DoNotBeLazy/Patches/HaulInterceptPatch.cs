@@ -103,7 +103,27 @@ namespace DoNotBeLazy.Patches
             // so the two can't disagree.
             if (!JobDriver_StuffAndHaul.CanPickUpAtLeastOne(pawn, primary))
             {
-                Logger.Message($"{pawn.LabelShort}: {primary.LabelCap} would overencumber before even one unit - leaving vanilla's own haul job in place");
+                // Throttled 2026-09-24 (dnbl-architecture.md section 18) -
+                // this check runs on every job-giver evaluation, not once
+                // per job start, and an un-throttled line here logged
+                // ~100 times/sec for the same pawn/item.
+                JobDriver_StuffAndHaul.LogOverencumberSkipThrottled(pawn, primary,
+                    $"{pawn.LabelShort}: {primary.LabelCap} would overencumber before even one unit - leaving vanilla's own haul job in place");
+                return;
+            }
+
+            // Fixed 2026-09-24, dnbl-architecture.md section 18 (defect 2 of
+            // two, shared with TransporterInterceptPatch and
+            // SweepManager.WrapForVehicleStuffing). Without this, a stuffing
+            // job built for an item another pawn already holds fails its own
+            // TryMakePreToilReservations the instant it starts, and the job
+            // giver rebuilds this exact job - up to several times a second -
+            // until the item frees up. Leave vanilla's own job in place
+            // instead, same idea as CanPickUpAtLeastOne above.
+            if (!JobDriver_StuffAndHaul.CanReserveItem(pawn, primary))
+            {
+                JobDriver_StuffAndHaul.LogReserveSkipThrottled(pawn, primary,
+                    $"{pawn.LabelShort}: {primary.LabelCap} is already reserved - leaving vanilla's own haul job in place");
                 return;
             }
 
@@ -122,8 +142,12 @@ namespace DoNotBeLazy.Patches
             stuffJob.haulMode = HaulMode.ToCellStorage; // signal to the driver: storage mode
             stuffJob.playerForced = __result.playerForced;
 
-            Logger.Message($"{pawn.LabelShort}: stuffing job created for {primary.LabelCap}, replacing a single-item haul");
-
+            // Fixed 2026-09-27, dnbl-architecture.md section 18: this ran
+            // once per WorkGiver candidate evaluation, not once per job
+            // actually started - Pelican logged ~70 distinct items in under
+            // 2 seconds. The one line for this event now lives in
+            // JobDriver_StuffAndHaul.TryMakePreToilReservations, which fires
+            // once when the job actually starts.
             __result = stuffJob;
         }
     }

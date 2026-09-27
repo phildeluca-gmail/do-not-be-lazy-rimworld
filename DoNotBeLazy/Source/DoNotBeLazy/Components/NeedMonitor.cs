@@ -1,5 +1,8 @@
+using System;
+using System.Collections.Generic;
 using RimWorld;
 using Verse;
+using Verse.AI;
 using DoNotBeLazy.Core;
 
 namespace DoNotBeLazy.Components
@@ -59,6 +62,26 @@ namespace DoNotBeLazy.Components
         {
         }
 
+        // Throttle for GameComponentTickExceptionThrottled below - one line
+        // per pawn per window rather than one per tick, same shape as
+        // SweepManager's GiveJobFailedLogExpiry/missingSweepStateLogExpiry.
+        // Added 2026-09-27 per user order: "Don't end all pawn's activities
+        // because one pawn stopped."
+        private const int GameComponentTickExceptionQuietTicks = 250;
+        private static readonly Dictionary<Pawn, int> gameComponentTickExceptionLogExpiry = new Dictionary<Pawn, int>();
+
+        private static void GameComponentTickExceptionThrottled(Pawn pawn, Exception ex)
+        {
+            int now = Find.TickManager.TicksGame;
+            if (gameComponentTickExceptionLogExpiry.TryGetValue(pawn, out int expiry) && now < expiry)
+            {
+                return;
+            }
+
+            gameComponentTickExceptionLogExpiry[pawn] = now + GameComponentTickExceptionQuietTicks;
+            Logger.Warning($"{pawn.LabelShort}: exception during this pawn's need check - skipping {pawn.LabelShort} this tick and continuing with the rest of the pass: {ex}");
+        }
+
         public override void GameComponentTick()
         {
             if (Find.TickManager.TicksGame % CheckIntervalTicks != 0)
@@ -80,21 +103,42 @@ namespace DoNotBeLazy.Components
 
                 foreach (Pawn pawn in sweepManager.GetSweptPawns())
                 {
-                    // already pending on a need from an earlier tick -
-                    // don't re-pause every 60 ticks while they sleep it off
-                    if (sweepManager.IsPaused(pawn))
+                    // Wrapped per-pawn 2026-09-27 per user order: "Don't end
+                    // all pawn's activities because one pawn stopped." An
+                    // exception checking one pawn's needs used to abort the
+                    // rest of this tick's pass for every other swept pawn on
+                    // every map - see GameComponentTickExceptionThrottled
+                    // above.
+                    try
                     {
-                        continue;
-                    }
+                        // already pending on a need from an earlier tick -
+                        // don't re-pause every 60 ticks while they sleep it off.
+                        // Still worth polling rather than skipping outright:
+                        // TryForceRestIfStuck catches the case, found live
+                        // 2026-09-26/27, where a Rest pause hands the pawn back
+                        // to vanilla and vanilla's own JobGiver_GetRest declines
+                        // anyway because the timetable says Work - see its
+                        // comment in SweepManager.
+                        if (sweepManager.IsPaused(pawn))
+                        {
+                            sweepManager.TryForceRestIfStuck(pawn);
+                            sweepManager.WarnIfFoodStuck(pawn);
+                            continue;
+                        }
 
-                    if (!NeedIsCritical(pawn, threshold, moodThreshold, restThreshold))
+                        if (!NeedIsCritical(pawn, threshold, moodThreshold, restThreshold))
+                        {
+                            continue;
+                        }
+
+                        string need = CriticalNeedLabel(pawn, threshold, moodThreshold, restThreshold);
+                        sweepManager.PauseForNeed(pawn, need);
+                        Logger.Message($"{pawn.LabelShort} paused from sweep: {need} at/below threshold. Will resume once addressed.");
+                    }
+                    catch (Exception ex)
                     {
-                        continue;
+                        GameComponentTickExceptionThrottled(pawn, ex);
                     }
-
-                    string need = CriticalNeedLabel(pawn, threshold, moodThreshold, restThreshold);
-                    sweepManager.PauseForNeed(pawn, need);
-                    Logger.Message($"{pawn.LabelShort} paused from sweep: {need} at/below threshold. Will resume once addressed.");
                 }
             }
         }
@@ -190,6 +234,160 @@ namespace DoNotBeLazy.Components
         private static bool NeedIsCritical(Need need, float threshold)
         {
             return need != null && need.CurLevelPercentage <= threshold;
+        }
+
+        // Section 21, go-eat backstop - built 2026-09-27. Verbatim ask:
+        // "Best mood buff to lowest." Called by SweepManager the instant a
+        // pawn is paused for Food (revised the same day - see the section 21
+        // note - not on a delay), so this has to pick a candidate on its own
+        // rather than lean on FoodUtility.TryFindBestFoodSourceFor, which
+        // picks by FoodOptimality (nutrition and distance), not by mood.
+        //
+        // Bounded on purpose - this runs once per pause, never per tick:
+        // candidates come from Verse.ThingListGroupHelper's own maintained
+        // list for ThingRequestGroup.FoodSourceNotPlantOrTree (confirmed by
+        // decompile that this group already includes
+        // Building_NutrientPasteDispenser, so dispensers are covered without
+        // extra code) plus the pawn's own inventory - never a raw map scan.
+        // Predator-hunt and harvest-a-plant food sources are deliberately
+        // NOT replicated (out of scope for a hunger backstop); pack-animal
+        // inventory is also skipped for the same reason.
+        //
+        // Verified against lib\Assembly-CSharp.dll:
+        // - FoodUtility.WillEat(Thing) covers food policy (Pawn_FoodRestrictionTracker),
+        //   ideology venerated-animal and royal title gates. Ordinary ideology
+        //   moral reactions (AteHumanMeat, AteNonCannibalFood, etc.) are not a
+        //   block - they show up as thoughts, which is exactly what
+        //   FoodUtility.MoodFromIngesting sums, so the mood-based pick already
+        //   steers away from them on its own.
+        // - Forbidden: Thing.IsForbidden(Pawn) (RimWorld.ForbidUtility).
+        // - Reachable + reservable: Pawn.CanReserveAndReach(LocalTargetInfo,
+        //   PathEndMode, Danger) (Verse.AI.ReservationUtility) for a map item;
+        //   a nutrient paste dispenser is checked by hand the same way
+        //   FoodUtility.BestFoodSourceOnMap's own validator does (power,
+        //   feedstock, InteractionCell reachable) since it is not reserved
+        //   the normal way.
+        // - Freshness: CompRottable.Stage != RotStage.Fresh is excluded -
+        //   FoodUtility.IsNotFresh()/IsDessicated() are private helpers this
+        //   build does not expose, so the rot stage is read directly instead.
+        // - Job: JobDefOf.Ingest via JobMaker.MakeJob, count from
+        //   FoodUtility.WillIngestStackCountOf(pawn, foodDef,
+        //   FoodUtility.GetNutrition(...)) - the same two calls
+        //   RimWorld.JobGiver_GetFood itself makes. Social propriety
+        //   (Thing.IsSociallyProper, prisoners eating apart from colonists) is
+        //   NOT checked - out of scope; note it if this ever reaches a
+        //   prisoner.
+        //
+        // Mood is FoodUtility.MoodFromIngesting(pawn, candidate, foodDef) -
+        // itself just ThoughtsFromIngesting(...).Sum(t => t.thought.stages[0].baseMoodEffect),
+        // read verbatim off FoodUtility.cs. Highest mood wins; a tie (most
+        // often two plain meals with no thoughts at all, both 0) goes to
+        // whichever is nearer. Because the winner is simply the maximum,
+        // negative-mood food is only ever picked when every candidate is
+        // negative - no separate branch needed for that rule.
+        public static Job TryFindBestFoodJob(Pawn pawn, out int candidateCount, out float bestMoodEffect, out string declineReason)
+        {
+            candidateCount = 0;
+            bestMoodEffect = 0f;
+            declineReason = null;
+
+            if (pawn?.needs?.food == null || pawn.Map == null)
+            {
+                declineReason = "no food need, or not spawned on a map";
+                return null;
+            }
+
+            Thing bestThing = null;
+            ThingDef bestDef = null;
+            float bestScore = float.NegativeInfinity;
+            int bestDistance = int.MaxValue;
+            int candidates = 0;
+
+            void Consider(Thing candidate, bool inInventory)
+            {
+                ThingDef def = FoodUtility.GetFinalIngestibleDef(candidate);
+                if (def == null || !def.IsNutritionGivingIngestible)
+                {
+                    return;
+                }
+
+                if (!pawn.WillEat(candidate, pawn) || candidate.IsForbidden(pawn))
+                {
+                    return;
+                }
+
+                CompRottable rot = candidate.TryGetComp<CompRottable>();
+                if (rot != null && rot.Stage != RotStage.Fresh)
+                {
+                    return;
+                }
+
+                if (inInventory)
+                {
+                    if (!candidate.IngestibleNow)
+                    {
+                        return;
+                    }
+                }
+                else if (candidate is Building_NutrientPasteDispenser dispenser)
+                {
+                    if (dispenser.powerComp == null || !dispenser.powerComp.PowerOn
+                        || !dispenser.HasEnoughFeedstockInHoppers()
+                        || !dispenser.InteractionCell.Standable(dispenser.Map)
+                        || !pawn.CanReach(dispenser.InteractionCell, PathEndMode.OnCell, Danger.Some))
+                    {
+                        return;
+                    }
+                }
+                else
+                {
+                    if (!candidate.IngestibleNow
+                        || !pawn.CanReserveAndReach(candidate, PathEndMode.ClosestTouch, Danger.Some))
+                    {
+                        return;
+                    }
+                }
+
+                candidates++;
+                float mood = FoodUtility.MoodFromIngesting(pawn, candidate, def);
+                int distance = inInventory ? 0 : (pawn.Position - candidate.Position).LengthManhattan;
+                if (mood > bestScore || (mood == bestScore && distance < bestDistance))
+                {
+                    bestScore = mood;
+                    bestDistance = distance;
+                    bestThing = candidate;
+                    bestDef = def;
+                }
+            }
+
+            if (pawn.inventory?.innerContainer != null)
+            {
+                foreach (Thing item in pawn.inventory.innerContainer)
+                {
+                    Consider(item, true);
+                }
+            }
+
+            foreach (Thing thing in pawn.Map.listerThings.ThingsMatching(ThingRequest.ForGroup(ThingRequestGroup.FoodSourceNotPlantOrTree)))
+            {
+                Consider(thing, false);
+            }
+
+            candidateCount = candidates;
+
+            if (bestThing == null)
+            {
+                declineReason = candidates == 0
+                    ? "no food this pawn will eat, reach or reserve"
+                    : "no viable candidate scored";
+                return null;
+            }
+
+            bestMoodEffect = bestScore;
+            float nutrition = FoodUtility.GetNutrition(pawn, bestThing, bestDef);
+            Job job = JobMaker.MakeJob(JobDefOf.Ingest, bestThing);
+            job.count = FoodUtility.WillIngestStackCountOf(pawn, bestDef, nutrition);
+            return job;
         }
     }
 }

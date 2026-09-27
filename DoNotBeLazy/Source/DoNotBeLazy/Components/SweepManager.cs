@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using RimWorld;
 using Verse;
 using Verse.AI;
+using Verse.AI.Group;
 using DoNotBeLazy.Core;
 using DoNotBeLazy.Jobs;
 using DoNotBeLazy.Utility;
@@ -232,6 +233,22 @@ namespace DoNotBeLazy.Components
             // lasts, and a line per check is exactly the shape the standing
             // rule forbids.
             public bool warned;
+
+            // TryForceRestIfStuck's own throttle - added 2026-09-27. Set to
+            // `tick` at pause start so the first attempt still waits out
+            // ForceRestRetryTicks rather than firing on the very next
+            // GameComponentTick, and advanced on every attempt after that
+            // (successful or not) so a bed search runs at most once per
+            // window instead of every 60 ticks.
+            public int lastForceCheckTick;
+
+            // One "no bed" decline logged per pause rather than one per
+            // retry - same shape as `warned` above.
+            public bool declineLogged;
+
+            // Section 21 - one "still not eating" line per pause from
+            // WarnIfFoodStuck, same shape as declineLogged above.
+            public bool foodStuckWarned;
         }
 
         private readonly Dictionary<Pawn, PauseInfo> pausedForNeed = new Dictionary<Pawn, PauseInfo>();
@@ -260,15 +277,6 @@ namespace DoNotBeLazy.Components
         // Cleared by any successful assignment.
         private readonly Dictionary<Pawn, int> areaRetries = new Dictionary<Pawn, int>();
 
-        // How many times one order may say that something else is driving a
-        // pawn this mod still believes it holds. Three rather than one: the
-        // first line is the moment the disagreement starts, and a second or
-        // third says it is still going on rather than being a single
-        // handover. A hard cap per pawn per order, so the line cannot turn
-        // into a per-tick report however badly the sweep is losing its pawns.
-        // Added 2026-09-18 - architecture section 15.
-        private const int MaxForeignJobReports = 3;
-
         // How long one pawn stays quiet after a line saying a job end was
         // thrown away because AssigningJob was set. 600 ticks, the same round
         // as AreaRetryTicks. Added 2026-09-18 - architecture section 15.
@@ -281,20 +289,15 @@ namespace DoNotBeLazy.Components
         // 2026-09-18 - architecture section 15.
         private readonly Dictionary<Pawn, Job> ourJob = new Dictionary<Pawn, Job>();
 
-        // One entry per pawn already reported as taken over on its current
-        // order, rather than a second dictionary - the same shape, and for
-        // the same reason, as PauseInfo.
-        private struct ForeignJobInfo
-        {
-            // the foreign job the last line named, so the same job running on
-            // for minutes writes one line and not one per state check
-            public Job job;
-
-            // how many of this order's MaxForeignJobReports have been spent
-            public int reports;
-        }
-
-        private readonly Dictionary<Pawn, ForeignJobInfo> foreignJob = new Dictionary<Pawn, ForeignJobInfo>();
+        // The last foreign (vanilla-driven, not player-forced) job named in
+        // a "we still hold the order" line for this pawn, so the same job
+        // running on for minutes writes one line and not one per 60-tick
+        // poll. Re-added 2026-09-27, simplified from the 2026-09-18
+        // MaxForeignJobReports/ForeignJobInfo pair (removed earlier the same
+        // day, when the first version of this fix ended the sweep instead of
+        // reporting it - reinstated once that fix was narrowed). See
+        // TryReportForeignJob.
+        private readonly Dictionary<Pawn, Job> lastReportedForeignJob = new Dictionary<Pawn, Job>();
 
         // Job ends thrown away because this pawn was being handed a job at
         // the moment its own prior job ended. The tick to write the next
@@ -398,6 +401,95 @@ namespace DoNotBeLazy.Components
         {
         }
 
+        // Throttle for GiveJobFailedThrottled below - one line per pawn per
+        // window rather than one per reentrant crash, same shape as
+        // JobDriver_StuffAndHaul's skip-log tables. 2026-09-26.
+        private const int GiveJobFailedQuietTicks = 250;
+        private static readonly Dictionary<Pawn, int> giveJobFailedLogExpiry = new Dictionary<Pawn, int>();
+
+        // Throttle for the missing-sweep-state warning below - same shape as
+        // GiveJobFailedQuietTicks/giveJobFailedLogExpiry above, and caused by
+        // the same class of reentrancy. Added 2026-09-27.
+        private const int MissingSweepStateQuietTicks = 250;
+        private static readonly Dictionary<Pawn, int> missingSweepStateLogExpiry = new Dictionary<Pawn, int>();
+
+        // Throttle for MapComponentTickThrottled below - same shape again.
+        // Added 2026-09-27 per user order: "Don't end all pawn's activities
+        // because one pawn stopped." Before this, an unhandled exception
+        // anywhere in one pawn's turn through this loop (ClearSweeps,
+        // TryResumeFromNeed, TryScannerWatchdog, TryWorkstationRetry,
+        // TryAreaRetry, TryReportForeignJob) aborted the rest of THIS tick's
+        // pass for every pawn still to come - the same silent-for-everyone-
+        // else failure mode the missing-sweep-state guard above was written
+        // for, just one level higher up the call stack.
+        private const int MapComponentTickExceptionQuietTicks = 250;
+        private static readonly Dictionary<Pawn, int> mapComponentTickExceptionLogExpiry = new Dictionary<Pawn, int>();
+
+        private static void MapComponentTickExceptionThrottled(Pawn pawn, Exception ex)
+        {
+            int now = Find.TickManager.TicksGame;
+            if (mapComponentTickExceptionLogExpiry.TryGetValue(pawn, out int expiry) && now < expiry)
+            {
+                return;
+            }
+
+            mapComponentTickExceptionLogExpiry[pawn] = now + MapComponentTickExceptionQuietTicks;
+            Logger.Warning($"{pawn.LabelShort}: exception during this pawn's turn in the sweep tick pass - skipping {pawn.LabelShort} this tick and continuing with the rest of the pass: {ex}");
+        }
+
+        // Not throttled: unlike the tick-pass guard above, this fires at most
+        // once per pawn per group-order click, never per tick, so there is no
+        // message-cap risk. Added 2026-09-27, same order: a group order is
+        // meant to drop the pawns who cannot and keep the pawns who can
+        // (architecture doc section 9) - an unhandled exception asking one
+        // pawn's own answer must not stop the rest of the group from being
+        // asked in turn.
+        private static void GroupOrderPawnExceptionCaught(Pawn pawn, string workGiverDefName, Exception ex)
+        {
+            Logger.Warning($"{pawn.LabelShort}: exception while asking for a job on {workGiverDefName} - {pawn.LabelShort} does not join this order, rest of the group is still asked: {ex}");
+        }
+
+        // Fixed 2026-09-26 - seen live at 21:53:48: Noob's own job ending
+        // called vanilla's EnrouteManager.InterruptEnroutePawns (a
+        // HaulToContainer job's destination container was full), which ended
+        // a DIFFERENT pawn's job while Noob's own GiveJob call was still on
+        // the stack (Job.TryMakePreToilReservations, called from inside
+        // Pawn_JobTracker.TryTakeOrderedJob's own pre-check). Architecture
+        // section 14 already accepts that an interrupted pawn reaches
+        // Notify_JobEnded and gets reassigned reentrantly rather than being
+        // thrown away - that part is by design. What is not by design: the
+        // reassigned pawn's own StartJob then re-entered the SAME vanilla
+        // enroute machinery a second time, and a NullReferenceException in
+        // JobDriver_HaulToContainer.UpdateTracker (verified by decompiling
+        // Assembly-CSharp.dll with ilspycmd - get_ThingToCarry reads
+        // job.targetA fresh on every call, so a second read mid-reservation
+        // found it gone) unwound uncaught through vanilla's own
+        // EndCurrentJob and InterruptEnroutePawns and errored NOOB'S job -
+        // an unrelated pawn three frames further up the same stack.
+        // Pawn_JobTracker.StartJob has already set curJob/curDriver for the
+        // reassigned pawn by the point it throws (verified: the assignment
+        // at line ~291 precedes TryMakePreToilReservations at line ~296),
+        // leaving that pawn on a job whose driver has no toils set up.
+        // Nothing needs cleaning up for that by hand: JobDriver.DriverTick
+        // finds CurToil null forever and ends the job with
+        // JobCondition.Succeeded on its own very next tick, and
+        // Notify_JobEnded picks the pawn back up normally from there.
+        // Catching here, at the one place every sweep job is issued, keeps a
+        // reentrant failure to the pawn it actually belongs to instead of
+        // crashing whichever pawn's call chain it happened to unwind through.
+        private static void GiveJobFailedThrottled(Pawn pawn, Job job, Exception ex)
+        {
+            int now = Find.TickManager.TicksGame;
+            if (giveJobFailedLogExpiry.TryGetValue(pawn, out int expiry) && now < expiry)
+            {
+                return;
+            }
+
+            giveJobFailedLogExpiry[pawn] = now + GiveJobFailedQuietTicks;
+            // Full exception now written to log instead of just the type name - 2026-09-26
+            Logger.Warning($"{pawn.LabelShort}: declined {DescribeJob(job)} - exception starting it reentrantly: {ex.ToString()}; vanilla will end the half-started job on its own next tick and we'll pick {pawn.LabelShort} back up from there");
+        }
+
         // every TryTakeOrderedJob in the mod goes through here - see
         // BeginAssigningJob / EndAssigningJob above
         //
@@ -411,12 +503,22 @@ namespace DoNotBeLazy.Components
         // already in its queue, and nothing is interrupted. When the pawn
         // IS idle (no current job, or an idle job), it starts the job right
         // away regardless of this flag - there is nothing to queue behind.
+        //
+        // Wrapped in a catch since 2026-09-26 - see GiveJobFailedThrottled
+        // above. A reentrant call here (this pawn was interrupted by
+        // vanilla's own job machinery while ANOTHER pawn was being handed a
+        // job) can throw mid-StartJob; left uncaught it unwinds out through
+        // vanilla's own call chain and errors an unrelated pawn's job.
         public static void GiveJob(Pawn pawn, Job job, bool appendBehindCurrentJob = false)
         {
             BeginAssigningJob(pawn);
             try
             {
                 pawn.jobs.TryTakeOrderedJob(job, JobTag.Misc, appendBehindCurrentJob);
+            }
+            catch (Exception ex)
+            {
+                GiveJobFailedThrottled(pawn, job, ex);
             }
             finally
             {
@@ -472,73 +574,190 @@ namespace DoNotBeLazy.Components
             var pawns = new List<Pawn>(activeSweeps.Keys);
             foreach (Pawn pawn in pawns)
             {
-                if (pawn.Dead || pawn.Downed || pawn.InMentalState || pawn.Drafted || pawn.Map != map)
+                // Wrapped per-pawn 2026-09-27 per user order: "Don't end all
+                // pawn's activities because one pawn stopped." Before this,
+                // an exception anywhere below - ClearSweeps, TryResumeFromNeed,
+                // the three retries, TryReportForeignJob - aborted the rest of
+                // THIS tick's pass for every other swept pawn on the map, not
+                // just the one that threw. See MapComponentTickExceptionThrottled
+                // above.
+                try
                 {
-                    // the pawn is out of the work, so its queued orders go
-                    // too - architecture section 12, decision 4
-                    ClearSweeps(pawn,
-                        pawn.Dead ? "dead"
-                        : pawn.Downed ? "downed"
-                        : pawn.InMentalState ? "mental break"
-                        : pawn.Drafted ? "drafted"
-                        : "left the map");
-                    continue;
-                }
+                    if (pawn.Dead || pawn.Downed || pawn.InMentalState || pawn.Drafted || pawn.Map != map)
+                    {
+                        // the pawn is out of the work, so its queued orders go
+                        // too - architecture section 12, decision 4
+                        ClearSweeps(pawn,
+                            pawn.Dead ? "dead"
+                            : pawn.Downed ? "downed"
+                            : pawn.InMentalState ? "mental break"
+                            : pawn.Drafted ? "drafted"
+                            : "left the map");
+                        continue;
+                    }
 
-                // scanner orders never arm a retry (their JobOnThing has no
-                // null path) and bench orders are never scanner work, so
-                // these two are exclusive - the watchdog just returns on
-                // anything that isn't a scanner.
-                // Resuming used to happen ONLY on a job end. A pawn whose
-                // need recovered without ending a job we would hear about -
-                // or whose replacement jobs all ended while still under
-                // threshold - sat paused with nothing left to prompt a
-                // second look. Polled here for the same reason the three
-                // retries below are: there is no event to hang it on.
-                if (TryResumeFromNeed(pawn, activeSweeps[pawn]))
+                    // scanner orders never arm a retry (their JobOnThing has no
+                    // null path) and bench orders are never scanner work, so
+                    // these two are exclusive - the watchdog just returns on
+                    // anything that isn't a scanner.
+                    // Resuming used to happen ONLY on a job end. A pawn whose
+                    // need recovered without ending a job we would hear about -
+                    // or whose replacement jobs all ended while still under
+                    // threshold - sat paused with nothing left to prompt a
+                    // second look. Polled here for the same reason the three
+                    // retries below are: there is no event to hang it on.
+                    // Crashed live 2026-09-27 09:30:39: activeSweeps[pawn] threw
+                    // KeyNotFoundException (Dictionary.get_Item) here, taking
+                    // down the rest of this tick's pass for every other swept
+                    // pawn on the map. `pawns` is a snapshot of activeSweeps.Keys
+                    // taken at the top of this call, so every entry existed at
+                    // that instant - but an earlier pawn's own turn in THIS SAME
+                    // pass can remove a LATER pawn's entry before its turn comes
+                    // up: AssignNextTask -> GiveJob can reenter vanilla's own job
+                    // machinery (the same reentrancy GiveJobFailedThrottled
+                    // above exists for, 2026-09-26) and end a different pawn's
+                    // job, which can reach RemoveSweep/ClearSweeps for that pawn
+                    // through the ordinary (non-suppressed) path. No matching
+                    // "sweep ended" line was found in the log for this crash,
+                    // so the exact removal could not be pinned to a pawn or a
+                    // call site from the log alone - guarded defensively rather
+                    // than left to crash the rest of the pass.
+                    if (!activeSweeps.TryGetValue(pawn, out SweepOrder activeOrder))
+                    {
+                        int now = Find.TickManager.TicksGame;
+                        if (!missingSweepStateLogExpiry.TryGetValue(pawn, out int expiry) || now >= expiry)
+                        {
+                            missingSweepStateLogExpiry[pawn] = now + MissingSweepStateQuietTicks;
+                            Logger.Warning($"{pawn.LabelShort}: sweep state vanished mid-tick (no activeSweeps entry left by the time this pass reached it) - skipping this pawn this tick rather than crash the rest of the pass");
+                        }
+
+                        continue;
+                    }
+
+                    if (TryResumeFromNeed(pawn, activeOrder))
+                    {
+                        continue;
+                    }
+
+                    TryScannerWatchdog(pawn);
+                    TryWorkstationRetry(pawn);
+                    TryAreaRetry(pawn);
+
+                    // last, because the three above can end the order or hand
+                    // the pawn a fresh job in this same pass, and either answers
+                    // the question this one asks
+                    TryReportForeignJob(pawn);
+                }
+                catch (Exception ex)
                 {
-                    continue;
+                    MapComponentTickExceptionThrottled(pawn, ex);
                 }
-
-                TryScannerWatchdog(pawn);
-                TryWorkstationRetry(pawn);
-                TryAreaRetry(pawn);
-
-                // last, because the three above can end the order or hand
-                // the pawn a fresh job in this same pass, and either answers
-                // the question this one asks
-                TryReportForeignJob(pawn);
             }
         }
 
-        // Say so when this mod still holds a pawn and something else is
-        // driving it. Added 2026-09-18 - architecture section 15.
+        // End the sweep when a genuine external order has taken the pawn
+        // over; report, without ending, when vanilla is merely driving the
+        // pawn on its own. Added 2026-09-18 - architecture section 15.
+        // Rewritten 2026-09-27 - architecture section 16.
         //
         // This is the case that cost the evening of 2026-09-17: Pelican was
         // on a "* fabricate things until done" order, stopped fabricating,
         // was handed flak jackets by vanilla instead, and the mod went on
         // believing it held him with not one line written about any of it.
+        // The 2026-09-18 fix wrote the line but never ended the sweep, which
+        // is a second, separate bug from the one that prompted it: a direct
+        // player order to a swept pawn was reported as a takeover here and
+        // then reclaimed anyway the next time any job of the pawn's ended,
+        // because Notify_JobEnded's default for an unexplained job end is
+        // "my own task finished, hand out the next one." Confirmed
+        // 2026-09-27 against a live log: Kiriko and Bax both kept
+        // re-registering on their HaulGeneral order after being given direct
+        // orders, and the only thing that ever released a pawn all session
+        // was a fresh sweep order replacing the old one outright (ClearSweeps'
+        // own "replaced by a new ... order" path). Notify_JobEnded's
+        // playerInterruptedForced check (2026-09-26) never once fired in
+        // that log either - JobTrackerPatch's postfix discards an ended job
+        // as self-caused whenever this mod is mid-hand-off for the same
+        // pawn, and vanilla's TryTakeOrderedJob sets that same flag on ANY
+        // job it replaces, including this mod's own - so the flag cannot
+        // tell the two apart at that check.
+        //
+        // A first version of this fix (2026-09-27, same day) ended the
+        // sweep on ANY curJob that was not the job this mod handed out. Too
+        // broad - caught in review before being run in a game. Verified by
+        // decompiling lib\Assembly-CSharp.dll: Pawn_JobTracker.StartJob, when
+        // replacing an existing job, ends the old one through
+        // CleanupCurrentJob directly (line ~269) rather than through
+        // EndCurrentJob - so a job vanilla starts this way never touches this
+        // mod's Harmony patch at all, and the pawn can be well into it long
+        // before this 60-tick poll ever sees the mismatch. That path is how
+        // a LOT of ordinary vanilla driving works: Verse.AI.Toils_Recipe.
+        // FinishRecipeAndStartStoringProduct calls
+        // actor.jobs.StartJob(HaulAIUtility.HaulToCellStorageJob(...), ...)
+        // directly to haul a finished bill's product to the best stockpile
+        // (line ~277) - every "make X until done" sweep would have ended
+        // after its first product. Pawn_JobTracker.EndCurrentJob's own
+        // opportunistic-job and Wait_MaintainPosture fallbacks (~408-420),
+        // and CheckForJobOverride_NewTemp's higher-priority think-tree job
+        // (~543, used for a fire, a hostile, self-preservation, a mental
+        // break or a prison break - CLAUDE.md section 16's allowed
+        // interrupts all arrive this way) all go through StartJob the same
+        // way, as does TryFindAndStartJob picking the pawn's own next
+        // ordinary job (eating, sleeping, joy).
+        //
+        // The discriminator: Verse.AI.Job.playerForced is set to true in
+        // exactly one place in the whole decompiled assembly -
+        // Pawn_JobTracker.TryTakeOrderedJob, line 858, unconditionally on
+        // every call - and none of the StartJob-only paths above ever touch
+        // it, so it stays false on whatever they hand the pawn. It survives
+        // onto whatever job eventually runs even when the pawn was idle at
+        // the moment of the order: TryTakeOrderedJob's own idle branch
+        // enqueues the SAME Job object and starts it through
+        // CheckForJobOverride_NewTemp -> StartJob, and StartJob never resets
+        // the flag. This mod's own GiveJob goes through TryTakeOrderedJob
+        // too and gets the flag as well, which is why it is not read alone -
+        // only `playerForced && not the job this mod handed out` means a
+        // genuine external order (the player's, or another mod's own
+        // TryTakeOrderedJob call - Be Lazy's pending gizmo work would be
+        // one). Checked before the paused/retry guards below, not after, so
+        // a direct order given while this mod has let go of the pawn for a
+        // moment - a need pause, a workstation retry, an area retry - still
+        // ends the sweep instead of being missed until the gap closes.
         //
         // Why a tick check and not a hook on the job starting.
         // Pawn_JobTracker.EndCurrentJob calls TryFindAndStartJob inside its
-        // own body - read out of lib\Assembly-CSharp.dll, not remembered - so
-        // vanilla has already started a replacement job by the time this
-        // mod's postfix on EndCurrentJob runs and hands out the next sweep
-        // job. Asking the question as the job starts would therefore be true
-        // on every ordinary handover, which is once per target. Asking it
-        // 60 ticks later asks it of a settled pawn, and the answer is a real
-        // disagreement rather than a moment in the handover.
-        //
-        // Never fires while the mod has deliberately let go of the pawn: a
-        // need pause, a workstation retry and an area retry all mean vanilla
-        // is meant to be driving. Scanner orders are left to
-        // TryScannerWatchdog, because a scanner job's 1500-tick expiry swaps
-        // the Job object for an identical one without the pawn moving, and
-        // the reference comparison below would read that as a takeover.
+        // own body, so vanilla has already started a replacement job by the
+        // time this mod's postfix on EndCurrentJob runs and hands out the
+        // next sweep job. Asking the question as the job starts would
+        // therefore be true on every ordinary handover, which is once per
+        // target. Asking it 60 ticks later asks it of a settled pawn, and
+        // the answer is a real disagreement rather than a moment in the
+        // handover.
         private void TryReportForeignJob(Pawn pawn)
         {
-            if (!activeSweeps.TryGetValue(pawn, out SweepOrder order)
-                || pausedForNeed.ContainsKey(pawn)
+            if (!activeSweeps.TryGetValue(pawn, out SweepOrder order))
+            {
+                return;
+            }
+
+            Job current = pawn.jobs?.curJob;
+            ourJob.TryGetValue(pawn, out Job mine);
+
+            if (current != null && current.playerForced && !ReferenceEquals(current, mine))
+            {
+                ClearSweeps(pawn, $"the player gave this pawn a different order (now on {DescribeJob(current)} from {DescribeJobSource(current)})");
+                lastReportedForeignJob.Remove(pawn);
+                return;
+            }
+
+            // A need pause, a workstation retry and an area retry all mean
+            // vanilla is meant to be driving for now - not a takeover, and
+            // already covered above if it turns out to be one. Scanner
+            // orders are left to TryScannerWatchdog: a scanner job's
+            // 1500-tick expiry swaps the Job object for an identical one
+            // without the pawn moving, and the reference comparison below
+            // would misread that as vanilla having taken over.
+            if (pausedForNeed.ContainsKey(pawn)
                 || workstationRetryAt.ContainsKey(pawn)
                 || areaRetryAt.ContainsKey(pawn)
                 || ScannerCompat.IsScannerWork(order.WorkGiverDef))
@@ -546,35 +765,31 @@ namespace DoNotBeLazy.Components
                 return;
             }
 
-            Job current = pawn.jobs?.curJob;
-            ourJob.TryGetValue(pawn, out Job mine);
             if (current != null && ReferenceEquals(current, mine))
             {
+                lastReportedForeignJob.Remove(pawn);
                 return;
             }
 
-            foreignJob.TryGetValue(pawn, out ForeignJobInfo seen);
-
-            // the same foreign job still running is the same disagreement,
-            // not a new one - one line, however long it lasts
-            if (seen.reports >= MaxForeignJobReports || (seen.job != null && ReferenceEquals(seen.job, current)))
+            // Vanilla driving the pawn on its own without an order behind
+            // it - see the cases named above. Reported, not ended, same as
+            // before this fix. One line per distinct foreign job, not one
+            // per 60-tick poll: the same job running on for minutes writes
+            // once.
+            lastReportedForeignJob.TryGetValue(pawn, out Job lastReported);
+            if (current != null && ReferenceEquals(current, lastReported))
             {
                 return;
             }
 
-            seen.job = current;
-            seen.reports++;
-            foreignJob[pawn] = seen;
-
+            lastReportedForeignJob[pawn] = current;
             string now = current == null
                 ? "has no job at all"
                 : $"is on {DescribeJob(current)} from {DescribeJobSource(current)}";
-
             Logger.Message($"{pawn.LabelShort}: we still hold the {order.WorkGiverDef.defName} order"
                 + (order.WorkstationTarget != null ? $" at {order.WorkstationTarget.LabelShort}" : "")
                 + $", but the pawn {now}"
-                + (mine == null ? " - we have given it no job yet" : $" - the last job we gave was {DescribeJob(mine)}")
-                + $" (report {seen.reports} of {MaxForeignJobReports} for this order)");
+                + (mine == null ? " - we have given it no job yet" : $" - the last job we gave was {DescribeJob(mine)}"));
         }
 
         // A job end was thrown away because this pawn's own assignment
@@ -884,7 +1099,7 @@ namespace DoNotBeLazy.Components
             areaRetryAt.Remove(pawn);
             areaRetries.Remove(pawn);
             ourJob.Remove(pawn);
-            foreignJob.Remove(pawn);
+            lastReportedForeignJob.Remove(pawn);
             discardedEnds.Remove(pawn);
             retargets.Remove(pawn);
         }
@@ -1118,26 +1333,231 @@ namespace DoNotBeLazy.Components
                 return;
             }
 
+            int startTick = Find.TickManager.TicksGame;
             pausedForNeed[pawn] = new PauseInfo
             {
-                tick = Find.TickManager.TicksGame,
-                need = need
+                tick = startTick,
+                need = need,
+                lastForceCheckTick = startTick
             };
 
-            if (!endCurrentJob || pawn.jobs?.curJob == null)
+            if (endCurrentJob && pawn.jobs?.curJob != null)
+            {
+                BeginAssigningJob(pawn);
+                try
+                {
+                    pawn.jobs.EndCurrentJob(JobCondition.InterruptForced);
+                }
+                finally
+                {
+                    EndAssigningJob(pawn);
+                }
+            }
+
+            // Section 21 go-eat backstop, revised same day it was ordered:
+            // "If a pawn pauses for food and doesn't eat, that is a
+            // different problem. it should be sent for food as soon as it
+            // pauses." No more waiting on NeedMonitor's poll - act here,
+            // synchronously, the instant the pause is recorded.
+            if (need != null && need.StartsWith("Food"))
+            {
+                TryForceEatNow(pawn);
+            }
+        }
+
+        // Section 21. Skips a pawn already on an Ingest job - EndCurrentJob
+        // just above can itself hand the pawn a new job synchronously
+        // (vanilla's think tree runs before EndCurrentJob returns), and if
+        // that job is already Ingest, vanilla is already feeding this pawn
+        // and there is nothing to override. Otherwise picks the
+        // highest-mood food this pawn may eat (NeedMonitor.TryFindBestFoodJob)
+        // and forces it - "best mood buff to lowest", the verbatim ask.
+        private void TryForceEatNow(Pawn pawn)
+        {
+            Job curJob = pawn.jobs?.curJob;
+            if (curJob != null && curJob.def == JobDefOf.Ingest)
             {
                 return;
             }
 
-            BeginAssigningJob(pawn);
-            try
+            Job job = NeedMonitor.TryFindBestFoodJob(pawn, out int candidateCount, out float moodEffect, out string declineReason);
+            if (job == null)
             {
-                pawn.jobs.EndCurrentJob(JobCondition.InterruptForced);
+                Logger.Warning($"{pawn.LabelShort}: paused for Food but no food could be forced - {declineReason} ({candidateCount} candidates considered)");
+                return;
             }
-            finally
+
+            // Recorded before GiveJob, same order every other call site
+            // uses. Review finding 2026-09-27: GiveJob's TryTakeOrderedJob
+            // always sets Job.playerForced, so without this,
+            // TryReportForeignJob's periodic poll (its player-order check
+            // runs BEFORE the pausedForNeed skip) reads a forced meal it
+            // does not recognise as "ours" and ends the whole sweep with
+            // "the player gave this pawn a different order."
+            ourJob[pawn] = job;
+            GiveJob(pawn, job);
+            Thing food = job.targetA.Thing;
+            Logger.Message($"{pawn.LabelShort}: forced to eat {food?.LabelShort ?? job.def.defName} (mood effect {moodEffect:F0}, {candidateCount} candidate{(candidateCount == 1 ? "" : "s")} considered) - sweep stays paused until Food is satisfied");
+        }
+
+        // Section 21, diagnostic only - not a retry. TryForceEatNow above
+        // already tried once, synchronously, the moment the pause began. If
+        // the pawn is still paused for Food and still not on an Ingest job
+        // FoodStuckWarnTicks later, the forced job never took hold (or
+        // something else replaced it) - worth one line, not another forced
+        // job every check, which is the retry loop the ask explicitly ruled
+        // out. Called from NeedMonitor.GameComponentTick alongside
+        // TryForceRestIfStuck.
+        private const int FoodStuckWarnTicks = 2500; // one in-game hour - same round number as ForceRestRetryTicks
+
+        public void WarnIfFoodStuck(Pawn pawn)
+        {
+            if (!pausedForNeed.TryGetValue(pawn, out PauseInfo paused)
+                || !paused.need.StartsWith("Food")
+                || paused.foodStuckWarned)
             {
-                EndAssigningJob(pawn);
+                return;
             }
+
+            if (Find.TickManager.TicksGame - paused.tick < FoodStuckWarnTicks)
+            {
+                return;
+            }
+
+            Job curJob = pawn.jobs?.curJob;
+            if (curJob != null && curJob.def == JobDefOf.Ingest)
+            {
+                return;
+            }
+
+            paused.foodStuckWarned = true;
+            pausedForNeed[pawn] = paused;
+            Logger.Warning($"{pawn.LabelShort}: still paused for {paused.need} and not eating {FoodStuckWarnTicks} ticks after the pause began - the forced Ingest job did not take, or something replaced it");
+        }
+
+        // Found live 2026-09-26/27: a pawn paused by PauseForNeed for Rest
+        // does not always get sent to bed once we let go, and nothing here
+        // was retrying - Lady stood on Wait_MaintainPosture for about 19
+        // minutes (22:41:14 to 23:00:38) after a Rest pause, where two
+        // earlier Rest pauses the same session had resolved themselves in
+        // under 4 and about 18 minutes. Decompiled RimWorld.JobGiver_GetRest
+        // (Assembly-CSharp.dll via ilspycmd): its GetPriority returns 0
+        // whenever the pawn's current TimeAssignment is Work, no matter how
+        // low Rest actually is - only Sleep, or Anything/Joy/Meditate below
+        // their own curLevel cutoffs, ever let it fire. That check has
+        // nothing to do with how depleted the need is, and it sits entirely
+        // in GetPriority - TryGiveJob itself has no timetable check at all.
+        // So PauseForNeed correctly hands the pawn back to vanilla
+        // (verified against EndCurrentJob/TryFindAndStartJob: no leftover
+        // job, queue or assignment lock), but vanilla can decline to act on
+        // it for as long as the schedule says Work, and the pawn just sits
+        // on whatever JobGiver_Idle keeps re-issuing.
+        //
+        // Called by NeedMonitor every CheckIntervalTicks for a pawn already
+        // paused, instead of skipping it outright. Bypasses GetPriority's
+        // schedule gate by asking RestUtility for a bed directly - the same
+        // call JobGiver_GetRest itself makes once its priority clears - and
+        // issuing LayDown by hand if one exists. restThreshold already
+        // exists specifically because a forced job overrides the schedule
+        // once; this is the same override applied a second time, on the
+        // vanilla side, once ours has already let go.
+        // Ground-sleeping is deliberately NOT replicated here -
+        // TryFindGroundSleepSpotFor is private and this is a bed-first
+        // safety net, not a full reimplementation; a pawn with no bed still
+        // gets vanilla's own normal retries.
+        //
+        // Review finding 2026-09-27, fixed same day: the first cut acted on
+        // ANY current job every 60 ticks, which would have interrupted
+        // eating, firefighting, being doctored, another mod's own sleep job
+        // (Use Bedrolls), or an order the player gave by hand - breaking
+        // section 16 ("his own orders always interrupt") and fighting
+        // vanilla's own higher-priority needs. Two gates added: only acts
+        // when the pawn is genuinely idle (no job, or one of the
+        // JobDefOf.Wait*/GotoWander shapes JobSourcePatch already treats as
+        // idle - verified against Assembly-CSharp.dll that these are the
+        // real JobDefOf names) and not player-forced; and only retries at
+        // most once per ForceRestRetryTicks, so a bed search no longer runs
+        // every single check while paused.
+        private const int ForceRestRetryTicks = 2500; // one in-game hour
+
+        private static readonly HashSet<JobDef> IdleJobDefs = new HashSet<JobDef>
+        {
+            JobDefOf.Wait,
+            JobDefOf.Wait_MaintainPosture,
+            JobDefOf.Wait_Wander,
+            JobDefOf.GotoWander
+        };
+
+        public bool TryForceRestIfStuck(Pawn pawn)
+        {
+            if (!pausedForNeed.TryGetValue(pawn, out PauseInfo paused) || !paused.need.StartsWith("Rest"))
+            {
+                return false;
+            }
+
+            // Only act on a genuinely idle pawn - never a job the player
+            // gave by hand (section 16), never anything else vanilla or
+            // another mod is already running for it (eating, doctoring,
+            // firefighting, Use Bedrolls' own sleep job).
+            Job curJob = pawn.jobs?.curJob;
+            bool idle = curJob == null || (IdleJobDefs.Contains(curJob.def) && !curJob.playerForced);
+            if (!idle)
+            {
+                return false;
+            }
+
+            int now = Find.TickManager.TicksGame;
+            if (now - paused.lastForceCheckTick < ForceRestRetryTicks)
+            {
+                return false;
+            }
+
+            paused.lastForceCheckTick = now;
+            pausedForNeed[pawn] = paused;
+
+            if (pawn.needs?.rest == null || RestUtility.DisturbancePreventsLyingDown(pawn))
+            {
+                return false;
+            }
+
+            Lord lord = pawn.GetLord();
+            if (lord != null && lord.CurLordToil != null && !lord.CurLordToil.AllowRestingInBed)
+            {
+                return false;
+            }
+
+            if (pawn.IsWildMan() || (pawn.InMentalState && !pawn.MentalState.AllowRestingInBed))
+            {
+                return false;
+            }
+
+            if (pawn.roping != null && pawn.roping.IsRoped)
+            {
+                return false;
+            }
+
+            Building_Bed bed = RestUtility.FindBedFor(pawn);
+            if (bed == null)
+            {
+                if (!paused.declineLogged)
+                {
+                    paused.declineLogged = true;
+                    pausedForNeed[pawn] = paused;
+                    Logger.Message($"{pawn.LabelShort}: still idle and paused for {paused.need} but no bed available - leaving vanilla to keep trying");
+                }
+                return false;
+            }
+
+            // Recorded before GiveJob - same fault as TryForceEatNow, found
+            // in review 2026-09-27: GiveJob's TryTakeOrderedJob always sets
+            // Job.playerForced, so without this, TryReportForeignJob's
+            // periodic poll reads the forced LayDown as a foreign order and
+            // ends the sweep.
+            Job layDown = JobMaker.MakeJob(JobDefOf.LayDown, bed);
+            ourJob[pawn] = layDown;
+            GiveJob(pawn, layDown);
+            Logger.Message($"{pawn.LabelShort}: still paused for {paused.need} with no rest job from vanilla - forced LayDown at {bed.LabelShort}");
+            return true;
         }
 
         // Entry point from FloatMenuPatch. eligible pawns only - caller has
@@ -1271,7 +1691,26 @@ namespace DoNotBeLazy.Components
             // own raw job instead.
             if (!JobDriver_StuffAndHaul.CanPickUpAtLeastOne(pawn, primary))
             {
-                Logger.Message($"BeginSweep {workGiverDef.defName} at {persistentTarget.LabelShort}: {primary.LabelCap} would overencumber {pawn.LabelShort} before even one unit, stuffing skipped for this trip");
+                // Throttled 2026-09-24 (dnbl-architecture.md section 18) -
+                // same per-evaluation spam as the other two substitution
+                // points' overencumber line.
+                JobDriver_StuffAndHaul.LogOverencumberSkipThrottled(pawn, primary,
+                    $"BeginSweep {workGiverDef.defName} at {persistentTarget.LabelShort}: {primary.LabelCap} would overencumber {pawn.LabelShort} before even one unit, stuffing skipped for this trip");
+                return rawJob;
+            }
+
+            // Fixed 2026-09-24, dnbl-architecture.md section 18 (defect 2 of
+            // two, shared with HaulInterceptPatch and
+            // TransporterInterceptPatch). Without this, a stuffing job built
+            // for an item another pawn already holds fails its own
+            // TryMakePreToilReservations the instant it starts, and the job
+            // giver rebuilds this exact job every call until the item frees
+            // up. Leave the vehicle's own raw job in place instead, same idea
+            // as CanPickUpAtLeastOne above.
+            if (!JobDriver_StuffAndHaul.CanReserveItem(pawn, primary))
+            {
+                JobDriver_StuffAndHaul.LogReserveSkipThrottled(pawn, primary,
+                    $"BeginSweep {workGiverDef.defName} at {persistentTarget.LabelShort}: {primary.LabelCap} is already reserved, stuffing skipped for this trip");
                 return rawJob;
             }
 
@@ -1310,60 +1749,71 @@ namespace DoNotBeLazy.Components
 
             foreach (Pawn pawn in eligiblePawns)
             {
-                // Asked one pawn at a time, and the order matters: each
-                // GiveJob below puts a job in flight that the NEXT
-                // JobOnThing call can see, through
-                // TransferableCountHauledByOthersForPacking. So a pawn who
-                // gets null here is usually being told the cargo is already
-                // spoken for, which is the right answer rather than a
-                // failure - they simply do not join.
-                //
-                // Every pawn answers for itself, so this already keeps the
-                // pawns who can and drops the ones who cannot - checked
-                // 2026-09-13 against that rule, architecture doc section 9.
-                Job job = WrapForVehicleStuffing(pawn, scanner.JobOnThing(pawn, target, true), workGiverDef, target);
-                if (job == null)
+                // Wrapped per-pawn 2026-09-27 per user order: "Don't end all
+                // pawn's activities because one pawn stopped." An exception
+                // asking this pawn's own answer must not stop the rest of the
+                // group from being asked - see GroupOrderPawnExceptionCaught.
+                try
                 {
-                    Logger.Message($"BeginSweep {workGiverDef.defName}: no job on {target.LabelShort} for {pawn.LabelShort}, not joining");
-                    continue;
-                }
+                    // Asked one pawn at a time, and the order matters: each
+                    // GiveJob below puts a job in flight that the NEXT
+                    // JobOnThing call can see, through
+                    // TransferableCountHauledByOthersForPacking. So a pawn who
+                    // gets null here is usually being told the cargo is already
+                    // spoken for, which is the right answer rather than a
+                    // failure - they simply do not join.
+                    //
+                    // Every pawn answers for itself, so this already keeps the
+                    // pawns who can and drops the ones who cannot - checked
+                    // 2026-09-13 against that rule, architecture doc section 9.
+                    Job job = WrapForVehicleStuffing(pawn, scanner.JobOnThing(pawn, target, true), workGiverDef, target);
+                    if (job == null)
+                    {
+                        Logger.Message($"BeginSweep {workGiverDef.defName}: no job on {target.LabelShort} for {pawn.LabelShort}, not joining");
+                        continue;
+                    }
 
-                // A pawn already on an order is not handed this job: the
-                // order goes on its queue, and it is asked again when its
-                // turn comes. Its answer here could not see the jobs of the
-                // pawns starting in this same loop, which costs nothing for
-                // that reason. Section 12, decision 7. Unless queueOrder is
-                // false, in which case this pawn's active order is replaced
-                // instead - section 16.
-                if (!JoinOrQueue(pawn, order, queueOrder, out int ahead, out bool appendBehindCurrentJob))
+                    // A pawn already on an order is not handed this job: the
+                    // order goes on its queue, and it is asked again when its
+                    // turn comes. Its answer here could not see the jobs of the
+                    // pawns starting in this same loop, which costs nothing for
+                    // that reason. Section 12, decision 7. Unless queueOrder is
+                    // false, in which case this pawn's active order is replaced
+                    // instead - section 16.
+                    if (!JoinOrQueue(pawn, order, queueOrder, out int ahead, out bool appendBehindCurrentJob))
+                    {
+                        if (ahead < 0)
+                        {
+                            duplicates++;
+                        }
+                        else
+                        {
+                            queued++;
+                            minAhead = Math.Min(minAhead, ahead);
+                            maxAhead = Math.Max(maxAhead, ahead);
+                        }
+                        continue;
+                    }
+
+                    // a fresh assignment always clears leftover pause and retry
+                    // state from a previous order
+                    pausedForNeed.Remove(pawn);
+                    workstationRetryAt.Remove(pawn);
+                    areaRetryAt.Remove(pawn);
+                    areaRetries.Remove(pawn);
+                    consecutiveFailures.Remove(pawn);
+                    activeSweeps[pawn] = order;
+                    joined++;
+
+                    Logger.Message($"BeginSweep {workGiverDef.defName} at {target.LabelShort}: {pawn.LabelShort} joined, first job {DescribeJob(job)}"
+                        + (appendBehindCurrentJob ? $" - queued behind {pawn.LabelShort}'s current job, not interrupting it" : ""));
+                    ourJob[pawn] = job;
+                    GiveJob(pawn, job, appendBehindCurrentJob);
+                }
+                catch (Exception ex)
                 {
-                    if (ahead < 0)
-                    {
-                        duplicates++;
-                    }
-                    else
-                    {
-                        queued++;
-                        minAhead = Math.Min(minAhead, ahead);
-                        maxAhead = Math.Max(maxAhead, ahead);
-                    }
-                    continue;
+                    GroupOrderPawnExceptionCaught(pawn, workGiverDef.defName, ex);
                 }
-
-                // a fresh assignment always clears leftover pause and retry
-                // state from a previous order
-                pausedForNeed.Remove(pawn);
-                workstationRetryAt.Remove(pawn);
-                areaRetryAt.Remove(pawn);
-                areaRetries.Remove(pawn);
-                consecutiveFailures.Remove(pawn);
-                activeSweeps[pawn] = order;
-                joined++;
-
-                Logger.Message($"BeginSweep {workGiverDef.defName} at {target.LabelShort}: {pawn.LabelShort} joined, first job {DescribeJob(job)}"
-                    + (appendBehindCurrentJob ? $" - queued behind {pawn.LabelShort}'s current job, not interrupting it" : ""));
-                ourJob[pawn] = job;
-                GiveJob(pawn, job, appendBehindCurrentJob);
             }
 
             if (joined == 0 && queued == 0 && duplicates == 0)
@@ -1397,65 +1847,78 @@ namespace DoNotBeLazy.Components
 
             foreach (Pawn pawn in ranked)
             {
-                Job job = scanner.JobOnThing(pawn, billGiver, true);
-                if (job == null)
+                // Wrapped per-pawn 2026-09-27 per user order: "Don't end all
+                // pawn's activities because one pawn stopped." The comment
+                // above already promises "one pawn's no never stops the next
+                // being asked" - an unhandled exception used to break that
+                // promise exactly like a bad answer would. See
+                // GroupOrderPawnExceptionCaught.
+                try
                 {
-                    Logger.Message($"BeginSweep {workGiverDef.defName}: no job on {billGiver.LabelShort} for {pawn.LabelShort}, trying next");
-                    continue;
-                }
+                    Job job = scanner.JobOnThing(pawn, billGiver, true);
+                    if (job == null)
+                    {
+                        Logger.Message($"BeginSweep {workGiverDef.defName}: no job on {billGiver.LabelShort} for {pawn.LabelShort}, trying next");
+                        continue;
+                    }
 
-                // empty pool - see SweepOrder comment. billGiver is the
-                // order: every job after this one comes from AssignNextTask
-                // re-asking this same station.
-                var order = new SweepOrder(workGiverDef, new List<LocalTargetInfo>(), billGiver);
+                    // empty pool - see SweepOrder comment. billGiver is the
+                    // order: every job after this one comes from AssignNextTask
+                    // re-asking this same station.
+                    var order = new SweepOrder(workGiverDef, new List<LocalTargetInfo>(), billGiver);
 
-                // The best-ranked pawn with a job takes the order even when
-                // it is busy: the order queues behind what it is doing,
-                // rather than falling to a lower-ranked idle pawn - that
-                // would change section 2's selection rule. Section 12,
-                // decision 7. The scan counter is read when a queued order
-                // starts, not here. Unless queueOrder is false, in which
-                // case this pawn's active order is replaced instead, and
-                // JoinOrQueue returns true so the join code below runs -
-                // section 16.
-                if (!JoinOrQueue(pawn, order, queueOrder, out int ahead, out bool appendBehindCurrentJob))
-                {
-                    Logger.Message(ahead < 0
-                        ? $"BeginSweep {workGiverDef.defName} at {billGiver.LabelShort}: {pawn.LabelShort} of {ranked.Count} ranked already has it"
-                        : $"BeginSweep {workGiverDef.defName} at {billGiver.LabelShort}: {pawn.LabelShort} of {ranked.Count} ranked, queued behind {ahead} order{(ahead == 1 ? "" : "s")}");
+                    // The best-ranked pawn with a job takes the order even when
+                    // it is busy: the order queues behind what it is doing,
+                    // rather than falling to a lower-ranked idle pawn - that
+                    // would change section 2's selection rule. Section 12,
+                    // decision 7. The scan counter is read when a queued order
+                    // starts, not here. Unless queueOrder is false, in which
+                    // case this pawn's active order is replaced instead, and
+                    // JoinOrQueue returns true so the join code below runs -
+                    // section 16.
+                    if (!JoinOrQueue(pawn, order, queueOrder, out int ahead, out bool appendBehindCurrentJob))
+                    {
+                        Logger.Message(ahead < 0
+                            ? $"BeginSweep {workGiverDef.defName} at {billGiver.LabelShort}: {pawn.LabelShort} of {ranked.Count} ranked already has it"
+                            : $"BeginSweep {workGiverDef.defName} at {billGiver.LabelShort}: {pawn.LabelShort} of {ranked.Count} ranked, queued behind {ahead} order{(ahead == 1 ? "" : "s")}");
+                        return;
+                    }
+
+                    // A fresh assignment always clears leftover pause and retry
+                    // state from a previous order
+                    pausedForNeed.Remove(pawn);
+                    workstationRetryAt.Remove(pawn);
+
+                    // Seed the scan high-water mark from wherever this station
+                    // already stands. Starting at zero would read the first
+                    // sample as a find on a scanner that has been worked before.
+                    CompScanner scannerComp = ScannerCompat.ScannerOn(billGiver);
+                    if (scannerComp != null)
+                    {
+                        order.MaxScanDays = 0f;
+                        ScannerCompat.FoundSomething(scannerComp, ref order.MaxScanDays);
+                    }
+
+                    activeSweeps[pawn] = order;
+
+                    // whole workstation path used to emit nothing at all - a
+                    // bill order's only trace was one "job ended" line with no
+                    // context, which is why the 08-22 log couldn't say whether
+                    // an order had even started. job.def matters here: DoBill
+                    // means the bill itself, anything else means the WorkGiver
+                    // wants a haul-off or a refuel first.
+                    Logger.Message($"BeginSweep {workGiverDef.defName} at {billGiver.LabelShort}: {pawn.LabelShort} of {ranked.Count} ranked, first job {DescribeJob(job)}"
+                        + (appendBehindCurrentJob ? $" - queued behind {pawn.LabelShort}'s current job, not interrupting it" : ""));
+                    areaRetryAt.Remove(pawn);
+                    areaRetries.Remove(pawn);
+                    ourJob[pawn] = job;
+                    GiveJob(pawn, job, appendBehindCurrentJob);
                     return;
                 }
-
-                // A fresh assignment always clears leftover pause and retry
-                // state from a previous order
-                pausedForNeed.Remove(pawn);
-                workstationRetryAt.Remove(pawn);
-
-                // Seed the scan high-water mark from wherever this station
-                // already stands. Starting at zero would read the first
-                // sample as a find on a scanner that has been worked before.
-                CompScanner scannerComp = ScannerCompat.ScannerOn(billGiver);
-                if (scannerComp != null)
+                catch (Exception ex)
                 {
-                    order.MaxScanDays = 0f;
-                    ScannerCompat.FoundSomething(scannerComp, ref order.MaxScanDays);
+                    GroupOrderPawnExceptionCaught(pawn, workGiverDef.defName, ex);
                 }
-
-                activeSweeps[pawn] = order;
-
-                // whole workstation path used to emit nothing at all - a
-                // bill order's only trace was one "job ended" line with no
-                // context, which is why the 08-22 log couldn't say whether
-                // an order had even started. job.def matters here: DoBill
-                // means the bill itself, anything else means the WorkGiver
-                // wants a haul-off or a refuel first.
-                Logger.Message($"BeginSweep {workGiverDef.defName} at {billGiver.LabelShort}: {pawn.LabelShort} of {ranked.Count} ranked, first job {DescribeJob(job)}"
-                    + (appendBehindCurrentJob ? $" - queued behind {pawn.LabelShort}'s current job, not interrupting it" : ""));
-                areaRetryAt.Remove(pawn);
-                areaRetries.Remove(pawn);
-                ourJob[pawn] = job;
-                GiveJob(pawn, job, appendBehindCurrentJob);
-                return;
             }
 
             Logger.Message($"BeginSweep {workGiverDef.defName}: no job on {billGiver.LabelShort} for any of {ranked.Count} pawns, no sweep started");
@@ -1575,65 +2038,77 @@ namespace DoNotBeLazy.Components
             // pool is left out of the order
             foreach (Pawn pawn in able)
             {
-                // Was an unconditional activeSweeps[pawn] = order, which is
-                // how a rice haul 148 targets strong was thrown away by a
-                // corn haul 13 seconds later on 2026-09-13. A pawn already on
-                // an order keeps it, and this one waits behind it if the
-                // player held shift - or the order is replaced, and its
-                // queue destroyed, if not (section 16, settled 2026-09-20).
-                if (!JoinOrQueue(pawn, order, queueOrder, out int ahead, out bool appendBehindCurrentJob))
+                // Wrapped per-pawn 2026-09-27 per user order: "Don't end all
+                // pawn's activities because one pawn stopped." This loop IS
+                // the group order - an unhandled exception for one pawn must
+                // not stop the rest of `able` from joining. See
+                // GroupOrderPawnExceptionCaught.
+                try
                 {
-                    if (ahead < 0)
+                    // Was an unconditional activeSweeps[pawn] = order, which is
+                    // how a rice haul 148 targets strong was thrown away by a
+                    // corn haul 13 seconds later on 2026-09-13. A pawn already on
+                    // an order keeps it, and this one waits behind it if the
+                    // player held shift - or the order is replaced, and its
+                    // queue destroyed, if not (section 16, settled 2026-09-20).
+                    if (!JoinOrQueue(pawn, order, queueOrder, out int ahead, out bool appendBehindCurrentJob))
                     {
-                        duplicates++;
+                        if (ahead < 0)
+                        {
+                            duplicates++;
+                        }
+                        else
+                        {
+                            queued++;
+                            minAhead = Math.Min(minAhead, ahead);
+                            maxAhead = Math.Max(maxAhead, ahead);
+                        }
+                        continue;
                     }
-                    else
+
+                    activeSweeps[pawn] = order;
+
+                    // A fresh order clears leftover retry state from the pawn's
+                    // previous one, as the other two entry points already did.
+                    // Without it a pawn still waiting on an old areaRetryAt had
+                    // the end of its first job on THIS order ignored by
+                    // Notify_JobEnded, and carried the old try count in. Rare
+                    // until 2026-09-13, when a pawn facing only reserved targets
+                    // started waiting too - architecture doc section 10. The
+                    // pause is not cleared here; the need check below decides it.
+                    workstationRetryAt.Remove(pawn);
+                    areaRetryAt.Remove(pawn);
+                    areaRetries.Remove(pawn);
+                    consecutiveFailures.Remove(pawn);
+
+                    // A pawn already under threshold JOINS the sweep but does not
+                    // start work - it is paused on the spot and picks the order
+                    // up when the need is dealt with. Added 2026-09-07.
+                    //
+                    // This loop used to clear the pause unconditionally and
+                    // assign immediately. Boom was paused on Rest 4% at 16:33,
+                    // recruited by the next * haul at 16:38, and paused again one
+                    // second later on Rest 1% - his rest fell while he hauled,
+                    // because a new order simply forgot he was resting. Session
+                    // total that day: 76 pauses against 30 resumes.
+                    string need = NeedMonitor.CriticalNeedLabelFor(pawn);
+                    if (need != null)
                     {
-                        queued++;
-                        minAhead = Math.Min(minAhead, ahead);
-                        maxAhead = Math.Max(maxAhead, ahead);
+                        // false: leave the pawn on whatever it is already doing.
+                        // See PauseForNeed for why ending it here froze pawns.
+                        PauseForNeed(pawn, need, false);
+                        Logger.Message($"{pawn.LabelShort} joined the sweep paused: {need} ({order.WorkGiverDef.defName}) - left on its current job");
+                        joinedPaused++;
+                        continue;
                     }
-                    continue;
+
+                    pausedForNeed.Remove(pawn);
+                    AssignNextTask(pawn, order, null, appendBehindCurrentJob);
                 }
-
-                activeSweeps[pawn] = order;
-
-                // A fresh order clears leftover retry state from the pawn's
-                // previous one, as the other two entry points already did.
-                // Without it a pawn still waiting on an old areaRetryAt had
-                // the end of its first job on THIS order ignored by
-                // Notify_JobEnded, and carried the old try count in. Rare
-                // until 2026-09-13, when a pawn facing only reserved targets
-                // started waiting too - architecture doc section 10. The
-                // pause is not cleared here; the need check below decides it.
-                workstationRetryAt.Remove(pawn);
-                areaRetryAt.Remove(pawn);
-                areaRetries.Remove(pawn);
-                consecutiveFailures.Remove(pawn);
-
-                // A pawn already under threshold JOINS the sweep but does not
-                // start work - it is paused on the spot and picks the order
-                // up when the need is dealt with. Added 2026-09-07.
-                //
-                // This loop used to clear the pause unconditionally and
-                // assign immediately. Boom was paused on Rest 4% at 16:33,
-                // recruited by the next * haul at 16:38, and paused again one
-                // second later on Rest 1% - his rest fell while he hauled,
-                // because a new order simply forgot he was resting. Session
-                // total that day: 76 pauses against 30 resumes.
-                string need = NeedMonitor.CriticalNeedLabelFor(pawn);
-                if (need != null)
+                catch (Exception ex)
                 {
-                    // false: leave the pawn on whatever it is already doing.
-                    // See PauseForNeed for why ending it here froze pawns.
-                    PauseForNeed(pawn, need, false);
-                    Logger.Message($"{pawn.LabelShort} joined the sweep paused: {need} ({order.WorkGiverDef.defName}) - left on its current job");
-                    joinedPaused++;
-                    continue;
+                    GroupOrderPawnExceptionCaught(pawn, workGiverDef.defName, ex);
                 }
-
-                pausedForNeed.Remove(pawn);
-                AssignNextTask(pawn, order, null, appendBehindCurrentJob);
             }
 
             // ONE line for the whole order when anybody queued it or already
@@ -1702,6 +2177,32 @@ namespace DoNotBeLazy.Components
         {
             if (!activeSweeps.TryGetValue(pawn, out SweepOrder order))
             {
+                return;
+            }
+
+            // The player's own orders always interrupt - section 16, settled
+            // 2026-09-19/20. Job.playerInterruptedForced is vanilla's own
+            // marker, written only by Pawn_JobTracker.TryTakeOrderedJob's
+            // replace-without-shift branch onto the OUTGOING job, so its
+            // being true here means a direct player order just took this
+            // pawn over - not a reservation steal, not our own hand-off (both
+            // of those never set it). Checked here, first, unconditionally,
+            // because every branch below this point can resume the sweep on
+            // its own reasoning and none of them looked at this flag:
+            // pausedForNeed resumes once needs are satisfied whatever job
+            // satisfied them, and a plain Succeeded hands out the next task
+            // whatever job succeeded. Fixed 2026-09-26 - a pawn already
+            // registered as paused for a need (or merely between two of our
+            // own hand-offs) whose player-forced order then ran to its own
+            // end reached one of those branches first and got resumed onto
+            // the very order the player had just taken it off of. The
+            // wording matches TargetFailureIsRecoverable's own
+            // InterruptForced case below, which this makes unreachable for
+            // playerInterruptedForced true - that case still exists for the
+            // condition itself to read correctly when this flag is false.
+            if (endedJob != null && endedJob.playerInterruptedForced)
+            {
+                ClearSweeps(pawn, $"the player gave this pawn a different order (ended {DescribeJob(endedJob)})");
                 return;
             }
 

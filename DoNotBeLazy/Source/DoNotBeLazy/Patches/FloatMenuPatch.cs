@@ -92,6 +92,30 @@ namespace DoNotBeLazy.Patches
         // explain a click; thirty would be a wall of grey nobody reads.
         private const int MaxFeedbackOptions = 3;
 
+        // Throttle for PawnExceptionCaught below - same shape as
+        // SweepManager's per-pawn throttles (MapComponentTickExceptionQuietTicks
+        // / GiveJobFailedQuietTicks). Added 2026-09-27 per user order: "yes,
+        // fix the right-click menu gap too" (architecture doc section 22).
+        // One right-click walks the same pawn through every eligible
+        // WorkGiverDef, so an unthrottled log here would repeat once per def
+        // rather than once per pawn per click. Internal, not private -
+        // VehicleMenuPatch's AnyoneCanAct shares the same gap and reuses this
+        // rather than keeping a second copy.
+        private const int PawnExceptionQuietTicks = 250;
+        private static readonly Dictionary<Pawn, int> pawnExceptionLogExpiry = new Dictionary<Pawn, int>();
+
+        internal static void PawnExceptionCaught(Pawn pawn, string where, Exception ex)
+        {
+            int now = Find.TickManager.TicksGame;
+            if (pawnExceptionLogExpiry.TryGetValue(pawn, out int expiry) && now < expiry)
+            {
+                return;
+            }
+
+            pawnExceptionLogExpiry[pawn] = now + PawnExceptionQuietTicks;
+            Logger.Warning($"{pawn.LabelShort}: exception in {where} while building the float menu - {pawn.LabelShort} excluded from this option, rest of the group still considered: {ex}");
+        }
+
         // 1 pawn selected
         [HarmonyPatch(typeof(FloatMenuMakerMap), nameof(FloatMenuMakerMap.ChoicesAtFor))]
         public static class SingleSelect
@@ -334,22 +358,18 @@ namespace DoNotBeLazy.Patches
                 // PlantsCut is "cut plants" AND "chop wood" - and def.label
                 // can only ever say one of them. Ask the clicked thing what
                 // was actually ordered; PlantCompat returns null for
-                // everything else, which is every other work type.
-                string label = PlantCompat.LabelFor(target.Thing)
-                    ?? (def.label.NullOrEmpty() ? def.defName : def.label.CapitalizeFirst());
-
-                // "until done" is wrong for a scanner and would be read as
-                // "until the scan bar fills" - there is no bar. The order
-                // ends on a find, so the option says which ending it means.
-                string ending = ScannerCompat.IsScannerWork(def)
-                    ? " until it finds something"
-                    : " until done";
+                // everything else, which is every other work type. This is
+                // also the text CompDnblCargo.CompInspectStringExtra shows a
+                // paused pawn ("Returns to: ...") - DescribeSweepOrder is the
+                // one place this wording is built, so the two never drift.
+                string orderKind = PlantCompat.LabelFor(target.Thing);
+                string label = DescribeSweepOrder(def, orderKind);
 
                 WorkGiverDef capturedDef = def;
                 LocalTargetInfo capturedTarget = target;
                 Map capturedMap = map;
                 options.Add(new FloatMenuOption(
-                    "* " + label + ending,
+                    "* " + label,
                     () =>
                     {
                         SweepManager mgr = capturedMap.GetComponent<SweepManager>();
@@ -436,11 +456,24 @@ namespace DoNotBeLazy.Patches
                     continue;
                 }
 
-                // Danger.Deadly to match vanilla's goto check - a manual move
-                // order is allowed to walk somewhere dangerous
-                if (p.CanReach(cell, PathEndMode.OnCell, Danger.Deadly))
+                // Wrapped 2026-09-27 - same gap as EligiblePawns etc.
+                // (architecture doc section 22): CanReach is a real
+                // pathfinding call and can throw on a bad map/mod
+                // interaction, same risk class as the four named loops. On
+                // exception this pawn just doesn't get a move order; the
+                // rest of the group still does.
+                try
                 {
-                    movers.Add(p);
+                    // Danger.Deadly to match vanilla's goto check - a manual
+                    // move order is allowed to walk somewhere dangerous
+                    if (p.CanReach(cell, PathEndMode.OnCell, Danger.Deadly))
+                    {
+                        movers.Add(p);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    PawnExceptionCaught(p, "MoveHereOption", ex);
                 }
             }
 
@@ -455,11 +488,47 @@ namespace DoNotBeLazy.Patches
                 {
                     foreach (Pawn p in movers)
                     {
-                        IntVec3 dest = RCellFinder.BestOrderedGotoDestNear(cell, p, null);
-                        FloatMenuMakerMap.PawnGotoAction(cell, p, dest);
+                        // Wrapped 2026-09-27, same order and same gap as
+                        // ConsumeAll (architecture doc section 22): an
+                        // unhandled exception issuing one mover's goto used
+                        // to abort the rest of the group's move order too.
+                        // Not throttled - fires at most once per pawn per
+                        // click, same as ConsumeAll's guard.
+                        try
+                        {
+                            IntVec3 dest = RCellFinder.BestOrderedGotoDestNear(cell, p, null);
+                            FloatMenuMakerMap.PawnGotoAction(cell, p, dest);
+                        }
+                        catch (Exception ex)
+                        {
+                            Logger.Warning($"{p.LabelShort}: exception issuing the move-here order - {p.LabelShort} skipped, rest of the group still tried: {ex}");
+                        }
                     }
                 },
                 MenuOptionPriority.GoHere);
+        }
+
+        // The words the player sees for a sweep: "Cook simple meals until
+        // done", "Chop wood until done", "Operate the scanner until it
+        // finds something". orderKind is SweepOrder.OrderKind (null for
+        // everything but a PlantCompat order) - the same value stored on
+        // the order at BeginAreaSweep, so calling this again later with
+        // order.OrderKind reproduces the exact text the menu entry showed.
+        // Section 20: also used for the "Returns to:" inspect line on a
+        // paused pawn, added 2026-09-27, so that line can never say
+        // something the menu itself didn't offer.
+        public static string DescribeSweepOrder(WorkGiverDef def, string orderKind)
+        {
+            string label = orderKind ?? (def.label.NullOrEmpty() ? def.defName : def.label.CapitalizeFirst());
+
+            // "until done" is wrong for a scanner and would be read as
+            // "until the scan bar fills" - there is no bar. The order
+            // ends on a find, so the option says which ending it means.
+            string ending = ScannerCompat.IsScannerWork(def)
+                ? " until it finds something"
+                : " until done";
+
+            return label + ending;
         }
 
         // Greyed-out entry explaining why a sweep isn't on offer. Vanilla
@@ -525,7 +594,22 @@ namespace DoNotBeLazy.Patches
                     continue;
                 }
 
-                string refusal = ConsumeRefusalReason(pawn, ingestible);
+                // Wrapped 2026-09-27, same order and same gap as
+                // EligiblePawns above (architecture doc section 22). On
+                // exception this pawn is left out of both the "can eat" list
+                // and the refusal tally - the rest of the group is still
+                // tallied and the Consume option still offered to them.
+                string refusal;
+                try
+                {
+                    refusal = ConsumeRefusalReason(pawn, ingestible);
+                }
+                catch (Exception ex)
+                {
+                    PawnExceptionCaught(pawn, "AddConsumeOption", ex);
+                    continue;
+                }
+
                 if (refusal == null)
                 {
                     canEat.Add(pawn);
@@ -683,10 +767,23 @@ namespace DoNotBeLazy.Patches
                     break;
                 }
 
-                float nutrition = thing.GetStatValue(StatDefOf.Nutrition);
-                Job job = JobMaker.MakeJob(JobDefOf.Ingest, thing);
-                job.count = Mathf.Clamp(FoodUtility.WillIngestStackCountOf(pawn, thing.def, nutrition), 1, thing.stackCount);
-                pawn.jobs.TryTakeOrderedJob(job, JobTag.Misc);
+                // Wrapped per-pawn 2026-09-27 per user order: "Don't end all
+                // pawn's activities because one pawn stopped." TryTakeOrderedJob
+                // can throw (SweepManager.GiveJob exists to catch the same
+                // call reentrantly) - unguarded here, one pawn's exception
+                // used to stop the rest of the group from being handed the
+                // consume job too.
+                try
+                {
+                    float nutrition = thing.GetStatValue(StatDefOf.Nutrition);
+                    Job job = JobMaker.MakeJob(JobDefOf.Ingest, thing);
+                    job.count = Mathf.Clamp(FoodUtility.WillIngestStackCountOf(pawn, thing.def, nutrition), 1, thing.stackCount);
+                    pawn.jobs.TryTakeOrderedJob(job, JobTag.Misc);
+                }
+                catch (Exception ex)
+                {
+                    Logger.Warning($"{pawn.LabelShort}: exception starting the consume job on {thing.LabelShort} - {pawn.LabelShort} skipped, rest of the group still tried: {ex}");
+                }
             }
         }
 
@@ -1059,8 +1156,25 @@ namespace DoNotBeLazy.Patches
                     continue;
                 }
 
+                // Wrapped 2026-09-27, same order and same gap as
+                // EligiblePawns above (architecture doc section 22). A pawn
+                // this throws for is left out of the verdict entirely -
+                // neither counted toward "any" nor allowed to force a false
+                // return - rather than losing the answer for the whole
+                // group.
+                bool hopeless;
+                try
+                {
+                    hopeless = PawnValidator.Hopeless(pawn, def);
+                }
+                catch (Exception ex)
+                {
+                    PawnExceptionCaught(pawn, "AllHopeless/" + def.defName, ex);
+                    continue;
+                }
+
                 any = true;
-                if (!PawnValidator.Hopeless(pawn, def))
+                if (!hopeless)
                 {
                     return false;
                 }
@@ -1110,7 +1224,22 @@ namespace DoNotBeLazy.Patches
                     continue;
                 }
 
-                string reason = PawnValidator.RefusalReason(pawn, def);
+                // Wrapped 2026-09-27, same order and same gap as
+                // EligiblePawns above (architecture doc section 22). On
+                // exception this pawn is skipped - it does not get to
+                // explain the refusal, but the search for one who can still
+                // continues over the rest of the group.
+                string reason;
+                try
+                {
+                    reason = PawnValidator.RefusalReason(pawn, def);
+                }
+                catch (Exception ex)
+                {
+                    PawnExceptionCaught(pawn, "FirstRefusal/" + def.defName, ex);
+                    continue;
+                }
+
                 if (reason != null)
                 {
                     who = pawn;
@@ -1132,9 +1261,26 @@ namespace DoNotBeLazy.Patches
                 {
                     continue;
                 }
-                if (PawnValidator.CanSweep(pawn, def))
+
+                // Wrapped 2026-09-27 per user order: "yes, fix the
+                // right-click menu gap too" (architecture doc section 22).
+                // CanSweep used to be able to throw straight out of this
+                // loop and take the WHOLE menu build down with it (Build is
+                // caught only once, at the top) - one pawn's bad state was
+                // dropping every * option for the whole selection, the exact
+                // thing the group rule forbids. On exception this pawn is
+                // treated as not eligible; the rest of the group is still
+                // checked.
+                try
                 {
-                    result.Add(pawn);
+                    if (PawnValidator.CanSweep(pawn, def))
+                    {
+                        result.Add(pawn);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    PawnExceptionCaught(pawn, "EligiblePawns/" + def.defName, ex);
                 }
             }
             return result;
