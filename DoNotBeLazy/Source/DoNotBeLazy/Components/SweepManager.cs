@@ -274,6 +274,10 @@ namespace DoNotBeLazy.Components
             // Change C: the last reason TryForceJoyIfStuck declined, so each
             // distinct reason is written once per pause.
             public string joyDeclineReason;
+
+            // Change D: the last reason TryForceRestIfStuck returned at a
+            // silent gate, written once per distinct reason per pause.
+            public string restDeclineReason;
         }
 
         private readonly Dictionary<Pawn, PauseInfo> pausedForNeed = new Dictionary<Pawn, PauseInfo>();
@@ -614,6 +618,13 @@ namespace DoNotBeLazy.Components
 
         private static readonly Dictionary<Pawn, string> orderIds = new Dictionary<Pawn, string>();
         private static readonly HashSet<Pawn> orderStarted = new HashSet<Pawn>();
+
+        // The pawn's current sweep order id, or "DNBL-?" when it has none
+        // (a pause with no sweep behind it should not happen).
+        private static string OrderIdFor(Pawn pawn)
+        {
+            return orderIds.TryGetValue(pawn, out string id) ? id : "DNBL-?";
+        }
 
         public static string NextOrderId()
         {
@@ -1562,6 +1573,12 @@ namespace DoNotBeLazy.Components
                 lastForceCheckTick = startTick
             };
 
+            // Change D, 2026-10-02: the need pause as an ORDER event on the
+            // pawn's sweep order id, so an order that joined paused does not
+            // read as lost. endCurrentJob false is the join-paused path; true
+            // is NeedMonitor pausing a pawn mid-sweep. Logging only.
+            Logger.Order($"ORDER {OrderIdFor(pawn)} paused: {pawn.LabelShort} ({need}, {(endCurrentJob ? "paused mid-sweep" : "joined paused")})");
+
             if (endCurrentJob && pawn.jobs?.curJob != null)
             {
                 BeginAssigningJob(pawn);
@@ -1715,10 +1732,12 @@ namespace DoNotBeLazy.Components
             if (NeedMonitor.FoodSatisfied(pawn))
             {
                 Logger.Warning($"{pawn.LabelShort}: paused {FoodStuckWarnTicks} ticks after a Food pause began, but Food is now satisfied ({NeedMonitor.LevelsText(pawn)}) - the pause is held by: {held}");
+                ScreenNote(pawn, $"{pawn.LabelShort}: paused a long time - Food is fine, still held by: {held}");
             }
             else
             {
                 Logger.Warning($"{pawn.LabelShort}: still paused and not eating {FoodStuckWarnTicks} ticks after the pause began - the forced Ingest job did not take, or something replaced it. Now: {NeedMonitor.LevelsText(pawn)}; still under threshold: {held}");
+                ScreenNote(pawn, $"{pawn.LabelShort}: paused a long time and not eating - still under: {held}");
             }
         }
 
@@ -1834,6 +1853,7 @@ namespace DoNotBeLazy.Components
             paused.earlyReturnReason = reason;
             pausedForNeed[pawn] = paused;
             Logger.Message($"{pawn.LabelShort}: no forced-meal retry while paused for Food - pawn is {reason}");
+            ScreenNote(pawn, $"{pawn.LabelShort}: not sent to eat - {reason}");
         }
 
         // Found live 2026-09-26/27: a pawn paused by PauseForNeed for Rest
@@ -1924,8 +1944,27 @@ namespace DoNotBeLazy.Components
                 return false;
             }
 
-            if (!NeedMonitor.FoodSatisfied(pawn) || !NeedMonitor.RestSatisfied(pawn) || NeedMonitor.JoySatisfied(pawn))
+            if (NeedMonitor.JoySatisfied(pawn))
             {
+                return false;
+            }
+
+            // Recreation is the low one but something else comes first.
+            // Logged (change D) once per distinct reason per pause; the
+            // behaviour is the same as before - nothing is sent.
+            if (!NeedMonitor.FoodSatisfied(pawn) || !NeedMonitor.RestSatisfied(pawn))
+            {
+                string firstWhy = !NeedMonitor.FoodSatisfied(pawn)
+                    ? "Recreation is low but Food is not satisfied yet - feeding comes first"
+                    : "Recreation is low but Rest is not satisfied yet - resting comes first";
+                if (paused.joyDeclineReason != firstWhy)
+                {
+                    paused.joyDeclineReason = firstWhy;
+                    pausedForNeed[pawn] = paused;
+                    Logger.Message($"{pawn.LabelShort}: no recreation job sent - {firstWhy} ({NeedMonitor.LevelsText(pawn)})");
+                    ScreenNote(pawn, $"{pawn.LabelShort}: not sent to recreation - {firstWhy}");
+                }
+
                 return false;
             }
 
@@ -1984,6 +2023,7 @@ namespace DoNotBeLazy.Components
                     paused.joyDeclineReason = decline;
                     pausedForNeed[pawn] = paused;
                     Logger.Message($"{pawn.LabelShort}: paused and held by Recreation, but no recreation job sent - {decline}");
+                    ScreenNote(pawn, $"{pawn.LabelShort}: not sent to recreation - {decline}");
                 }
 
                 return false;
@@ -1994,6 +2034,32 @@ namespace DoNotBeLazy.Components
             GiveJob(pawn, joyJob, false, "forced recreation");
             Logger.Message($"{pawn.LabelShort}: paused and held by Recreation with nothing from vanilla - sent to {joyJob.def.defName} ({NeedMonitor.LevelsText(pawn)})");
             return true;
+        }
+
+        // Change E, 2026-10-02 ("make the mod print that error to screen"):
+        // the same text as the log line, short, on RimWorld's message feed
+        // with the pawn as the look target so a click jumps to it. Verified
+        // by reflection: Verse.Messages.Message(string, LookTargets,
+        // MessageTypeDef, bool historical); a Pawn converts to LookTargets
+        // (NameAndSkip in LoopGizmoPatch already passes one). Always called
+        // beside a log line that is itself throttled to once per distinct
+        // reason per pause, so the screen is not spammed. The log line stays.
+        private static void ScreenNote(Pawn pawn, string text)
+        {
+            Messages.Message(text, pawn, MessageTypeDefOf.CautionInput, false);
+        }
+
+        private void LogRestSkipped(Pawn pawn, string reason, string shortReason = null)
+        {
+            if (!pausedForNeed.TryGetValue(pawn, out PauseInfo paused) || paused.restDeclineReason == reason)
+            {
+                return;
+            }
+
+            paused.restDeclineReason = reason;
+            pausedForNeed[pawn] = paused;
+            Logger.Message($"{pawn.LabelShort}: no forced rest while paused - pawn is {reason} ({NeedMonitor.LevelsText(pawn)})");
+            ScreenNote(pawn, $"{pawn.LabelShort}: not sent to bed - {shortReason ?? reason}");
         }
 
         public bool TryForceRestIfStuck(Pawn pawn)
@@ -2051,24 +2117,38 @@ namespace DoNotBeLazy.Components
             paused.lastForceCheckTick = now;
             pausedForNeed[pawn] = paused;
 
-            if (pawn.needs?.rest == null || RestUtility.DisturbancePreventsLyingDown(pawn))
+            // Change D, 2026-10-02: each of these returns used to be silent
+            // (koala, Rest 7%, a fire sweep: attempted at 22:27:38 and left
+            // no reason). Same once-per-distinct-reason-per-pause pattern as
+            // LogEatRetrySkipped. Behaviour is unchanged.
+            if (pawn.needs?.rest == null)
             {
+                LogRestSkipped(pawn, "has no rest need");
+                return false;
+            }
+
+            if (RestUtility.DisturbancePreventsLyingDown(pawn))
+            {
+                LogRestSkipped(pawn, "RestUtility.DisturbancePreventsLyingDown is true (something nearby - a fire or a hostile - stops it lying down)", "something nearby (a fire or a hostile) stops it lying down");
                 return false;
             }
 
             Lord lord = pawn.GetLord();
             if (lord != null && lord.CurLordToil != null && !lord.CurLordToil.AllowRestingInBed)
             {
+                LogRestSkipped(pawn, $"under a lord whose current duty ({lord.CurLordToil.GetType().Name}) does not allow resting in bed");
                 return false;
             }
 
             if (pawn.IsWildMan() || (pawn.InMentalState && !pawn.MentalState.AllowRestingInBed))
             {
+                LogRestSkipped(pawn, pawn.IsWildMan() ? "a wild man" : "in a mental state that does not allow resting in bed");
                 return false;
             }
 
             if (pawn.roping != null && pawn.roping.IsRoped)
             {
+                LogRestSkipped(pawn, "roped");
                 return false;
             }
 
@@ -2820,6 +2900,7 @@ namespace DoNotBeLazy.Components
 
                 pausedForNeed.Remove(pawn);
                 Logger.Message($"{pawn.LabelShort}: {paused.need} satisfied, resuming sweep ({order.WorkGiverDef.defName})");
+                Logger.Order($"ORDER {OrderIdFor(pawn)} resumed: {pawn.LabelShort} ({NeedMonitor.LevelsText(pawn)})");
                 AssignNextTask(pawn, order);
                 return;
             }
@@ -3126,6 +3207,7 @@ namespace DoNotBeLazy.Components
 
             pausedForNeed.Remove(pawn);
             Logger.Message($"{pawn.LabelShort}: {paused.need} satisfied, resuming sweep ({order.WorkGiverDef.defName})");
+            Logger.Order($"ORDER {OrderIdFor(pawn)} resumed: {pawn.LabelShort} ({NeedMonitor.LevelsText(pawn)})");
             AssignNextTask(pawn, order);
             return true;
         }
