@@ -45,15 +45,35 @@ namespace DoNotBeLazy.Patches
     [HarmonyPatch(typeof(Pawn_JobTracker), nameof(Pawn_JobTracker.EndCurrentJob))]
     public static class JobTrackerPatch
     {
-        [HarmonyPriority(Priority.First)]
-        public static void Prefix(Pawn_JobTracker __instance, out Job __state)
+        // What the Prefix captures. The Job reference alone is not enough:
+        // EndCurrentJob returns the ended job to the pool (CleanupCurrentJob,
+        // canReturnToPool true), and Job.Clear() resets playerForced and
+        // playerInterruptedForced and nulls def. By the time the Postfix runs
+        // the flag is always false and DescribeJob says "no job" - which is
+        // why Notify_JobEnded's playerInterruptedForced check never fired in
+        // a game, and a player-forced order (Be Lazy's Get Rec'd) did not end
+        // a sweep. Verified 2026-10-02 by decompiling Pawn_JobTracker and
+        // Job.Clear. The flag is read here, before the job is pooled.
+        public struct EndedJobState
         {
-            __state = __instance.curJob;
+            public Job job;
+            public bool playerInterruptedForced;
         }
 
-        public static void Postfix(JobCondition condition, Pawn ___pawn, Job __state)
+        [HarmonyPriority(Priority.First)]
+        public static void Prefix(Pawn_JobTracker __instance, out EndedJobState __state)
         {
-            Job endedJob = __state;
+            Job cur = __instance.curJob;
+            __state = new EndedJobState
+            {
+                job = cur,
+                playerInterruptedForced = cur != null && cur.playerInterruptedForced
+            };
+        }
+
+        public static void Postfix(JobCondition condition, Pawn ___pawn, EndedJobState __state)
+        {
+            Job endedJob = __state.job;
 
             Pawn pawn = ___pawn;
             if (pawn == null || endedJob == null)
@@ -108,7 +128,7 @@ namespace DoNotBeLazy.Patches
                 return;
             }
 
-            sweepManager.Notify_JobEnded(pawn, condition, endedJob);
+            sweepManager.Notify_JobEnded(pawn, condition, endedJob, __state.playerInterruptedForced);
         }
     }
 }

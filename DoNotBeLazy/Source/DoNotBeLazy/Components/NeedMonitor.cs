@@ -89,6 +89,10 @@ namespace DoNotBeLazy.Components
                 return;
             }
 
+            // ends the ORDER lines of any Drop everything whose queue has
+            // run out, 2026-10-02
+            DoNotBeLazy.Patches.LoopGizmoPatch.PollDropOrders();
+
             float threshold = DoNotBeLazyMod.Settings.needThreshold;
             float moodThreshold = DoNotBeLazyMod.Settings.moodThreshold;
             float restThreshold = DoNotBeLazyMod.Settings.restThreshold;
@@ -122,6 +126,15 @@ namespace DoNotBeLazy.Components
                         if (sweepManager.IsPaused(pawn))
                         {
                             sweepManager.TryForceRestIfStuck(pawn);
+                            // Section 21, added 2026-09-28: retries a stuck
+                            // Food pause the same way TryForceRestIfStuck
+                            // retries a stuck Rest pause - see its comment
+                            // in SweepManager.
+                            sweepManager.TryForceEatIfStuck(pawn);
+                            // Change C, 2026-10-02: Recreation holding a
+                            // pause is sent to recreation the way Rest is
+                            // sent to bed.
+                            sweepManager.TryForceJoyIfStuck(pawn);
                             sweepManager.WarnIfFoodStuck(pawn);
                             continue;
                         }
@@ -186,6 +199,69 @@ namespace DoNotBeLazy.Components
             }
 
             return null;
+        }
+
+        // The four levels at once, for the line written at each forced-meal
+        // retry. Added 2026-10-02 - a pause records only the need that
+        // started it, and that is not what keeps the pawn paused.
+        public static string LevelsText(Pawn pawn)
+        {
+            Pawn_NeedsTracker needs = pawn?.needs;
+            if (needs == null)
+            {
+                return "no needs";
+            }
+
+            return (needs.food != null ? Describe("Food", needs.food) : "Food n/a")
+                + ", " + (needs.rest != null ? Describe("Rest", needs.rest) : "Rest n/a")
+                + ", " + (needs.joy != null ? Describe("Recreation", needs.joy) : "Recreation n/a")
+                + ", " + (needs.mood != null ? Describe("Mood", needs.mood) : "Mood n/a");
+        }
+
+        // Every need still under its resume threshold - what actually keeps
+        // a paused pawn paused (NeedsSatisfied tests all four, not just the
+        // one the pause started on). "" when none is.
+        public static string UnsatisfiedNeedsText(Pawn pawn)
+        {
+            Pawn_NeedsTracker needs = pawn?.needs;
+            if (needs == null)
+            {
+                return "";
+            }
+
+            float threshold = DoNotBeLazyMod.Settings.needThreshold + ResumeMargin;
+            float moodThreshold = DoNotBeLazyMod.Settings.moodThreshold + ResumeMargin;
+            float restThreshold = DoNotBeLazyMod.Settings.restThreshold + ResumeMargin;
+
+            var parts = new System.Collections.Generic.List<string>();
+            if (NeedIsCritical(needs.food, threshold)) parts.Add(Describe("Food", needs.food));
+            if (NeedIsCritical(needs.rest, restThreshold)) parts.Add(Describe("Rest", needs.rest));
+            if (NeedIsCritical(needs.joy, threshold)) parts.Add(Describe("Recreation", needs.joy));
+            if (NeedIsCritical(needs.mood, moodThreshold)) parts.Add(Describe("Mood", needs.mood));
+            return string.Join(", ", parts.ToArray());
+        }
+
+        // Recreation alone, against the same resume threshold NeedsSatisfied
+        // uses (hunger and recreation share needThreshold). Change C.
+        public static bool JoySatisfied(Pawn pawn)
+        {
+            Need joy = pawn?.needs?.joy;
+            return joy == null || !NeedIsCritical(joy, DoNotBeLazyMod.Settings.needThreshold + ResumeMargin);
+        }
+
+        // Rest alone, against the same resume threshold NeedsSatisfied uses.
+        // Added 2026-10-02 (change B).
+        public static bool RestSatisfied(Pawn pawn)
+        {
+            Need rest = pawn?.needs?.rest;
+            return rest == null || !NeedIsCritical(rest, DoNotBeLazyMod.Settings.restThreshold + ResumeMargin);
+        }
+
+        // Food alone, against the same resume threshold NeedsSatisfied uses.
+        public static bool FoodSatisfied(Pawn pawn)
+        {
+            Need food = pawn?.needs?.food;
+            return food == null || !NeedIsCritical(food, DoNotBeLazyMod.Settings.needThreshold + ResumeMargin);
         }
 
         // "Food 14%" - the level is what says whether a pause was marginal or

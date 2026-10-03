@@ -50,6 +50,68 @@ namespace DoNotBeLazy.Core
             Verse.Log.Message(Prefix + text);
         }
 
+        // The exact input behind an order, ordered 2026-10-02: mouse button,
+        // every modifier held, the event type the state was read from, and
+        // the key bound to QueueOrder when it is not plain Shift. Read from
+        // Event.current, so it only means something when called while the
+        // click's own GUI event is live - a float menu option's action runs
+        // synchronously inside it, a gizmo's action likewise. The event type
+        // is part of the text so a wrong read is visible in the log.
+        public static string Keys()
+        {
+            UnityEngine.Event e = UnityEngine.Event.current;
+            if (e == null)
+            {
+                return "keys: no GUI event (not read inside a click)";
+            }
+
+            // Button and modifiers are read whatever the event type is.
+            // By the time a float menu option's or a gizmo's action runs
+            // the click event has been consumed (type Used, fixed
+            // 2026-10-02 after the first version, which keyed off isMouse,
+            // logged "no mouse button + no modifier" for every order).
+            // Event.Use only changes the type; the button and modifier
+            // fields are left in place.
+            string button = e.type == UnityEngine.EventType.MouseDown || e.type == UnityEngine.EventType.MouseUp || e.type == UnityEngine.EventType.Used
+                ? (e.button == 0 ? "left-click" : e.button == 1 ? "right-click" : e.button == 2 ? "middle-click" : "mouse button " + e.button)
+                : "no mouse button";
+            var mods = new System.Collections.Generic.List<string>();
+            if (e.shift) mods.Add("Shift");
+            if (e.control) mods.Add("Ctrl");
+            if (e.alt) mods.Add("Alt");
+            if (e.command) mods.Add("Cmd");
+
+            string text = "keys: " + button + (mods.Count == 0 ? " + no modifier" : " + " + string.Join(" + ", mods.ToArray()))
+                + " (event " + e.type + ")";
+
+            var queueKey = RimWorld.KeyBindingDefOf.QueueOrder;
+            if (Verse.KeyPrefs.KeyPrefsData.keyPrefs.TryGetValue(queueKey, out var binding))
+            {
+                bool plainShift = binding.keyBindingA == UnityEngine.KeyCode.LeftShift && binding.keyBindingB == UnityEngine.KeyCode.RightShift;
+                if (!plainShift)
+                {
+                    text += "; QueueOrder is bound to " + binding.keyBindingA + "/" + binding.keyBindingB;
+                }
+            }
+
+            text += "; QueueOrder key physically down: " + queueKey.IsDown;
+            return text;
+        }
+
+        // ORDER lines (2026-10-02) - the record of every order issued,
+        // started and ended. Written whether or not verbose logging is on,
+        // once per event, to the mod's own file.
+        public static void Order(string text)
+        {
+            if (LogFile.Available)
+            {
+                LogFile.Write("ORD ", text);
+                return;
+            }
+
+            Verse.Log.Message(Prefix + text);
+        }
+
         // Same prefix and the same file as everything else, so one extraction
         // still catches the lot - the pull-logs command splits them apart
         // afterwards. The level tag is what tells them apart inside the file.

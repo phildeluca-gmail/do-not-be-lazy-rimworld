@@ -1,4 +1,5 @@
 using System.Collections.Generic;
+using System.Linq;
 using DoNotBeLazy.Comps;
 using RimWorld;
 using UnityEngine;
@@ -233,8 +234,29 @@ namespace DoNotBeLazy.Jobs
 
         private CompDnblCargo CargoComp => pawn.GetComp<CompDnblCargo>();
 
+        // "Deliver what is already in my inventory" mode, added 2026-10-02
+        // (change A): a stuffing job whose targetA is a Thing the pawn is
+        // already holding in its inventory, in storage mode. The sweep
+        // starts one for a passed-over pawn that is still loaded with DNBL
+        // cargo (SweepManager.TryStartCargoDelivery). Uses the same deliver
+        // toils as a normal trip; skips the walk to and pickup of a target,
+        // and the opportunistic gather.
+        internal static bool IsCargoDeliveryJob(Pawn pawn, Job job)
+        {
+            Thing held = job?.targetA.Thing;
+            return job != null && job.haulMode == HaulMode.ToCellStorage && held != null
+                && pawn?.inventory != null && pawn.inventory.innerContainer.Contains(held);
+        }
+
         public override bool TryMakePreToilReservations(bool errorOnFailed)
         {
+            // targetA is in the pawn's own inventory - nothing to reserve.
+            if (IsCargoDeliveryJob(pawn, job))
+            {
+                Logger.Message($"{pawn.LabelShort}: unloading stuffed cargo to storage, starting with {job.targetA.Thing.LabelCap}");
+                return true;
+            }
+
             bool reserved = pawn.Reserve(job.targetA, job, errorOnFailed: errorOnFailed);
 
             // The one line for this event, fixed 2026-09-27 (dnbl-architecture.md
@@ -261,10 +283,52 @@ namespace DoNotBeLazy.Jobs
         protected override IEnumerable<Toil> MakeNewToils()
         {
             bool fixedDestination = job.haulMode == HaulMode.ToContainer;
+            bool cargoOnly = IsCargoDeliveryJob(pawn, job);
 
-            yield return Toils_Goto.GotoThing(TargetIndex.A, PathEndMode.ClosestTouch)
-                .FailOnDespawnedNullOrForbidden(TargetIndex.A);
-            yield return PickUpToil(isPrimary: true);
+            // Stuck-cargo fix, dnbl-architecture.md section 19 (the
+            // proposed fix recorded under section 18, "Open, not fixed
+            // here - Elliott's inventory looked stuck at 100% full"),
+            // ordered 2026-09-28 ("2 build all"). Every normal ending
+            // (FinishDeliveryToil, DropAndSkip, EndTripAfterReservationFailure)
+            // already drops and unregisters what it touches, so by the
+            // time any of them calls EndJobWith, `carried` is already
+            // empty. This is for every OTHER way the job can end - an
+            // interrupt, an exception, a replacement job, anything
+            // external - none of which run any toil in this driver.
+            // AddFinishAction is the one hook Verse.AI.JobDriver calls on
+            // every ending, success included, regardless of path
+            // (verified public instance method on JobDriver against
+            // lib\Assembly-CSharp.dll). Whatever is still in `carried`
+            // when it fires is dropped near the pawn and unregistered from
+            // CompDnblCargo here, so CargoDropGuardPatch stops blocking
+            // vanilla's own JobGiver_DropUnusedInventory from it
+            // afterward - Elliott's inventory sat at 100% full for the
+            // rest of a session because nothing ever did this.
+            AddFinishAction(ReleaseAnyStuckCargo);
+
+            if (cargoOnly)
+            {
+                // Everything DNBL registered as cargo and still in the
+                // inventory; the pawn's own medicine, food, drugs and gear
+                // are never in this set.
+                CompDnblCargo cargoComp = CargoComp;
+                if (cargoComp != null)
+                {
+                    foreach (Thing held in cargoComp.Carrying())
+                    {
+                        if (pawn.inventory.innerContainer.Contains(held) && !carried.Contains(held))
+                        {
+                            carried.Add(held);
+                        }
+                    }
+                }
+            }
+            else
+            {
+                yield return Toils_Goto.GotoThing(TargetIndex.A, PathEndMode.ClosestTouch)
+                    .FailOnDespawnedNullOrForbidden(TargetIndex.A);
+                yield return PickUpToil(isPrimary: true);
+            }
 
             // Pre-declared so every toil below can jump to one another
             // regardless of yield order - the same forward/backward jump
@@ -280,7 +344,11 @@ namespace DoNotBeLazy.Jobs
             ConfigureDeliverToil(deliver, moveToCarry, fixedDestination);
             ConfigureMoveToCarryToil(moveToCarry, deliver);
 
-            if (fixedDestination)
+            if (cargoOnly)
+            {
+                // nothing to gather - straight to the deliver toils below
+            }
+            else if (fixedDestination)
             {
                 Toil loopStart = new Toil();
                 yield return loopStart;
@@ -495,8 +563,22 @@ namespace DoNotBeLazy.Jobs
             Toil toil = new Toil();
             toil.initAction = () =>
             {
-                job.targetQueueA = new List<LocalTargetInfo>();
-                job.countQueue = new List<int>();
+                // Held in locals, fixed 2026-10-02 - Bag, 18:58:20, a
+                // NullReferenceException from this toil's initAction at the
+                // reserve-then-add step (the installed build already had the
+                // 2026-09-28 queue guard, so the fault was a different
+                // dereference there: job, job.targetQueueA or pawn.Map
+                // going null after ReservationManager.Reserve, which can
+                // reenter vanilla's job machinery for a player-forced job).
+                // Which of the three could not be told from the log. None is
+                // re-read after Reserve now; the pawn's spawned state is
+                // checked each pass instead.
+                Job thisJob = job;
+                Map map = pawn.Map;
+                var queue = new List<LocalTargetInfo>();
+                var counts = new List<int>();
+                job.targetQueueA = queue;
+                job.countQueue = counts;
 
                 if (opportunisticPicked >= MaxOpportunisticItems || MassUtility.EncumbrancePercent(pawn) >= 1f)
                 {
@@ -504,7 +586,7 @@ namespace DoNotBeLazy.Jobs
                 }
 
                 IntVec3 origin = pawn.Position;
-                var candidates = new List<Thing>(pawn.Map.listerHaulables.ThingsPotentiallyNeedingHauling());
+                var candidates = new List<Thing>(map.listerHaulables.ThingsPotentiallyNeedingHauling());
                 candidates.Sort((a, b) =>
                     (a.Position - origin).LengthHorizontalSquared.CompareTo((b.Position - origin).LengthHorizontalSquared));
 
@@ -515,6 +597,11 @@ namespace DoNotBeLazy.Jobs
                     if (added >= MaxOpportunisticItems - opportunisticPicked || MassUtility.EncumbrancePercent(pawn) >= 1f)
                     {
                         break;
+                    }
+                    if (candidate == null || !pawn.Spawned || pawn.Map != map || thisJob == null)
+                    {
+                        Logger.Message($"{pawn.LabelShort}: stuffing gather stopped - the pawn or its job is no longer in place (pawn spawned {pawn.Spawned}, job {(thisJob == null ? "null" : "set")}), ending gather with what is already carried");
+                        return;
                     }
                     if (carried.Contains(candidate))
                     {
@@ -554,13 +641,30 @@ namespace DoNotBeLazy.Jobs
                     // the instant since the check above - skip the
                     // candidate, no error (errorOnFailed: false - CanReserve
                     // already filtered the ordinary case just above).
-                    if (!pawn.Map.reservationManager.Reserve(pawn, job, candidate, errorOnFailed: false))
+                    if (!map.reservationManager.Reserve(pawn, thisJob, candidate, errorOnFailed: false))
                     {
                         continue;
                     }
 
-                    job.targetQueueA.Add(candidate);
-                    job.countQueue.Add(candidate.stackCount);
+                    // Fixed 2026-09-28, dnbl-architecture.md section 18 -
+                    // Clever's NullReferenceException. job.targetQueueA was
+                    // set fresh at the top of this same initAction (above)
+                    // but was found null again here, mid-loop - something
+                    // else reset this Job's queues while this toil was
+                    // still running (a concurrent job hand-out is the
+                    // suspect; not confirmed). Rather than crash the toil,
+                    // log and stop gathering - the primary item is already
+                    // in `carried`/inventory, so the trip still delivers it;
+                    // the queue-empty toils after this one already treat a
+                    // null queue as empty via NullOrEmpty().
+                    if (thisJob.targetQueueA == null || thisJob.countQueue == null)
+                    {
+                        Logger.Message($"{pawn.LabelShort}: stuffing job's target queue vanished mid-gather - job was likely replaced concurrently, ending gather with what is already carried");
+                        return;
+                    }
+
+                    queue.Add(candidate);
+                    counts.Add(candidate.stackCount);
                     added++;
                 }
             };
@@ -742,6 +846,39 @@ namespace DoNotBeLazy.Jobs
                 Logger.Message($"{pawn.LabelShort}: could not reserve a destination - dropped {remaining} carried item(s) and ending stuffing trip");
             }
             FinishTripAndEndJob(JobCondition.Incompletable);
+        }
+
+        // Stuck-cargo fix, dnbl-architecture.md section 19 - the
+        // AddFinishAction registered in MakeNewToils. Fires once, on every
+        // way this job can end, after any of this driver's own toils have
+        // already had their chance to drain `carried`. A no-op on the
+        // normal endings, where it is already empty by now; the one path
+        // this exists for is everything else (an interrupt, an exception,
+        // a replacement job) that ends the job without running any of
+        // them.
+        private void ReleaseAnyStuckCargo(JobCondition condition)
+        {
+            if (carried.Count == 0)
+            {
+                return;
+            }
+
+            List<Thing> stuck = new List<Thing>(carried);
+            string names = string.Join(", ", stuck.Select(t => t.LabelCap));
+            int dropped = 0;
+            foreach (Thing thing in stuck)
+            {
+                CargoComp?.Unregister(thing);
+                if (pawn.Spawned && pawn.Map != null && pawn.inventory != null
+                    && pawn.inventory.innerContainer.Contains(thing))
+                {
+                    pawn.inventory.innerContainer.TryDrop(thing, pawn.Position, pawn.Map, ThingPlaceMode.Near, out _);
+                    dropped++;
+                }
+            }
+            carried.Clear();
+
+            Logger.Message($"{pawn.LabelShort}: stuffing job ended ({condition}) with {names} still undelivered - dropped {dropped} and unregistered all as DNBL cargo");
         }
 
         // Shared trip-end logging and the zero-progress backstop - used by

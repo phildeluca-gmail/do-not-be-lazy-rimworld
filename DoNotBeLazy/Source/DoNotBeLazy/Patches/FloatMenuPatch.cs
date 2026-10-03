@@ -7,6 +7,7 @@ using Verse;
 using Verse.AI;
 using DoNotBeLazy.Components;
 using DoNotBeLazy.Utility;
+using DoNotBeLazy.Core;
 // UnityEngine has its own Logger and this file needs UnityEngine for Vector3
 using Logger = DoNotBeLazy.Core.Logger;
 
@@ -273,7 +274,16 @@ namespace DoNotBeLazy.Patches
                 // lib\Assembly-CSharp.dll, not remembered. A crematorium
                 // fails it for the surgery defs and passes it for its own,
                 // which is exactly the distinction that was missing.
-                if (!DefCanUseAnyBillGiverHere(def, thingsHere))
+                // Corpse-harvest fix, dnbl-architecture.md section 19,
+                // ordered 2026-09-28 ("2 build all") - reverses the
+                // 2026-08-17 "leave as-is" decision recorded there. A
+                // DoBill def whose fixedBillGiverDefs names exactly one
+                // ThingDef can only ever pass DefCanUseAnyBillGiverHere by
+                // clicking that table; clicking a corpse now looks for a
+                // usable instance of that one table within the sweep
+                // radius instead, so it can still be offered.
+                Thing corpseBillGiver = FindFixedBillGiverNearCorpse(def, thingsHere, cell, map);
+                if (!DefCanUseAnyBillGiverHere(def, thingsHere) && corpseBillGiver == null)
                 {
                     continue;
                 }
@@ -306,7 +316,23 @@ namespace DoNotBeLazy.Patches
                 }
 
                 var scanner = (WorkGiver_Scanner)def.Worker;
-                LocalTargetInfo target = FindTargetWithJob(eligiblePawns, def, scanner, cell, thingsHere, out string failReason, out Thing failThing);
+
+                // Try the corpse-harvest redirect first - same shape as
+                // FindTargetWithJob's own DoBill check (JobFailReason
+                // cleared, HasJobOnThing asked, forced:true) but against
+                // the one Thing found near the corpse rather than walking
+                // thingsHere. Falls through to the ordinary scan below
+                // when there's no corpse here, no such def, or the table
+                // found refuses everyone anyway.
+                LocalTargetInfo target = corpseBillGiver != null
+                    ? FindTargetOnFixedBillGiver(eligiblePawns, scanner, corpseBillGiver)
+                    : LocalTargetInfo.Invalid;
+                string failReason = null;
+                Thing failThing = null;
+                if (!target.IsValid)
+                {
+                    target = FindTargetWithJob(eligiblePawns, def, scanner, cell, thingsHere, out failReason, out failThing);
+                }
 
                 // MENU IS THE CELL, AND ONLY THE CELL. Ordered 2026-09-04:
                 // "what appears in the menu should ONLY be the jobs in that
@@ -389,8 +415,38 @@ namespace DoNotBeLazy.Patches
                         // tick pass, a job-ended callback). Verified
                         // 2026-09-20 against lib\Assembly-CSharp.dll.
                         // Architecture section 16.
+                        //
+                        // 2026-10-02: only the click's own event may say
+                        // "queue". KeyBindingDef.IsDownEvent ends with
+                        // `return IsDown`, which is Input.GetKey - the
+                        // physical key, not this click - so a held or stuck
+                        // Shift that the click event does not carry turned a
+                        // plain click into a queued order (Panna's smelt
+                        // order, 19:14:50, said "queued behind 1 order").
+                        // Read the event alone, and write what was read.
+                        //
+                        // Reverted the same day: by the time this action
+                        // runs the click event is already Used, so an
+                        // event-only read can never see the key and every
+                        // order became REPLACE. Vanilla's IsDownEvent falls
+                        // back to the physical key (IsDown) for exactly
+                        // this reason, so the decision is vanilla's own
+                        // read again; the line below records both the event
+                        // modifiers and the physical state so a disagreement
+                        // (the Panna smelt order) is visible.
                         bool queueOrder = KeyBindingDefOf.QueueOrder.IsDownEvent;
-                        mgr.BeginSweep(eligiblePawns, capturedTarget, capturedDef, queueOrder);
+                        string keys = Logger.Keys();
+                        Logger.Order($"order click: * {capturedDef.defName} on {capturedTarget} for {eligiblePawns.Count} pawn(s) - {keys}; "
+                            + $"game's own read (IsDownEvent, includes the physical key) = {queueOrder}; decision: {(queueOrder ? "QUEUE behind each pawn's current order" : "REPLACE each pawn's current order")}");
+                        SweepManager.LastClickKeys = keys;
+                        try
+                        {
+                            mgr.BeginSweep(eligiblePawns, capturedTarget, capturedDef, queueOrder);
+                        }
+                        finally
+                        {
+                            SweepManager.LastClickKeys = null;
+                        }
                     },
                     MenuOptionPriority.Low));
             }
@@ -760,6 +816,7 @@ namespace DoNotBeLazy.Patches
         // interrupt or chain, the job either succeeds or it doesn't)
         private static void ConsumeAll(List<Pawn> pawns, Thing thing)
         {
+            Logger.Order($"order click: Consume {thing.LabelShort} for {pawns.Count} pawn(s) - {Logger.Keys()}");
             foreach (Pawn pawn in pawns)
             {
                 if (thing.Destroyed || thing.stackCount <= 0)
@@ -1213,6 +1270,96 @@ namespace DoNotBeLazy.Patches
             }
 
             return false;
+        }
+
+        // Corpse-harvest fix, dnbl-architecture.md section 19, ordered
+        // 2026-09-28. Only engages for a DoBill def whose
+        // fixedBillGiverDefs names exactly one ThingDef - the shape
+        // Reclaim Reuse Recycle's own harvest-corpse WorkGiverDef has
+        // (R3_TableHarvesting), though nothing here names that mod or any
+        // other. Clicking a corpse can otherwise only ever yield
+        // "* Consume" for it, because DefCanUseAnyBillGiverHere tests
+        // ThingIsUsableBillGiver against what's on the clicked cell, and
+        // the table is never on the same cell as the corpse - see the
+        // 2026-08-17 finding this reverses. Search is by ThingDef via
+        // listerThings, not a radial cell walk, since the one ThingDef we
+        // want is already known. One Logger.Message on a match - once per
+        // click this path actually resolves, never per candidate
+        // examined or per def that finds nothing.
+        private static Thing FindFixedBillGiverNearCorpse(WorkGiverDef def, List<Thing> thingsHere, IntVec3 cell, Map map)
+        {
+            if (!(def.Worker is WorkGiver_DoBill bills) || def.fixedBillGiverDefs == null
+                || def.fixedBillGiverDefs.Count != 1 || thingsHere == null || map == null)
+            {
+                return null;
+            }
+
+            bool corpseHere = false;
+            foreach (Thing t in thingsHere)
+            {
+                if (t is Corpse)
+                {
+                    corpseHere = true;
+                    break;
+                }
+            }
+            if (!corpseHere)
+            {
+                return null;
+            }
+
+            ThingDef giverDef = def.fixedBillGiverDefs[0];
+            int radius = DoNotBeLazyMod.Settings.sweepRadius;
+            float radiusSquared = radius * radius;
+
+            foreach (Thing candidate in map.listerThings.ThingsOfDef(giverDef))
+            {
+                if (!candidate.Spawned || (candidate.Position - cell).LengthHorizontalSquared > radiusSquared)
+                {
+                    continue;
+                }
+
+                try
+                {
+                    if (bills.ThingIsUsableBillGiver(candidate))
+                    {
+                        Logger.Message($"corpse click at {cell}: {candidate.LabelShort} accepted as {def.defName}'s bill giver within {radius} tiles, offering the workstation sweep from the corpse");
+                        return candidate;
+                    }
+                }
+                catch
+                {
+                    // a def that throws on the question does not get to
+                    // answer it - same habit as DefCanUseAnyBillGiverHere
+                }
+            }
+
+            return null;
+        }
+
+        // The corpse-harvest redirect's own version of FindTargetWithJob's
+        // DoBill check - same shape (JobFailReason cleared, HasJobOnThing
+        // asked, forced:true) but against the single Thing
+        // FindFixedBillGiverNearCorpse found, not a walk over thingsHere.
+        private static LocalTargetInfo FindTargetOnFixedBillGiver(List<Pawn> pawns, WorkGiver_Scanner scanner, Thing billGiver)
+        {
+            foreach (Pawn pawn in pawns)
+            {
+                try
+                {
+                    JobFailReason.Clear();
+                    if (scanner.HasJobOnThing(pawn, billGiver, true))
+                    {
+                        return billGiver;
+                    }
+                }
+                catch
+                {
+                    // swallow - same habit as FindTargetWithJob
+                }
+            }
+
+            return LocalTargetInfo.Invalid;
         }
 
         private static string FirstRefusal(List<Pawn> pawns, Map map, WorkGiverDef def, out Pawn who)

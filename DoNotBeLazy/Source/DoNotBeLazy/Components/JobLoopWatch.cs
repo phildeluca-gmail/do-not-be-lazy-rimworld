@@ -1,5 +1,6 @@
 using System.Collections.Generic;
 using DoNotBeLazy.Core;
+using RimWorld;
 using Verse;
 using Verse.AI;
 
@@ -85,6 +86,18 @@ namespace DoNotBeLazy.Components
         public static void Notify_JobStarted(Pawn pawn, Job job, ThinkNode jobGiver)
         {
             if (pawn == null || job == null || pawn.Faction == null || !pawn.Faction.IsPlayer)
+            {
+                return;
+            }
+
+            // 2026-09-28: a vanilla social fight is not a loop - every punch is
+            // its own job, so two pawns trade JobDefOf.SocialFight jobs at each
+            // other dozens of times in a normal fight and both sides tripped
+            // this warning. Skipped by the job's own def, which names the fight
+            // itself regardless of which ThinkNode issued it - verified against
+            // RimWorld.JobDefOf.SocialFight by reflection on lib\Assembly-CSharp.dll,
+            // more robust than matching the giver's type name.
+            if (job.def == JobDefOf.SocialFight)
             {
                 return;
             }

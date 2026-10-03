@@ -33,7 +33,7 @@ if not exist "%MANAGED%" (
 
 if not exist "lib" mkdir "lib"
 
-for %%F in (Assembly-CSharp.dll UnityEngine.dll UnityEngine.CoreModule.dll) do (
+for %%F in (Assembly-CSharp.dll UnityEngine.dll UnityEngine.CoreModule.dll UnityEngine.IMGUIModule.dll) do (
     copy /y "%MANAGED%\%%F" "lib\%%F" >nul
     if errorlevel 1 (
         echo ERROR: could not copy %%F
