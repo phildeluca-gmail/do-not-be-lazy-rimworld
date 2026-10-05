@@ -102,6 +102,19 @@ namespace DoNotBeLazy.Components
                 return;
             }
 
+            // 2026-10-04: a tantrum is not a loop either - the pawn smashes
+            // things one job after another by design. JobDefOf has no Tantrum
+            // field; JobGiver_Tantrum issues ordinary jobs, so the job def
+            // cannot name it. Skipped by the pawn's mental state instead:
+            // verified by reflection on lib\Assembly-CSharp.dll that
+            // MentalState_TantrumAll, _TantrumRandom, _BedroomTantrum,
+            // _SadisticRageTantrum and _TargetedTantrum all derive from
+            // Verse.AI.MentalState_Tantrum, and that Pawn.MentalState exists.
+            if (pawn.MentalState is MentalState_Tantrum)
+            {
+                return;
+            }
+
             Thing target = job.targetA.Thing;
             if (target == null)
             {

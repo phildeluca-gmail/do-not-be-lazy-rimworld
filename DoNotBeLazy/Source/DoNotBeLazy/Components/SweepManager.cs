@@ -176,6 +176,11 @@ namespace DoNotBeLazy.Components
         // haul leg, so that is when it is worth asking again.
         private const int AreaRetryTicks = 600;
 
+        // How soon a pawn whose job start threw is asked again - short, so
+        // the reservation storm that caused it has settled but the pawn has
+        // not wandered off. Added 2026-10-05.
+        private const int GiveJobRetryTicks = 30;
+
         // ...but a stockpile that is genuinely full stays full, and each
         // retry walks the whole pool. Ten tries is about a hundred seconds
         // of patience before the sweep is called finished for that pawn.
@@ -278,6 +283,22 @@ namespace DoNotBeLazy.Components
             // Change D: the last reason TryForceRestIfStuck returned at a
             // silent gate, written once per distinct reason per pause.
             public string restDeclineReason;
+
+            // 2026-10-04 (Van: Food pause, Food satisfied, Rest 10% held it,
+            // never sent to bed). The last tick TryForceRestIfStuck acted
+            // while the pause was held by Rest but did not START on Rest; 0
+            // means never. Separate from lastForceCheckTick, which is set to
+            // the pause's start and would make a pawn that finished eating
+            // wait out a whole ForceRestRetryTicks first. And the last busy
+            // job already written down, once per distinct job def per pause.
+            public int restHeldCheckTick;
+            public string restBusyJob;
+
+            // 2026-10-04: the same two for TryForceJoyIfStuck - the last tick
+            // it acted on a pause that did not START on Recreation (0 means
+            // never), and the last busy job already written down.
+            public int joyHeldCheckTick;
+            public string joyBusyJob;
         }
 
         private readonly Dictionary<Pawn, PauseInfo> pausedForNeed = new Dictionary<Pawn, PauseInfo>();
@@ -571,9 +592,23 @@ namespace DoNotBeLazy.Components
         // rather than a step of a sweep - a forced meal, a forced rest - and
         // gives it its own ORDER lines. Null for a sweep step, which writes
         // the sweep order's "started" line the first time one is taken.
-        public static void GiveJob(Pawn pawn, Job job, bool appendBehindCurrentJob = false, string forcedKind = null)
+        //
+        // Since 2026-10-05 it returns whether the job was taken, and sets
+        // LastGiveJobThrew when TryTakeOrderedJob threw - see
+        // AssignNextTask's recovery for why the caller needs to know.
+        public static bool LastGiveJobThrew;
+        public static string LastGiveJobExceptionType;
+
+        // Consecutive GiveJob throws per pawn, cleared on a successful take.
+        // After MaxGiveJobThrowsInARow the pawn is taken off its order.
+        // Added 2026-10-05 on the coordinator's order.
+        private const int MaxGiveJobThrowsInARow = 5;
+        private static readonly Dictionary<Pawn, int> giveJobThrowStreak = new Dictionary<Pawn, int>();
+
+        public static bool GiveJob(Pawn pawn, Job job, bool appendBehindCurrentJob = false, string forcedKind = null)
         {
             bool took = false;
+            LastGiveJobThrew = false;
             BeginAssigningJob(pawn);
             try
             {
@@ -581,11 +616,18 @@ namespace DoNotBeLazy.Components
             }
             catch (Exception ex)
             {
+                LastGiveJobThrew = true;
+                LastGiveJobExceptionType = ex.GetType().Name;
                 GiveJobFailedThrottled(pawn, job, ex);
             }
             finally
             {
                 EndAssigningJob(pawn);
+            }
+
+            if (took)
+            {
+                giveJobThrowStreak.Remove(pawn);
             }
 
             if (forcedKind != null)
@@ -596,6 +638,8 @@ namespace DoNotBeLazy.Components
             {
                 Logger.Order($"ORDER {sweepOrderId} started: {pawn.LabelShort} {DescribeJob(job)} {job.targetA}");
             }
+
+            return took;
         }
 
         // ORDER lines, ordered 2026-10-02 - one id per order per pawn, three
@@ -609,6 +653,7 @@ namespace DoNotBeLazy.Components
         // meals, forced rests and Drop everything are orders of their own.
         // Each line fires once per order per pawn, never per tick or target.
         private static int orderCounter;
+        private static readonly string launchStamp = DateTime.Now.ToString("HHmm");
 
         // The input behind the click that is starting orders right now, set
         // by FloatMenuPatch around BeginSweep so NoteOrderIssued can name
@@ -628,7 +673,10 @@ namespace DoNotBeLazy.Components
 
         public static string NextOrderId()
         {
-            return "DNBL-" + (++orderCounter);
+            // 2026-10-04: the counter restarts at 1 on every launch, so the
+            // same id named different orders across sessions in one log. The
+            // launch stamp (HHmm, no spaces) makes it unique: DNBL-2243-24.
+            return "DNBL-" + launchStamp + "-" + (++orderCounter);
         }
 
         private static void NoteOrderIssued(Pawn pawn, SweepOrder order)
@@ -1590,6 +1638,13 @@ namespace DoNotBeLazy.Components
                 {
                     EndAssigningJob(pawn);
                 }
+
+                // 2026-10-04: ourJob still held the sweep job just ended. The
+                // job pool reuses Job objects, so a later vanilla Ingest could
+                // be the same instance and Notify_JobEnded logged it as "forced
+                // meal ended" although we never forced it (Van, 23:29:45).
+                // TryForceEatNow below sets it again for a meal we do force.
+                ourJob.Remove(pawn);
             }
 
             // Section 21 go-eat backstop, revised same day it was ordered:
@@ -1731,6 +1786,31 @@ namespace DoNotBeLazy.Components
             string held = NeedMonitor.UnsatisfiedNeedsText(pawn);
             if (NeedMonitor.FoodSatisfied(pawn))
             {
+                // 2026-10-04: Abi was already in bed (LayDown from
+                // JobGiver_GetRest) when this warned that Rest held the
+                // pause - misleading, nothing was wrong. When the current
+                // job already serves the need holding the pause (LayDown
+                // for Rest; a job with joyKind set for Recreation), say so
+                // in a plain line instead. Still logged once per pause
+                // (foodStuckWarned is set above). Nothing is forced here;
+                // TryForceRestIfStuck only acts on an idle pawn, so a
+                // LayDown in progress is never replaced.
+                bool restHeld = !NeedMonitor.RestSatisfied(pawn);
+                bool joyHeld = !NeedMonitor.JoySatisfied(pawn);
+                bool resting = curJob != null && curJob.def == JobDefOf.LayDown;
+                bool playing = curJob != null && curJob.def.joyKind != null;
+                // 2026-10-04, "Not a nap, but the work yes": a pawn napping
+                // is never interrupted for Recreation (TryForceJoyIfStuck
+                // logs "not interrupting a nap"), so a LayDown while
+                // Recreation holds the pause, alone or with Rest, is
+                // acceptable too and must not warn.
+                bool napAccepted = resting && joyHeld;
+                if ((restHeld && resting && (!joyHeld || playing)) || (!restHeld && joyHeld && playing) || napAccepted)
+                {
+                    Logger.Message($"{pawn.LabelShort}: {FoodStuckWarnTicks} ticks into a Food pause, Food is now satisfied and the pause is held by: {held}; the pawn is already on {curJob.def.defName}, which serves it ({NeedMonitor.LevelsText(pawn)})");
+                    return;
+                }
+
                 Logger.Warning($"{pawn.LabelShort}: paused {FoodStuckWarnTicks} ticks after a Food pause began, but Food is now satisfied ({NeedMonitor.LevelsText(pawn)}) - the pause is held by: {held}");
                 ScreenNote(pawn, $"{pawn.LabelShort}: paused a long time - Food is fine, still held by: {held}");
             }
@@ -1970,18 +2050,49 @@ namespace DoNotBeLazy.Components
 
             Job curJob = pawn.jobs?.curJob;
             bool idle = curJob == null || (IdleJobDefs.Contains(curJob.def) && !curJob.playerForced);
-            if (!idle)
+
+            // 2026-10-04 (Jazzy: Food pause, Recreation 13% held it after the
+            // meal, never sent to recreation). Same rule as the rest force,
+            // order: "Not a nap, but the work yes." A pawn on ordinary work
+            // is pulled off it and sent to recreation. A nap (LayDown), a
+            // meal, joy, a player order, emergency work or any non-work job
+            // is left alone.
+            bool ordinaryWork = IsOrdinaryWork(curJob);
+            if (!idle && !ordinaryWork)
             {
+                if (curJob != null && curJob.def != JobDefOf.Ingest && curJob.def != JobDefOf.LayDown
+                    && curJob.def.joyKind == null && paused.joyBusyJob != curJob.def.defName)
+                {
+                    paused.joyBusyJob = curJob.def.defName;
+                    pausedForNeed[pawn] = paused;
+                    Logger.Message($"{pawn.LabelShort}: paused for {paused.need}, Recreation holds it but the pawn is on {DescribeJob(curJob)}"
+                        + (curJob.playerForced ? " (player-forced)" : curJob.workGiverDef != null ? $" (emergency work, {curJob.workGiverDef.defName})" : " (not a work job)")
+                        + " - not interrupting");
+                }
+                else if (curJob != null && curJob.def == JobDefOf.LayDown && paused.joyBusyJob != curJob.def.defName)
+                {
+                    paused.joyBusyJob = curJob.def.defName;
+                    pausedForNeed[pawn] = paused;
+                    Logger.Message($"{pawn.LabelShort}: paused for {paused.need}, Recreation holds it but the pawn is resting ({curJob.def.defName}) - not interrupting a nap");
+                }
+
                 return false;
             }
 
+            // A pause that started on another need checks at once the first
+            // time Recreation holds it, then every ForceJoyRetryTicks; its
+            // own timer is separate because lastForceCheckTick starts at the
+            // pause's start. A Recreation pause keeps the old timer.
+            bool joyStart = paused.need.StartsWith("Recreation");
             int now = Find.TickManager.TicksGame;
-            if (now - paused.lastForceCheckTick < ForceJoyRetryTicks)
+            int lastCheck = joyStart ? paused.lastForceCheckTick : paused.joyHeldCheckTick;
+            if (lastCheck != 0 && now - lastCheck < ForceJoyRetryTicks)
             {
                 return false;
             }
 
             paused.lastForceCheckTick = now;
+            paused.joyHeldCheckTick = now;
             pausedForNeed[pawn] = paused;
 
             string decline = null;
@@ -2030,9 +2141,10 @@ namespace DoNotBeLazy.Components
             }
 
             joyJob.ignoreJoyTimeAssignment = true;
+            string joyInterrupted = idle ? "" : $" (interrupting ordinary work: {DescribeJob(curJob)})";
             ourJob[pawn] = joyJob;
             GiveJob(pawn, joyJob, false, "forced recreation");
-            Logger.Message($"{pawn.LabelShort}: paused and held by Recreation with nothing from vanilla - sent to {joyJob.def.defName} ({NeedMonitor.LevelsText(pawn)})");
+            Logger.Message($"{pawn.LabelShort}: paused and held by Recreation with nothing from vanilla - sent to {joyJob.def.defName} ({NeedMonitor.LevelsText(pawn)})" + joyInterrupted);
             return true;
         }
 
@@ -2060,6 +2172,17 @@ namespace DoNotBeLazy.Components
             pausedForNeed[pawn] = paused;
             Logger.Message($"{pawn.LabelShort}: no forced rest while paused - pawn is {reason} ({NeedMonitor.LevelsText(pawn)})");
             ScreenNote(pawn, $"{pawn.LabelShort}: not sent to bed - {shortReason ?? reason}");
+        }
+
+        // 2026-10-04: shared by the rest and recreation forces. Ordinary
+        // vanilla work = a job that is not player-forced and came from a
+        // non-emergency WorkGiver (Job.workGiverDef is set by JobGiver_Work).
+        // Eating, sleeping, joy, lord duties, player orders and emergency
+        // work (firefighting, doctoring, rescue) are not.
+        private static bool IsOrdinaryWork(Job job)
+        {
+            return job != null && !job.playerForced
+                && job.workGiverDef != null && !job.workGiverDef.emergency;
         }
 
         public bool TryForceRestIfStuck(Pawn pawn)
@@ -2103,18 +2226,43 @@ namespace DoNotBeLazy.Components
             // firefighting, Use Bedrolls' own sleep job).
             Job curJob = pawn.jobs?.curJob;
             bool idle = curJob == null || (IdleJobDefs.Contains(curJob.def) && !curJob.playerForced);
-            if (!idle)
+
+            // 2026-10-04 (Van, 23:27-23:29): once Food was satisfied the pause
+            // was held by Rest alone, but vanilla's think tree hands a pawn
+            // an ordinary work job (JobGiver_Work sets Job.workGiverDef -
+            // verified in the decompile) in the same tick it would otherwise
+            // idle, so the pawn was never sampled idle here and was never
+            // sent to bed - the timetable said Work, so JobGiver_GetRest
+            // declined. For the case where Rest is what holds the pause, a
+            // non-forced job from an ordinary (non-emergency) WorkGiver
+            // counts as interruptible too. Firefighting, doctoring and
+            // rescue are emergency WorkGivers and are left alone, as is
+            // anything the player ordered and anything that is not a work
+            // job at all (eating, sleeping, joy, a lord's duty).
+            bool ordinaryWork = IsOrdinaryWork(curJob);
+            if (!idle && !ordinaryWork)
             {
+                if (curJob != null && curJob.def != JobDefOf.Ingest && curJob.def != JobDefOf.LayDown
+                    && curJob.def.joyKind == null && paused.restBusyJob != curJob.def.defName)
+                {
+                    paused.restBusyJob = curJob.def.defName;
+                    pausedForNeed[pawn] = paused;
+                    Logger.Message($"{pawn.LabelShort}: paused for {paused.need}, Rest holds it but the pawn is on {DescribeJob(curJob)}"
+                        + (curJob.playerForced ? " (player-forced)" : curJob.workGiverDef != null ? $" (emergency work, {curJob.workGiverDef.defName})" : " (not a work job)")
+                        + " - not interrupting");
+                }
                 return false;
             }
 
             int now = Find.TickManager.TicksGame;
-            if (now - paused.lastForceCheckTick < ForceRestRetryTicks)
+            int lastCheck = otherNeedCase ? paused.restHeldCheckTick : paused.lastForceCheckTick;
+            if (lastCheck != 0 && now - lastCheck < ForceRestRetryTicks)
             {
                 return false;
             }
 
             paused.lastForceCheckTick = now;
+            paused.restHeldCheckTick = now;
             pausedForNeed[pawn] = paused;
 
             // Change D, 2026-10-02: each of these returns used to be silent
@@ -2169,11 +2317,13 @@ namespace DoNotBeLazy.Components
             // Job.playerForced, so without this, TryReportForeignJob's
             // periodic poll reads the forced LayDown as a foreign order and
             // ends the sweep.
+            string interrupted = idle ? "" : $" (interrupting ordinary work: {DescribeJob(curJob)})";
             Job layDown = JobMaker.MakeJob(JobDefOf.LayDown, bed);
             ourJob[pawn] = layDown;
             GiveJob(pawn, layDown, false, "forced rest");
             Logger.Message($"{pawn.LabelShort}: still paused for {paused.need} with no rest job from vanilla - forced LayDown at {bed.LabelShort}"
-                + (otherNeedCase ? $" (the pause started on another need; Rest is what holds it now - {NeedMonitor.LevelsText(pawn)})" : ""));
+                + (otherNeedCase ? $" (the pause started on another need; Rest is what holds it now - {NeedMonitor.LevelsText(pawn)})" : "")
+                + interrupted);
             return true;
         }
 
@@ -3582,6 +3732,45 @@ namespace DoNotBeLazy.Components
                 lastAssignedTarget[pawn] = target;
                 ourJob[pawn] = job;
                 GiveJob(pawn, job, appendBehindCurrentJob);
+
+                // Added 2026-10-05. Seen 00:43:44 and 00:43:50 on a 12-pawn
+                // ConstructDeliverResourcesToBlueprints order: handing Darcey
+                // her job stole a reservation (every sweep job is
+                // player-forced), the holder's reassignment reentrantly
+                // stole one of Darcey's, and ReservationManager ended
+                // Darcey's own half-started job - EndCurrentJob returned it
+                // to the pool and Job.Clear emptied its targets - while her
+                // own StartJob was still inside TryMakePreToilReservations,
+                // which then threw (JobDriver_HaulToContainer.ThingToCarry,
+                // targetA gone). That end was discarded by the IsBeingAssigned
+                // guard, and the throw was caught in GiveJob, so nothing was
+                // left to bring Darcey back: she went to DoBill and the
+                // target she was given had left the pool. Put the target
+                // back and ask again shortly, within the area-wait budget.
+                if (LastGiveJobThrew)
+                {
+                    LastGiveJobThrew = false;
+                    if (!IsRetired(order, target) && !order.SharedPool.Contains(target))
+                    {
+                        order.SharedPool.Add(target);
+                    }
+
+                    giveJobThrowStreak.TryGetValue(pawn, out int streak);
+                    streak++;
+                    giveJobThrowStreak[pawn] = streak;
+                    if (streak >= MaxGiveJobThrowsInARow)
+                    {
+                        giveJobThrowStreak.Remove(pawn);
+                        Logger.Message($"{pawn.LabelShort}: starting a job threw {streak} times in a row - taking the pawn off the {order.WorkGiverDef.defName} order, target {target} put back in the pool");
+                        RemoveSweep(pawn, $"job kept failing to start: {LastGiveJobExceptionType}");
+                    }
+                    else
+                    {
+                        areaRetryAt[pawn] = Find.TickManager.TicksGame + GiveJobRetryTicks;
+                        Logger.Message($"{pawn.LabelShort}: starting the job on {target} threw - target put back in the {order.WorkGiverDef.defName} pool, asking again in {GiveJobRetryTicks} ticks (throw {streak} of {MaxGiveJobThrowsInARow})");
+                    }
+                }
+
                 return;
             }
 

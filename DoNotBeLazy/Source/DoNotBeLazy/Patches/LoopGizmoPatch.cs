@@ -147,6 +147,13 @@ namespace DoNotBeLazy.Patches
             int apparelQueued = 0, apparelLocked = 0, apparelWarcasket = 0;
             int weaponQueued = 0;
             int inventoryQueued = 0;
+            // 2026-10-04: "Drop everything keeps weapons" setting. Applies ONLY
+            // to the equipped weapon (user correction: "2 should ONLY be for
+            // equipped weapons."); inventory weapons drop as normal. Counted
+            // so the per-press line can say so.
+            // when it is on. Counted so the per-press line can say so.
+            bool keepWeapons = DoNotBeLazy.Core.DoNotBeLazyMod.Settings != null && DoNotBeLazy.Core.DoNotBeLazyMod.Settings.dropEverythingKeepsWeapons;
+            int weaponsKept = 0;
 
             if (pawn.apparel != null)
             {
@@ -195,7 +202,12 @@ namespace DoNotBeLazy.Patches
                 }
             }
 
-            if (pawn.equipment?.Primary != null)
+            if (pawn.equipment?.Primary != null && keepWeapons)
+            {
+                weaponsKept++;
+                Logger.Message($"{pawn.LabelShort}: drop everything - {pawn.equipment.Primary.LabelCap} kept (keep-weapons setting)");
+            }
+            else if (pawn.equipment?.Primary != null)
             {
                 string weaponLabel = pawn.equipment.Primary.LabelCap;
                 Job job = JobMaker.MakeJob(JobDefOf.DropEquipment, pawn.equipment.Primary);
@@ -237,10 +249,11 @@ namespace DoNotBeLazy.Patches
             }
 
             int totalQueued = apparelQueued + weaponQueued + inventoryQueued;
+            string keptNote = keepWeapons ? $", {weaponsKept} weapon(s) kept by the keep-weapons setting" : "";
             string outcome = totalQueued == 0
-                ? "nothing to drop"
+                ? "nothing to drop" + keptNote
                 : $"apparel {apparelQueued} queued ({apparelLocked} locked, {apparelWarcasket} warcasket skipped), "
-                    + $"weapon {weaponQueued} queued, inventory {inventoryQueued} queued";
+                    + $"weapon {weaponQueued} queued, inventory {inventoryQueued} queued" + keptNote;
             Logger.Message($"{pawn.LabelShort}: drop everything pressed - {outcome}");
 
             if (totalQueued == 0)

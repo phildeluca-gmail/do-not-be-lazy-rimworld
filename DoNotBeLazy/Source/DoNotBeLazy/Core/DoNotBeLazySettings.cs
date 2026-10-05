@@ -44,6 +44,15 @@ namespace DoNotBeLazy.Core
         // it finishes on its own, and no new one starts.
         public bool stuffFirstHauling = true;
 
+        // Added 2026-10-04. User order: "allow me to tick a box to toggle
+        // dropping weapons. Default tick is OFF. When it is ON, pawn drops
+        // all but their weapons." Read by LoopGizmoPatch.QueueDropEverything
+        // at the moment the button is pressed. When on, "Drop everything"
+        // keeps the EQUIPPED weapon only (correction: "2 should ONLY be
+        // for equipped weapons."); apparel and all inventory, weapons
+        // included, are still dropped. Default CHANGED to true 2026-10-04 (user: "The default setting for both is KEEP equipped weapons."); off drops weapons like before.
+        public bool dropEverythingKeepsWeapons = true;
+
         // Widgets.TextFieldNumeric and Widgets.TextFieldPercent both take a
         // "ref string buffer" next to the value, and it is not optional. The
         // buffer is what is currently TYPED, which a float or an int cannot
@@ -83,6 +92,7 @@ namespace DoNotBeLazy.Core
             Scribe_Values.Look(ref verboseLogging, "verboseLogging", true);
             Scribe_Values.Look(ref jobDiagnostics, "jobDiagnostics", false);
             Scribe_Values.Look(ref stuffFirstHauling, "stuffFirstHauling", true);
+            Scribe_Values.Look(ref dropEverythingKeepsWeapons, "dropEverythingKeepsWeapons", true);
 
             // the toggle only exists to drive this - keep them in sync on
             // load as well as on change, or a saved "on" reads as off until
@@ -146,6 +156,10 @@ namespace DoNotBeLazy.Core
             listing.Gap();
             listing.CheckboxLabeled("Stuff-first hauling and loading", ref stuffFirstHauling,
                 "When on, a pawn hauling or loading fills its inventory with extra items along the way instead of carrying one at a time. Turn off to go back to vanilla one-item-at-a-time hauling if this causes a problem.");
+
+            listing.Gap();
+            listing.CheckboxLabeled("Drop everything keeps weapons", ref dropEverythingKeepsWeapons,
+                "When on (default), the Drop everything button leaves the pawn's equipped weapon alone and drops everything else, including weapons carried in inventory. When off, the equipped weapon is dropped too.");
 
             listing.Gap();
             listing.CheckboxLabeled("Verbose logging (for bug reports)", ref verboseLogging,
