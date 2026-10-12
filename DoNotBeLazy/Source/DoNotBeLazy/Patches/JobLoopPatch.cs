@@ -21,6 +21,9 @@ namespace DoNotBeLazy.Patches
         public static void Postfix(Job newJob, ThinkNode jobGiver, Pawn ___pawn)
         {
             JobLoopWatch.Notify_JobStarted(___pawn, newJob, jobGiver);
+            // dnbl-architecture.md section 25: marks the pawn for the
+            // leftover bulk goods check; the check itself runs from a tick.
+            LeftoverCargo.Notify_JobStarted(___pawn, newJob);
         }
     }
 }

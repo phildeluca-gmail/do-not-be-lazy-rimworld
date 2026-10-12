@@ -101,6 +101,11 @@ namespace DoNotBeLazy.Patches
             // limit, so its own job can very likely still succeed. Uses the
             // exact calculation JobDriver_StuffAndHaul.PickUpToil applies,
             // so the two can't disagree.
+            if (!JobDriver_StuffAndHaul.CanStuffPack(pawn))
+            {
+                return;
+            }
+
             if (!JobDriver_StuffAndHaul.CanPickUpAtLeastOne(pawn, primary))
             {
                 // Throttled 2026-09-24 (dnbl-architecture.md section 18) -

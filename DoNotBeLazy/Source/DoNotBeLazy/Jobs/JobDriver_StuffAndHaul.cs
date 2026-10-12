@@ -1,6 +1,8 @@
 using System.Collections.Generic;
 using System.Linq;
+using DoNotBeLazy.Components;
 using DoNotBeLazy.Comps;
+using DoNotBeLazy.Utility;
 using RimWorld;
 using UnityEngine;
 using Verse;
@@ -59,6 +61,25 @@ namespace DoNotBeLazy.Jobs
         // item is never re-offered for the rest of the trip.
         private readonly HashSet<Thing> refused = new HashSet<Thing>();
 
+        // Things left on the ground this trip because the vehicle's load
+        // list no longer asks for them (section 23, item 6). Kept apart from
+        // `refused` so the trip-end line does not call them overencumbering.
+        private readonly HashSet<Thing> notWanted = new HashSet<Thing>();
+
+        // Section 23, item 6. True when this trip loads a Vehicle Framework
+        // vehicle's cargo hold (a PackVehicle order, VF members resolved);
+        // false for upgrade materials and everything else, which keep the
+        // vanilla container path. `fixedTarget` is the vehicle, kept because
+        // job.targetB is rewritten when a stack goes to storage instead.
+        private bool vehicleCargo;
+        private LocalTargetInfo fixedTarget;
+        private bool vehicleReachChecked;
+
+        // Stacks of this trip the vehicle will not take (no longer wanted,
+        // or the vehicle cannot be reached). Still in `carried`; `deliver`
+        // takes them to storage instead of carrying them on (review item 4).
+        private readonly HashSet<Thing> toStorage = new HashSet<Thing>();
+
         private int opportunisticPicked;
         private int destinationsUsed;
         private int loopIterations;
@@ -87,6 +108,11 @@ namespace DoNotBeLazy.Jobs
 
         private const int ZeroProgressSuppressionTicks = 60;
 
+        // Order 2026-10-06 (dnbl-architecture.md section 23): the hold applied
+        // when the job was ended from outside its own toils is 30 seconds.
+        // Kept separate so the normal trip ending stays at 60 ticks.
+        private const int ExternalEndingSuppressionTicks = 1800;
+
         // Delivery-side backstop, added 2026-09-22 alongside the
         // HaulInterceptPatch fix for the three same-tick crashes that
         // night (dnbl-architecture.md section 18) - independent of that
@@ -98,6 +124,10 @@ namespace DoNotBeLazy.Jobs
         // `deliver` without the carried set ever shrinking.
         private const int MaxStuckDeliveryAttempts = 50;
         private int stuckDeliveryAttempts;
+
+        // Set by FinishTripAndEndJob so ReleaseAnyStuckCargo does not record
+        // the same zero-progress suppression a second time.
+        private bool zeroProgressRecorded;
 
         // Progress measure for the backstop above - re-armed 2026-09-22
         // for the third same-night defect (dnbl-architecture.md section
@@ -157,9 +187,6 @@ namespace DoNotBeLazy.Jobs
         // logging standard forbids. Own table, not reserveSkipLogExpiry
         // above - the two guards answer different questions for the same
         // pawn/target pair and must not suppress each other's first line.
-        private static readonly Dictionary<Pawn, Dictionary<Thing, int>> overencumberSkipLogExpiry
-            = new Dictionary<Pawn, Dictionary<Thing, int>>();
-
         private const int SkipLogThrottleTicks = 250;
 
         internal static void LogReserveSkipThrottled(Pawn pawn, Thing thing, string message)
@@ -170,9 +197,83 @@ namespace DoNotBeLazy.Jobs
         // Shared by all three substitution points (HaulInterceptPatch,
         // TransporterInterceptPatch, SweepManager.WrapForVehicleStuffing) -
         // same reason CanReserveItem's log throttle is shared.
+        // Once per pawn per ThingDef per game hour. Keyed by def, not by Thing:
+        // every stack of Food is a different Thing, so the old per-Thing key
+        // logged again for each stack the pawn was offered (10-14 repeats of
+        // identical numbers, 2026-10-12).
         internal static void LogOverencumberSkipThrottled(Pawn pawn, Thing thing, string message)
         {
-            LogSkipThrottled(overencumberSkipLogExpiry, pawn, thing, message);
+            if (pawn == null || thing == null || Find.TickManager == null)
+            {
+                return;
+            }
+            if (!overencumberDefLogExpiry.TryGetValue(pawn, out Dictionary<ThingDef, int> byDef))
+            {
+                byDef = new Dictionary<ThingDef, int>();
+                overencumberDefLogExpiry[pawn] = byDef;
+            }
+            if (byDef.TryGetValue(thing.def, out int expiryTick) && Find.TickManager.TicksGame < expiryTick)
+            {
+                return;
+            }
+            byDef[thing.def] = Find.TickManager.TicksGame + GenDate.TicksPerHour;
+            Logger.Message(message + OverencumberNumbers(pawn, thing));
+        }
+
+        private static readonly Dictionary<Pawn, Dictionary<ThingDef, int>> overencumberDefLogExpiry
+            = new Dictionary<Pawn, Dictionary<ThingDef, int>>();
+
+        // 2026-10-12: stuff-first hauling is for pawns who can fill an
+        // inventory pack. Verified by reflection on lib\Assembly-CSharp.dll:
+        // MassUtility.Capacity is 0 unless RaceProps.ToolUser or packAnimal,
+        // and animals (husky, megasloth) logged capacity 0.0 hundreds of
+        // times. Humanlike is the primary test (animals never stuff a pack,
+        // even pack animals whose capacity is non-zero); Capacity <= 0 also
+        // catches a humanlike with no carrying ability. Callers return before
+        // any capacity check, so vanilla's own job is untouched.
+        private static readonly HashSet<Pawn> ignoredPawnsLogged = new HashSet<Pawn>();
+
+        // Called from the ItemLedger constructor, which RimWorld runs on every
+        // game create or load: pawns of the previous game must not stay as keys,
+        // and the once-per-session ignore line is per loaded game.
+        internal static void ResetLogThrottles()
+        {
+            ignoredPawnsLogged.Clear();
+            overencumberDefLogExpiry.Clear();
+        }
+
+        internal static bool CanStuffPack(Pawn pawn)
+        {
+            if (pawn == null || pawn.RaceProps == null)
+            {
+                return false;
+            }
+            if (pawn.RaceProps.Humanlike && MassUtility.Capacity(pawn) > 0f)
+            {
+                return true;
+            }
+            if (ignoredPawnsLogged.Add(pawn))
+            {
+                Logger.Message($"{pawn.LabelShort}: stuff-first hauling ignores this pawn - " +
+                    (pawn.RaceProps.Humanlike ? "carrying capacity is 0" : "not humanlike, animals cannot stuff a pack")
+                    + "; vanilla's own haul job is left in place");
+            }
+            return false;
+        }
+
+        // 2026-10-11 (Bruise): the refusal line gave no numbers, so a pawn
+        // the player saw at ~65 % could not be told apart from one truly full.
+        // These are MassUtility's own figures - the same ones the check uses.
+        private static string OverencumberNumbers(Pawn pawn, Thing thing)
+        {
+            try
+            {
+                return $" [capacity {MassUtility.Capacity(pawn):F1} kg, gear {MassUtility.GearMass(pawn):F1}, inventory {MassUtility.InventoryMass(pawn):F1}, free {MassUtility.FreeSpace(pawn):F1}, one unit {thing.GetStatValue(StatDefOf.Mass):F3} kg]";
+            }
+            catch (System.Exception)
+            {
+                return "";
+            }
         }
 
         private static void LogSkipThrottled(Dictionary<Pawn, Dictionary<Thing, int>> expiryTable, Pawn pawn, Thing thing, string message)
@@ -216,7 +317,7 @@ namespace DoNotBeLazy.Jobs
             return true;
         }
 
-        private static void RecordZeroProgress(Pawn pawn, Thing target)
+        private static void RecordZeroProgress(Pawn pawn, Thing target, int ticks = ZeroProgressSuppressionTicks)
         {
             if (pawn == null || target == null)
             {
@@ -229,7 +330,67 @@ namespace DoNotBeLazy.Jobs
                 zeroProgressExpiry[pawn] = byTarget;
             }
 
-            byTarget[target] = Find.TickManager.TicksGame + ZeroProgressSuppressionTicks;
+            byTarget[target] = Find.TickManager.TicksGame + ticks;
+        }
+
+        // 2026-10-06, dnbl-architecture.md section 23 (order 4.1). How full a
+        // pawn is with things that are NOT DNBL cargo: gear plus inventory
+        // mass, minus the mass of whatever CompDnblCargo has registered and
+        // is still in the inventory, over carrying capacity. A pawn whose
+        // own items fill the pack is refused every stuffing trip, so the
+        // sweep drops it from a vehicle order instead of handing it the
+        // same doomed job again. `heaviest` names the three heaviest
+        // non-cargo inventory stacks for the log line.
+        internal static float NonCargoEncumbrance(Pawn pawn, out string heaviest)
+        {
+            heaviest = "none";
+            if (pawn?.inventory == null)
+            {
+                return 0f;
+            }
+
+            float capacity = MassUtility.Capacity(pawn);
+            if (capacity <= 0f)
+            {
+                return 0f;
+            }
+
+            CompDnblCargo cargoComp = pawn.GetComp<CompDnblCargo>();
+            float cargoMass = 0f;
+            var stacks = new List<Thing>();
+            foreach (Thing held in pawn.inventory.innerContainer)
+            {
+                if (cargoComp != null && cargoComp.IsCarrying(held))
+                {
+                    cargoMass += held.GetStatValue(StatDefOf.Mass) * held.stackCount;
+                }
+                else
+                {
+                    stacks.Add(held);
+                }
+            }
+
+            heaviest = DescribeHeaviest(stacks);
+            return (MassUtility.GearAndInventoryMass(pawn) - cargoMass) / capacity;
+        }
+
+        // Top three stacks by total mass, "Devilstrand x60 (9.0 kg), ...".
+        internal static string DescribeHeaviest(List<Thing> stacks)
+        {
+            if (stacks == null || stacks.Count == 0)
+            {
+                return "none";
+            }
+
+            return string.Join(", ", stacks
+                .OrderByDescending(t => t.GetStatValue(StatDefOf.Mass) * t.stackCount)
+                .Take(3)
+                .Select(t => $"{t.LabelNoCount} x{t.stackCount} ({t.GetStatValue(StatDefOf.Mass) * t.stackCount:F1} kg)"));
+        }
+
+        internal static string DescribeInventoryHeaviest(Pawn pawn)
+        {
+            return pawn?.inventory == null ? "none" : DescribeHeaviest(pawn.inventory.innerContainer.ToList());
         }
 
         private CompDnblCargo CargoComp => pawn.GetComp<CompDnblCargo>();
@@ -274,7 +435,10 @@ namespace DoNotBeLazy.Jobs
                 string destination = job.haulMode == HaulMode.ToContainer && job.targetB.Thing != null
                     ? job.targetB.Thing.LabelShort
                     : "storage (destination chosen per item)";
-                Logger.Message($"{pawn.LabelShort}: stuffing job started for {job.targetA.Thing?.LabelCap}, destination {destination}");
+                // Encumbrance and the three heaviest stacks added 2026-10-06
+                // (order 4.4). One line per job start, so it is bounded by
+                // how often a job is actually handed out.
+                Logger.Message($"{pawn.LabelShort}: stuffing job started for {job.targetA.Thing?.LabelCap}, destination {destination} (encumbrance {MassUtility.EncumbrancePercent(pawn):P0}, heaviest in inventory: {DescribeInventoryHeaviest(pawn)})");
             }
 
             return reserved;
@@ -284,6 +448,9 @@ namespace DoNotBeLazy.Jobs
         {
             bool fixedDestination = job.haulMode == HaulMode.ToContainer;
             bool cargoOnly = IsCargoDeliveryJob(pawn, job);
+            fixedTarget = job.targetB;
+            vehicleCargo = fixedDestination && VehicleCompat.IsCargoLoadingWork(job.workGiverDef)
+                && VehicleCompat.IsVehicle(job.targetB.Thing);
 
             // Stuck-cargo fix, dnbl-architecture.md section 19 (the
             // proposed fix recorded under section 18, "Open, not fixed
@@ -318,6 +485,7 @@ namespace DoNotBeLazy.Jobs
                     {
                         if (pawn.inventory.innerContainer.Contains(held) && !carried.Contains(held))
                         {
+                            ItemLedger.Ensure(pawn, held);
                             carried.Add(held);
                         }
                     }
@@ -338,10 +506,19 @@ namespace DoNotBeLazy.Jobs
             Toil moveToCarry = new Toil();
             Toil carryToCell = Toils_Haul.CarryHauledThingToCell(TargetIndex.B);
             Toil carryToContainer = Toils_Haul.CarryHauledThingToContainer();
+            GuardCarriedThing(carryToCell);
+            GuardCarriedThing(carryToContainer);
             Toil finishCell = FinishDeliveryToil(deliver);
             Toil finishContainer = FinishDeliveryToil(deliver);
 
-            ConfigureDeliverToil(deliver, moveToCarry, fixedDestination);
+            // Section 23, item 6: a Vehicle Framework vehicle is delivered to
+            // straight from the inventory through VF's own call, not through
+            // the carry tracker and vanilla's container toils, which it
+            // refuses. Reached only by the jump in `deliver`.
+            Toil gotoVehicle = Toils_Goto.GotoThing(TargetIndex.B, PathEndMode.Touch)
+                .FailOnDespawnedNullOrForbidden(TargetIndex.B);
+
+            ConfigureDeliverToil(deliver, moveToCarry, gotoVehicle, fixedDestination);
             ConfigureMoveToCarryToil(moveToCarry, deliver);
 
             if (cargoOnly)
@@ -394,7 +571,7 @@ namespace DoNotBeLazy.Jobs
                         pawn.jobs.curDriver.JumpToToil(deliver);
                         return;
                     }
-                    if (refused.Contains(foundThing))
+                    if (refused.Contains(foundThing) || notWanted.Contains(foundThing))
                     {
                         // The scanner's best remaining offer is something
                         // this trip already refused as overencumbering -
@@ -468,6 +645,12 @@ namespace DoNotBeLazy.Jobs
             yield return carryToContainer;
             yield return Toils_Haul.DepositHauledThingInContainer(TargetIndex.B, TargetIndex.None);
             yield return finishContainer;
+            // Never fallen into: finishContainer always jumps to `deliver`.
+            // The 25-tick wait matches VF's own load job.
+            yield return gotoVehicle;
+            yield return Toils_General.Wait(25).WithProgressBarToilDelay(TargetIndex.B)
+                .FailOnDespawnedNullOrForbidden(TargetIndex.B);
+            yield return DeliverToVehicleToil(deliver);
         }
 
         // Picks up job's current TargetIndex.A (job.count, clamped live
@@ -496,6 +679,33 @@ namespace DoNotBeLazy.Jobs
                 int want = Mathf.Min(job.count > 0 ? job.count : thing.stackCount, thing.stackCount);
                 int can = MassUtility.CountToPickUpUntilOverEncumbered(pawn, thing);
                 int take = Mathf.Min(want, can);
+
+                // Section 23, item 6: never gather more for a vehicle than its
+                // load list still asks for, counting what this trip already
+                // holds for the same entry. Vehicle Framework's own count
+                // (job.count) leaves this pawn's stuffed stacks out.
+                if (take > 0 && vehicleCargo)
+                {
+                    int stillWanted = VehicleCompat.StillWanted(job.targetB.Thing, thing, carried);
+                    if (stillWanted >= 0 && stillWanted < take)
+                    {
+                        if (stillWanted <= 0)
+                        {
+                            if (notWanted.Add(thing))
+                            {
+                                Logger.Message($"{pawn.LabelShort}: {job.targetB.Thing.LabelShort} wants no more {thing.def.label} beyond what this trip carries, leaving {thing.LabelCap}");
+                            }
+                            if (pawn.Map.reservationManager.ReservedBy(thing, pawn, job))
+                            {
+                                pawn.Map.reservationManager.Release(thing, pawn, job);
+                            }
+                            return;
+                        }
+                        Logger.Message($"{pawn.LabelShort}: {job.targetB.Thing.LabelShort} still wants {stillWanted} {thing.def.label}, taking {stillWanted} instead of {take}");
+                        take = stillWanted;
+                    }
+                }
+
                 if (take <= 0)
                 {
                     // Once per item per trip, not once per loop iteration -
@@ -521,9 +731,15 @@ namespace DoNotBeLazy.Jobs
                 }
 
                 Thing picked = thing.SplitOff(take);
-                pawn.inventory.GetDirectlyHeldThings().TryAdd(picked, true);
+                // No merge, 2026-10-09 (section 23, item 6): merging into a
+                // stack already in the pack destroyed `picked`, which `carried`
+                // and the cargo registry still pointed at, so the trip
+                // delivered nothing. The pawn's own stacks also stay separate
+                // from cargo this way.
+                pawn.inventory.GetDirectlyHeldThings().TryAdd(picked, false);
                 CargoComp?.Register(picked);
                 carried.Add(picked);
+                ItemLedger.Added(pawn, picked, SweepManager.CurrentOrderIdOrNull(pawn));
                 if (!isPrimary)
                 {
                     opportunisticPicked++;
@@ -547,7 +763,7 @@ namespace DoNotBeLazy.Jobs
                     pawn.Map.reservationManager.Release(thing, pawn, job);
                 }
 
-                Logger.Message($"{pawn.LabelShort} stuffed {picked.LabelCap} x{take} into inventory ({MassUtility.EncumbrancePercent(pawn):P0} full)");
+                Logger.Message($"{pawn.LabelShort} stuffed {picked.LabelCap} into inventory ({MassUtility.EncumbrancePercent(pawn):P0} full)");
             };
             return toil;
         }
@@ -675,7 +891,7 @@ namespace DoNotBeLazy.Jobs
         // vehicle packing, or recomputed per item via StoreUtility for
         // storage mode), reserves it, and jumps into the carry-and-deliver
         // toils. Ends the job once nothing is left to deliver.
-        private void ConfigureDeliverToil(Toil deliver, Toil moveToCarry, bool fixedDestination)
+        private void ConfigureDeliverToil(Toil deliver, Toil moveToCarry, Toil gotoVehicle, bool fixedDestination)
         {
             deliver.initAction = () =>
             {
@@ -712,9 +928,43 @@ namespace DoNotBeLazy.Jobs
                 Thing next = carried[0];
                 LocalTargetInfo dest;
 
-                if (fixedDestination)
+                bool toFixed = fixedDestination && !toStorage.Contains(next);
+                if (toFixed)
                 {
-                    dest = job.targetB;
+                    dest = fixedTarget;
+
+                    // Section 23, item 6. No reservation (VF's own load job
+                    // reserves only the item, so several pawns deliver at
+                    // once) and no vanilla owner probe. Reach and forbidden
+                    // are checked once per trip, not per stack.
+                    if (vehicleCargo)
+                    {
+                        if (!vehicleReachChecked)
+                        {
+                            vehicleReachChecked = true;
+                            bool reachable = pawn.CanReach(dest, PathEndMode.Touch, Danger.Deadly);
+                            bool forbidden = dest.Thing.IsForbidden(pawn);
+                            if (!reachable || forbidden)
+                            {
+                                Logger.Message($"{pawn.LabelShort}: delivery to {dest.Thing.LabelShort} will fail - reachable: {reachable}, forbidden: {forbidden}; taking {carried.Count} stack(s) to storage instead");
+                                toStorage.UnionWith(carried);
+                                pawn.jobs.curDriver.JumpToToil(deliver);
+                                return;
+                            }
+                        }
+
+                        string why = VehicleCompat.WhyNotWanted(dest.Thing, next);
+                        if (why != null)
+                        {
+                            SendToStorage(next, $"{dest.Thing.LabelShort} will not take it: {why}");
+                            pawn.jobs.curDriver.JumpToToil(deliver);
+                            return;
+                        }
+                        job.SetTarget(TargetIndex.A, next);
+                        job.SetTarget(TargetIndex.B, dest);
+                        pawn.jobs.curDriver.JumpToToil(gotoVehicle);
+                        return;
+                    }
                 }
                 else if (StoreUtility.TryFindBestBetterStorageFor(next, pawn, pawn.Map, StoragePriority.Unstored, pawn.Faction, out IntVec3 cell, out IHaulDestination haulDestination))
                 {
@@ -783,7 +1033,7 @@ namespace DoNotBeLazy.Jobs
                 // vanilla exactly. FinishDeliveryToil below already guards
                 // its Release with ReservedBy, so nothing there needed to
                 // change.
-                bool isTransporterDestination = fixedDestination && dest.Thing != null
+                bool isTransporterDestination = toFixed && dest.Thing != null
                     && dest.Thing.TryGetComp<CompTransporter>() != null;
 
                 if (isTransporterDestination)
@@ -811,6 +1061,25 @@ namespace DoNotBeLazy.Jobs
                     return;
                 }
 
+                // 2026-10-06 (dnbl-architecture.md section 23, 2.3 follow-up):
+                // every fixed-destination job to the vehicle "Resupplier"
+                // ended Incompletable after the item reached the carry
+                // tracker, 286 jobs and no delivery. Vanilla's carry-to-
+                // container toil fails the job when the destination's
+                // ThingOwner will not accept the item, or the pather cannot
+                // reach it. Say which, once per delivery attempt, only when
+                // one of the two is true.
+                if (toFixed && dest.Thing != null)
+                {
+                    ThingOwner destOwner = dest.Thing.TryGetInnerInteractableThingOwner();
+                    bool accepts = destOwner != null && destOwner.CanAcceptAnyOf(next);
+                    bool reachable = pawn.CanReach(dest, PathEndMode.Touch, Danger.Deadly);
+                    if (!accepts || !reachable)
+                    {
+                        Logger.Message($"{pawn.LabelShort}: delivery to {dest.Thing.LabelShort} will fail - owner {(destOwner == null ? "none" : destOwner.GetType().Name)} accepts {next.LabelCap}: {accepts}, reachable: {reachable}, forbidden: {dest.Thing.IsForbidden(pawn)}");
+                    }
+                }
+
                 job.SetTarget(TargetIndex.A, next);
                 job.SetTarget(TargetIndex.B, dest);
                 pawn.jobs.curDriver.JumpToToil(moveToCarry);
@@ -819,10 +1088,72 @@ namespace DoNotBeLazy.Jobs
 
         private void DropAndSkip(Thing thing, string reason)
         {
+            LeftoverCargo.NoteForcedDrop(pawn, job, thing, reason);
             pawn.inventory.innerContainer.TryDrop(thing, pawn.Position, pawn.Map, ThingPlaceMode.Near, out _);
+            ItemLedger.Dropped(pawn, thing, reason, true);
             CargoComp?.Unregister(thing);
             carried.Remove(thing);
             Logger.Message($"{pawn.LabelShort}: {reason} - dropped {thing.LabelCap} near itself");
+        }
+
+        // Section 23, item 6. A stack the vehicle will not take (no longer
+        // wanted, or none of it went in) stays in `carried` but is marked
+        // for storage: `deliver` then finds it a storage destination like a
+        // storage-mode trip, so the pawn does not carry it on into the next
+        // trip. With no storage it is dropped near the pawn (DropAndSkip).
+        private void SendToStorage(Thing thing, string reason)
+        {
+            toStorage.Add(thing);
+            Logger.Message($"{pawn.LabelShort}: not delivering {thing.LabelCap} to the vehicle - {reason}; taking it to storage");
+        }
+
+        // Section 23, item 6. Standing at the vehicle: hands the stack over
+        // through VehicleCompat.DeliverToVehicle (VF's own AddOrTransfer and
+        // load-list bookkeeping), then the same bookkeeping as
+        // FinishDeliveryToil, and back to `deliver` for the next stack.
+        private Toil DeliverToVehicleToil(Toil deliver)
+        {
+            Toil toil = new Toil();
+            toil.initAction = () =>
+            {
+                Thing item = job.GetTarget(TargetIndex.A).Thing;
+                Thing vehicle = job.GetTarget(TargetIndex.B).Thing;
+                if (item == null || item.Destroyed || !pawn.inventory.innerContainer.Contains(item))
+                {
+                    // `deliver` prunes it from `carried`; nothing is held to keep.
+                    CargoComp?.Unregister(item);
+                    pawn.jobs.curDriver.JumpToToil(deliver);
+                    return;
+                }
+
+                string vehicleLabel = vehicle?.LabelShort ?? "the vehicle";
+                int asked = item.stackCount;
+                int added = VehicleCompat.DeliverToVehicle(vehicle, item, out int pendingLeft, out string reason);
+                if (added <= 0)
+                {
+                    SendToStorage(item, $"{vehicleLabel} took none: {reason}");
+                    pawn.jobs.curDriver.JumpToToil(deliver);
+                    return;
+                }
+
+                destinationsUsed++;
+                ItemLedger.Delivered(pawn, item, added, vehicleLabel + " (vehicle cargo)");
+                Logger.Message($"{pawn.LabelShort}: delivered {item.def.label} x{added} to {vehicleLabel}, {pendingLeft} still pending for it");
+                if (pawn.inventory.innerContainer.Contains(item))
+                {
+                    // The rest stays in `carried`. If another entry (or the
+                    // same one) still wants it, `deliver` offers it again
+                    // straight away; if not, `deliver` sends it to storage.
+                    Logger.Message($"{pawn.LabelShort}: {vehicleLabel} took {added} of {asked} {item.def.label}, {item.stackCount} left in the pack");
+                }
+                else
+                {
+                    carried.Remove(item);
+                    CargoComp?.Unregister(item);
+                }
+                pawn.jobs.curDriver.JumpToToil(deliver);
+            };
+            return toil;
         }
 
         // Everything still in the pawn's inventory when a destination
@@ -839,7 +1170,9 @@ namespace DoNotBeLazy.Jobs
             {
                 foreach (Thing thing in carried)
                 {
+                    LeftoverCargo.NoteForcedDrop(pawn, job, thing, "no destination could be reserved");
                     pawn.inventory.innerContainer.TryDrop(thing, pawn.Position, pawn.Map, ThingPlaceMode.Near, out _);
+                    ItemLedger.Dropped(pawn, thing, "no destination could be reserved", true);
                     CargoComp?.Unregister(thing);
                 }
                 carried.Clear();
@@ -858,27 +1191,105 @@ namespace DoNotBeLazy.Jobs
         // them.
         private void ReleaseAnyStuckCargo(JobCondition condition)
         {
+            // Order 4.2, 2026-10-06 (dnbl-architecture.md section 23): an
+            // ending that did not go through FinishTripAndEndJob (an
+            // Incompletable from outside the toils) used to record no
+            // zero-progress suppression, so the same pawn was handed the same
+            // job straight away. Same table, same duration.
+            string suppressNote = "";
+            // Only a failure ending counts: a player order, a draft or a need
+            // interrupt is not the job failing, and must not hold back the
+            // same order for 30 seconds.
+            bool failed = condition == JobCondition.Incompletable || condition == JobCondition.Errored;
+            if (failed && !zeroProgressRecorded && destinationsUsed == 0 && primaryTarget != null
+                && !IsCargoDeliveryJob(pawn, job))
+            {
+                RecordZeroProgress(pawn, primaryTarget, ExternalEndingSuppressionTicks);
+                zeroProgressRecorded = true;
+                suppressNote = $"; delivered nothing - suppressing a same-target stuffing job for {ExternalEndingSuppressionTicks} ticks";
+            }
+
             if (carried.Count == 0)
             {
+                if (suppressNote.Length > 0)
+                {
+                    Logger.Message($"{pawn.LabelShort}: stuffing job ended ({condition}) with nothing carried{suppressNote}");
+                }
+                // Items of this pawn in the ledger can outlive `carried`
+                // (replaced job, thrown-away job): say so on every ending.
+                ItemLedger.JobEnded(pawn, job?.loadID ?? 0, condition.ToString());
                 return;
             }
 
             List<Thing> stuck = new List<Thing>(carried);
             string names = string.Join(", ", stuck.Select(t => t.LabelCap));
+
+            int toilIndex = CurToilIndex;
+            string toil = HaveCurToil ? CurToilString : "none";
+
+            // Fixed 2026-10-09 (section 23, item 6): drop first, unregister
+            // only what was dropped or is no longer held. This used to
+            // unregister first and drop only from the inventory, so a stack
+            // in the carry tracker, or any stack the pawn could not drop,
+            // stayed in the pawn unregistered, where nothing would ever take
+            // it out again (~12 pawns kept 30-75 wood). A stack still held
+            // stays registered for SweepManager.DropRegisteredCargoOnLeaving.
             int dropped = 0;
+            int kept = 0;
             foreach (Thing thing in stuck)
             {
-                CargoComp?.Unregister(thing);
-                if (pawn.Spawned && pawn.Map != null && pawn.inventory != null
-                    && pawn.inventory.innerContainer.Contains(thing))
+                int stackBeforeDrop = thing.stackCount;
+                bool inInventory = pawn.inventory != null && pawn.inventory.innerContainer.Contains(thing);
+                bool inHands = pawn.carryTracker != null && pawn.carryTracker.innerContainer.Contains(thing);
+                if (inInventory || inHands)
                 {
-                    pawn.inventory.innerContainer.TryDrop(thing, pawn.Position, pawn.Map, ThingPlaceMode.Near, out _);
+                    if (pawn.Spawned && pawn.Map != null)
+                    {
+                        if (inInventory)
+                        {
+                            pawn.inventory.innerContainer.TryDrop(thing, pawn.Position, pawn.Map, ThingPlaceMode.Near, out _);
+                        }
+                        else
+                        {
+                            pawn.carryTracker.TryDropCarriedThing(pawn.Position, ThingPlaceMode.Near, out _);
+                        }
+                    }
+                    if ((pawn.inventory != null && pawn.inventory.innerContainer.Contains(thing))
+                        || (pawn.carryTracker != null && pawn.carryTracker.innerContainer.Contains(thing)))
+                    {
+                        kept++;
+                        continue;
+                    }
                     dropped++;
+                    // only a drop that really happened is batched; count taken before the drop, a merge empties the stack
+                    LeftoverCargo.NoteForcedDrop(pawn, job, thing, "job ended: " + condition, stackBeforeDrop);
+                    ItemLedger.Dropped(pawn, thing, $"stuffing job ended ({condition})", true);
                 }
+                CargoComp?.Unregister(thing);
             }
             carried.Clear();
+            ItemLedger.JobEnded(pawn, job?.loadID ?? 0, condition.ToString());
 
-            Logger.Message($"{pawn.LabelShort}: stuffing job ended ({condition}) with {names} still undelivered - dropped {dropped} and unregistered all as DNBL cargo");
+            // Order 4.4, corrected 2026-10-11: where each item is NOW, read
+            // after the drops. It used to be read before them, so a stack the
+            // job then dropped was still reported "in inventory" (Pavel's bow).
+            // A dropped stack that merged into another on the ground is no
+            // longer this exact Thing, so it shows as "gone (merged or moved)".
+            string where = string.Join(", ", stuck.Select(t =>
+            {
+                if (pawn.inventory != null && pawn.inventory.innerContainer.Contains(t))
+                {
+                    return t.LabelCap + " in inventory";
+                }
+                if (pawn.carryTracker != null && pawn.carryTracker.innerContainer.Contains(t))
+                {
+                    return t.LabelCap + " in carry tracker";
+                }
+                return t.Spawned ? t.LabelCap + " on the ground at " + t.Position : t.LabelCap + " gone (merged or moved)";
+            }));
+
+            string keptNote = kept == 0 ? "" : $", {kept} could not be dropped ({(pawn.Spawned ? "drop failed" : "pawn not spawned")}) and stay registered as DNBL cargo";
+            Logger.Message($"{pawn.LabelShort}: stuffing job ended ({condition}) in toil {toilIndex} ({toil}) with {names} still undelivered - dropped {dropped} near itself{keptNote}; item locations: {where}{suppressNote}");
         }
 
         // Shared trip-end logging and the zero-progress backstop - used by
@@ -901,6 +1312,7 @@ namespace DoNotBeLazy.Jobs
             if (zeroProgress && primaryTarget != null)
             {
                 RecordZeroProgress(pawn, primaryTarget);
+                zeroProgressRecorded = true;
                 suppressNote = $" - suppressing a same-target stuffing job for {ZeroProgressSuppressionTicks} ticks";
             }
 
@@ -909,8 +1321,40 @@ namespace DoNotBeLazy.Jobs
             // CLAUDE.md section 4 (2026-09-20): a count computed on every
             // run but logged only on failure records nothing about a
             // successful trip.
-            Logger.Message($"{pawn.LabelShort}: stuffing trip ended - {destinationsUsed} item(s) delivered, {opportunisticPicked} picked up opportunistically, {refused.Count} refused as overencumbering{suppressNote}");
+            Logger.Message($"{pawn.LabelShort}: stuffing trip ended - {destinationsUsed} item(s) delivered, {opportunisticPicked} picked up opportunistically, {refused.Count} refused as overencumbering{(notWanted.Count > 0 ? $", {notWanted.Count} left because the vehicle wanted no more" : "")}{suppressNote}");
             EndJobWith(condition);
+        }
+
+        // 2026-10-11 (dnbl-architecture.md section 23 follow-up): vanilla's
+        // CarryHauledThingToCell fail condition passes
+        // carryTracker.CarriedThing straight to IsValidStorageFor, which
+        // throws NullReferenceException when the hands are empty (seen live:
+        // a minified Steel mortar left the hands while Adorbs walked to the
+        // cell, the exception was logged by RimWorld and the job ended
+        // Errored). The container toil has the same shape. This end
+        // condition is inserted at index 0 so it is evaluated before
+        // vanilla's own: with nothing in the hands the job ends
+        // Incompletable with a logged reason, and vanilla's condition is
+        // never reached. Fires once, because it ends the job.
+        private void GuardCarriedThing(Toil toil)
+        {
+            toil.endConditions.Insert(0, () =>
+            {
+                Pawn actor = toil.actor;
+                if (actor == null || actor.carryTracker == null || actor.carryTracker.CarriedThing != null)
+                {
+                    return JobCondition.Ongoing;
+                }
+                Thing target = actor.jobs?.curJob?.GetTarget(TargetIndex.A).Thing;
+                string where = target == null ? "no target"
+                    : target.Destroyed ? "destroyed"
+                    : target.Spawned ? $"spawned at {target.Position}"
+                    : actor.inventory != null && actor.inventory.innerContainer.Contains(target) ? "in the inventory"
+                    : $"held by {(target.ParentHolder == null ? "nothing" : target.ParentHolder.GetType().Name)}";
+                ItemLedger.NoteSeen(target, "hands-empty guard: " + where);
+                Logger.Message($"{actor.LabelShort}: hands are empty while carrying to the destination - {(target == null ? "the item" : target.LabelCap)} is {where}; ending the stuffing trip");
+                return JobCondition.Incompletable;
+            });
         }
 
         private void ConfigureMoveToCarryToil(Toil moveToCarry, Toil deliver)
@@ -923,8 +1367,82 @@ namespace DoNotBeLazy.Jobs
                     pawn.jobs.curDriver.JumpToToil(deliver);
                     return;
                 }
-                pawn.inventory.innerContainer.TryTransferToContainer(thing, pawn.carryTracker.innerContainer, thing.stackCount, out Thing resultingThing);
-                job.SetTarget(TargetIndex.A, resultingThing);
+                ItemLedger.Ensure(pawn, thing);
+                // Review fix, 2026-10-09 (section 23, item 6): hands must be
+                // empty first. Whatever blocks them is put away - our own
+                // cargo back into the pack (no merge, still registered),
+                // anything else dropped, as vanilla drops a carried thing
+                // between jobs - so the stack below never merges into the
+                // pawn's own carried material and is never the thing dropped.
+                Thing blocking = pawn.carryTracker.CarriedThing;
+                if (blocking != null)
+                {
+                    bool ours = CargoComp != null && CargoComp.IsCarrying(blocking);
+                    if (ours)
+                    {
+                        pawn.carryTracker.innerContainer.TryTransferToContainer(blocking, pawn.inventory.innerContainer, blocking.stackCount, false);
+                    }
+                    if (pawn.carryTracker.innerContainer.Contains(blocking))
+                    {
+                        pawn.carryTracker.TryDropCarriedThing(pawn.Position, ThingPlaceMode.Near, out _);
+                        if (ours && !pawn.carryTracker.innerContainer.Contains(blocking))
+                        {
+                            ItemLedger.Dropped(pawn, blocking, "hands had to be cleared", true);
+                            CargoComp.Unregister(blocking);
+                            carried.Remove(blocking);
+                        }
+                    }
+                    else if (ours && !carried.Contains(blocking))
+                    {
+                        carried.Add(blocking);
+                    }
+                    Logger.Message($"{pawn.LabelShort}: hands held {blocking.LabelCap} ({(ours ? "DNBL cargo" : "not cargo")}) before lifting {thing.LabelCap} - {(pawn.inventory.innerContainer.Contains(blocking) ? "put back in the pack" : pawn.carryTracker.innerContainer.Contains(blocking) ? "could not be put down" : "dropped near itself")}");
+                }
+
+                pawn.inventory.innerContainer.TryTransferToContainer(thing, pawn.carryTracker.innerContainer, thing.stackCount, out _);
+
+                // The transfer's own result is not trusted: a merge returns a
+                // destroyed Thing. What matters is what is now in the hands.
+                // Hands were empty, so that is only ever this stack, or part
+                // of it when the stack exceeded what the hands can hold.
+                Thing inHands = pawn.carryTracker.CarriedThing;
+                if (inHands == null)
+                {
+                    // Nothing moved (hands still blocked, or refused).
+                    // Dropped like any other stack this driver cannot
+                    // deliver; kept registered only if even the drop fails.
+                    pawn.inventory.innerContainer.TryDrop(thing, pawn.Position, pawn.Map, ThingPlaceMode.Near, out _);
+                    ItemLedger.Dropped(pawn, thing, "could not lift it to the hands", true);
+                    if (pawn.inventory.innerContainer.Contains(thing))
+                    {
+                        Logger.Message($"{pawn.LabelShort}: could not lift or drop {thing.LabelCap} - left in the pack as DNBL cargo");
+                    }
+                    else
+                    {
+                        CargoComp?.Unregister(thing);
+                        Logger.Message($"{pawn.LabelShort}: could not lift {thing.LabelCap} out of the inventory to deliver it - dropped it near itself");
+                    }
+                    carried.Remove(thing);
+                    pawn.jobs.curDriver.JumpToToil(deliver);
+                    return;
+                }
+                if (inHands != thing)
+                {
+                    // A split: the rest stays in the pack, registered and in
+                    // `carried`; the part in hands is tracked as well.
+                    CargoComp?.Register(inHands);
+                    ItemLedger.Split(thing, inHands);
+                    if (!carried.Contains(inHands))
+                    {
+                        carried.Add(inHands);
+                    }
+                    if (thing.Destroyed || !pawn.inventory.innerContainer.Contains(thing))
+                    {
+                        CargoComp?.Unregister(thing);
+                        carried.Remove(thing);
+                    }
+                }
+                job.SetTarget(TargetIndex.A, inHands);
             };
         }
 
@@ -940,6 +1458,16 @@ namespace DoNotBeLazy.Jobs
                 if (delivered != null && pawn.Map.reservationManager.ReservedBy(job.targetB, pawn, job))
                 {
                     pawn.Map.reservationManager.Release(job.targetB, pawn, job);
+                }
+                if (delivered != null)
+                {
+                    LocalTargetInfo destTarget = job.GetTarget(TargetIndex.B);
+                    string where = destTarget.HasThing ? destTarget.Thing.LabelShort
+                        : $"storage cell {destTarget.Cell}";
+                    // Anything the placement left in the hands was not delivered.
+                    int left = pawn.carryTracker?.CarriedThing == delivered ? delivered.stackCount : 0;
+                    int total = ItemLedger.CountOf(delivered);
+                    ItemLedger.Delivered(pawn, delivered, total - left, where);
                 }
                 carried.Remove(delivered);
                 CargoComp?.Unregister(delivered);

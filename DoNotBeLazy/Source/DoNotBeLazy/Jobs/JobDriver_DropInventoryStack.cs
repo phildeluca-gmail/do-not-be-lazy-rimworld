@@ -50,6 +50,7 @@ namespace DoNotBeLazy.Jobs
                 }
 
                 pawn.inventory.innerContainer.TryDrop(thing, pawn.Position, pawn.Map, ThingPlaceMode.Near, out Thing _);
+                DoNotBeLazy.Components.ItemLedger.Dropped(pawn, thing, "drop everything", false);
                 pawn.GetComp<CompDnblCargo>()?.Unregister(thing);
                 Logger.Message($"{pawn.LabelShort} dropped {thing.LabelCap} from inventory (drop everything)");
                 EndJobWith(JobCondition.Succeeded);

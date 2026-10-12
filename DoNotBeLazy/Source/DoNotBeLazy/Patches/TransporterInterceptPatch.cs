@@ -147,6 +147,11 @@ namespace DoNotBeLazy.Patches
             // confirmed in the archived log through this patch too (a
             // transport-pod load, not a general haul). Same guard, same
             // shared calculation as the driver's own PickUpToil.
+            if (!JobDriver_StuffAndHaul.CanStuffPack(pawn))
+            {
+                return;
+            }
+
             if (!JobDriver_StuffAndHaul.CanPickUpAtLeastOne(pawn, toLoad.Thing))
             {
                 // Throttled 2026-09-24 (dnbl-architecture.md section 18) -

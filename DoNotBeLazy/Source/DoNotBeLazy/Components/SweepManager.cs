@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using RimWorld;
 using Verse;
 using Verse.AI;
@@ -652,6 +653,8 @@ namespace DoNotBeLazy.Components
         // EndOrder, the one place every sweep ending passes through. Forced
         // meals, forced rests and Drop everything are orders of their own.
         // Each line fires once per order per pawn, never per tick or target.
+        // LOCKED (dnbl H2) - passed 5x in play 2026-10-05; do not change without the user's explicit order.
+        // Region: orderCounter / launchStamp through TrackForcedOrder (order id stamp and ORDER ended-with-reason lines).
         private static int orderCounter;
         private static readonly string launchStamp = DateTime.Now.ToString("HHmm");
 
@@ -738,6 +741,16 @@ namespace DoNotBeLazy.Components
             {
                 Logger.Order($"ORDER {id} ended ({DescribeEnding(pawn, condition, job)}): {name} {def} {target} ({condition})");
             });
+        }
+
+        // END LOCKED (dnbl H2)
+
+        // The pawn's current sweep ORDER id for the item ledger, or null
+        // when it has none (a plain haul with no order behind it). Added
+        // 2026-10-11 beside, not inside, the locked region.
+        public static string CurrentOrderIdOrNull(Pawn pawn)
+        {
+            return pawn != null && orderIds.TryGetValue(pawn, out string id) ? id : null;
         }
 
         // "DoBill Make_ComponentIndustrial", "HaulToCell", or "no job".
@@ -1334,6 +1347,49 @@ namespace DoNotBeLazy.Components
                 : $"{reason}, {dropped} queued order{(dropped == 1 ? "" : "s")} dropped");
         }
 
+        // Order 2.1, 2026-10-06 (dnbl-architecture.md section 23). Same
+        // mechanism as JobDriver_StuffAndHaul.ReleaseAnyStuckCargo: unregister
+        // and drop where the pawn stands. Runs from EndOrder, which every way
+        // of leaving an order passes through, and only for vehicle orders.
+        private static void DropRegisteredCargoOnLeaving(Pawn pawn, SweepOrder ending, string reason)
+        {
+            CompDnblCargo cargoComp = pawn.GetComp<CompDnblCargo>();
+            if (cargoComp == null || pawn.inventory == null || !VehicleCompat.IsPersistentTargetWork(ending.WorkGiverDef))
+            {
+                return;
+            }
+
+            List<Thing> held = new List<Thing>();
+            foreach (Thing thing in cargoComp.Carrying())
+            {
+                if (pawn.inventory.innerContainer.Contains(thing))
+                {
+                    held.Add(thing);
+                }
+            }
+
+            if (held.Count == 0)
+            {
+                return;
+            }
+
+            string names = string.Join(", ", held.Select(t => t.LabelCap));
+            int dropped = 0;
+            foreach (Thing thing in held)
+            {
+                ItemLedger.Ensure(pawn, thing);
+                cargoComp.Unregister(thing);
+                if (pawn.Spawned && pawn.Map != null
+                    && pawn.inventory.innerContainer.TryDrop(thing, pawn.Position, pawn.Map, ThingPlaceMode.Near, out _))
+                {
+                    dropped++;
+                }
+                ItemLedger.Dropped(pawn, thing, $"left the {ending.WorkGiverDef.defName} order ({reason})", true);
+            }
+
+            Logger.Message($"{pawn.LabelShort}: left the {ending.WorkGiverDef.defName} order ({reason}) still holding {names} - dropped {dropped} of {held.Count} stacks and unregistered them as DNBL cargo");
+        }
+
         // What RemoveSweep did in full before 2026-09-13: forget the active
         // order and every piece of per-pawn state that goes with it. Touches
         // neither the job nor the queue.
@@ -1343,6 +1399,10 @@ namespace DoNotBeLazy.Components
             // called defensively in places where there may be nothing to do
             if (activeSweeps.TryGetValue(pawn, out SweepOrder ending))
             {
+                // Order 2.1, 2026-10-06: registered cargo never stays in a
+                // pawn's pack when it leaves a vehicle order.
+                DropRegisteredCargoOnLeaving(pawn, ending, reason);
+
                 // What the pawn is doing at the moment we let go of it, but
                 // only when it is not the job we gave it. That is the whole
                 // disagreement stated in one place: we are releasing a pawn
@@ -1357,6 +1417,7 @@ namespace DoNotBeLazy.Components
 
                 Logger.Message($"{pawn.LabelShort}: sweep ended - {reason} ({ending.WorkGiverDef.defName}){doingNow}");
 
+                // LOCKED (dnbl H2) - passed 5x in play 2026-10-05; do not change without the user's explicit order.
                 if (orderIds.TryGetValue(pawn, out string endedId))
                 {
                     string how = orderStarted.Contains(pawn) ? reason : "failed to start: " + reason;
@@ -1364,6 +1425,7 @@ namespace DoNotBeLazy.Components
                     orderIds.Remove(pawn);
                     orderStarted.Remove(pawn);
                 }
+                // END LOCKED (dnbl H2)
             }
 
             activeSweeps.Remove(pawn);
@@ -1795,6 +1857,7 @@ namespace DoNotBeLazy.Components
                 // (foodStuckWarned is set above). Nothing is forced here;
                 // TryForceRestIfStuck only acts on an idle pawn, so a
                 // LayDown in progress is never replaced.
+                // LOCKED (dnbl H3) - passed 5x in play 2026-10-05; do not change without the user's explicit order.
                 bool restHeld = !NeedMonitor.RestSatisfied(pawn);
                 bool joyHeld = !NeedMonitor.JoySatisfied(pawn);
                 bool resting = curJob != null && curJob.def == JobDefOf.LayDown;
@@ -1810,6 +1873,7 @@ namespace DoNotBeLazy.Components
                     Logger.Message($"{pawn.LabelShort}: {FoodStuckWarnTicks} ticks into a Food pause, Food is now satisfied and the pause is held by: {held}; the pawn is already on {curJob.def.defName}, which serves it ({NeedMonitor.LevelsText(pawn)})");
                     return;
                 }
+                // END LOCKED (dnbl H3)
 
                 Logger.Warning($"{pawn.LabelShort}: paused {FoodStuckWarnTicks} ticks after a Food pause began, but Food is now satisfied ({NeedMonitor.LevelsText(pawn)}) - the pause is held by: {held}");
                 ScreenNote(pawn, $"{pawn.LabelShort}: paused a long time - Food is fine, still held by: {held}");
@@ -2057,7 +2121,9 @@ namespace DoNotBeLazy.Components
             // is pulled off it and sent to recreation. A nap (LayDown), a
             // meal, joy, a player order, emergency work or any non-work job
             // is left alone.
+            // LOCKED (dnbl H1.1) - passed 5x in play 2026-10-05; do not change without the user's explicit order.
             bool ordinaryWork = IsOrdinaryWork(curJob);
+            // END LOCKED (dnbl H1.1)
             if (!idle && !ordinaryWork)
             {
                 if (curJob != null && curJob.def != JobDefOf.Ingest && curJob.def != JobDefOf.LayDown
@@ -2065,16 +2131,18 @@ namespace DoNotBeLazy.Components
                 {
                     paused.joyBusyJob = curJob.def.defName;
                     pausedForNeed[pawn] = paused;
-                    Logger.Message($"{pawn.LabelShort}: paused for {paused.need}, Recreation holds it but the pawn is on {DescribeJob(curJob)}"
+                    Logger.Message($"{pawn.LabelShort}: paused (began on {paused.need}), Recreation holds it but the pawn is on {DescribeJob(curJob)}"
                         + (curJob.playerForced ? " (player-forced)" : curJob.workGiverDef != null ? $" (emergency work, {curJob.workGiverDef.defName})" : " (not a work job)")
-                        + " - not interrupting");
+                        + $" - not interrupting (now: {NeedMonitor.LevelsText(pawn)})");
                 }
+                // LOCKED (dnbl H1.2) - passed 5x in play 2026-10-05; do not change without the user's explicit order.
                 else if (curJob != null && curJob.def == JobDefOf.LayDown && paused.joyBusyJob != curJob.def.defName)
                 {
                     paused.joyBusyJob = curJob.def.defName;
                     pausedForNeed[pawn] = paused;
-                    Logger.Message($"{pawn.LabelShort}: paused for {paused.need}, Recreation holds it but the pawn is resting ({curJob.def.defName}) - not interrupting a nap");
+                    Logger.Message($"{pawn.LabelShort}: paused (began on {paused.need}), Recreation holds it but the pawn is resting ({curJob.def.defName}) - not interrupting a nap (now: {NeedMonitor.LevelsText(pawn)})");
                 }
+                // END LOCKED (dnbl H1.2)
 
                 return false;
             }
@@ -2141,6 +2209,7 @@ namespace DoNotBeLazy.Components
             }
 
             joyJob.ignoreJoyTimeAssignment = true;
+            // LOCKED (dnbl H1.1) - passed 5x in play 2026-10-05; do not change without the user's explicit order.
             string joyInterrupted = idle ? "" : $" (interrupting ordinary work: {DescribeJob(curJob)})";
             ourJob[pawn] = joyJob;
             GiveJob(pawn, joyJob, false, "forced recreation");
@@ -2179,6 +2248,8 @@ namespace DoNotBeLazy.Components
         // non-emergency WorkGiver (Job.workGiverDef is set by JobGiver_Work).
         // Eating, sleeping, joy, lord duties, player orders and emergency
         // work (firefighting, doctoring, rescue) are not.
+        // LOCKED (dnbl H1.1) - passed 5x in play 2026-10-05; do not change without the user's explicit order.
+        // Whole method IsOrdinaryWork.
         private static bool IsOrdinaryWork(Job job)
         {
             return job != null && !job.playerForced
@@ -2239,7 +2310,9 @@ namespace DoNotBeLazy.Components
             // rescue are emergency WorkGivers and are left alone, as is
             // anything the player ordered and anything that is not a work
             // job at all (eating, sleeping, joy, a lord's duty).
+            // LOCKED (dnbl H1.1) - passed 5x in play 2026-10-05; do not change without the user's explicit order.
             bool ordinaryWork = IsOrdinaryWork(curJob);
+            // END LOCKED (dnbl H1.1)
             if (!idle && !ordinaryWork)
             {
                 if (curJob != null && curJob.def != JobDefOf.Ingest && curJob.def != JobDefOf.LayDown
@@ -2247,9 +2320,9 @@ namespace DoNotBeLazy.Components
                 {
                     paused.restBusyJob = curJob.def.defName;
                     pausedForNeed[pawn] = paused;
-                    Logger.Message($"{pawn.LabelShort}: paused for {paused.need}, Rest holds it but the pawn is on {DescribeJob(curJob)}"
+                    Logger.Message($"{pawn.LabelShort}: paused (began on {paused.need}), Rest holds it but the pawn is on {DescribeJob(curJob)}"
                         + (curJob.playerForced ? " (player-forced)" : curJob.workGiverDef != null ? $" (emergency work, {curJob.workGiverDef.defName})" : " (not a work job)")
-                        + " - not interrupting");
+                        + $" - not interrupting (now: {NeedMonitor.LevelsText(pawn)})");
                 }
                 return false;
             }
@@ -2317,6 +2390,7 @@ namespace DoNotBeLazy.Components
             // Job.playerForced, so without this, TryReportForeignJob's
             // periodic poll reads the forced LayDown as a foreign order and
             // ends the sweep.
+            // LOCKED (dnbl H1.1) - passed 5x in play 2026-10-05; do not change without the user's explicit order.
             string interrupted = idle ? "" : $" (interrupting ordinary work: {DescribeJob(curJob)})";
             Job layDown = JobMaker.MakeJob(JobDefOf.LayDown, bed);
             ourJob[pawn] = layDown;
@@ -2414,6 +2488,59 @@ namespace DoNotBeLazy.Components
         // pool stays empty and unread; per-pawn retry and failure counts live
         // in SweepManager's own dictionaries, so one pawn giving up does not
         // touch the others.
+        // Order 4.1, 2026-10-06 (dnbl-architecture.md section 23). A pawn whose
+        // pack is nearly full of things that are not this order's cargo is
+        // refused every stuffing trip ("would overencumber"), and used to be
+        // handed the same job again and again (Barna, 2026-10-06 23:05-23:18).
+        // Returns true when the pawn is too full to load a vehicle; the caller
+        // then keeps it out of the order. Logs why and shows one on-screen
+        // message. Called only where the pawn is about to join or continue a
+        // vehicle order, and the pawn leaves the order straight after, so it
+        // fires once per pawn per order.
+        private static bool IsTooFullToLoad(Pawn pawn, WorkGiverDef workGiverDef, Thing target)
+        {
+            if (!DoNotBeLazyMod.Settings.stuffFirstHauling || pawn == null || target == null
+                || !VehicleCompat.IsPersistentTargetWork(workGiverDef))
+            {
+                return false;
+            }
+
+            float percent = JobDriver_StuffAndHaul.NonCargoEncumbrance(pawn, out string heaviest);
+            if (percent < DoNotBeLazyMod.Settings.tooFullThreshold)
+            {
+                return false;
+            }
+
+            Logger.Message($"{pawn.LabelShort}: too full of its own items to load {target.LabelShort} ({percent:P0} of capacity is not this order's cargo; heaviest: {heaviest}) - dropped from the {workGiverDef.defName} order, the rest of the group continues");
+            // its pack is full of leftovers: have them delivered (section 25)
+            LeftoverCargo.MarkDue(pawn);
+            Messages.Message($"{pawn.LabelShort} is too full of {FirstHeaviestLabel(pawn)} to load {target.LabelShort} - dropped from the order",
+                pawn, MessageTypeDefOf.CautionInput, false);
+            return true;
+        }
+
+        // Label of the single heaviest non-cargo stack, for the on-screen text.
+        private static string FirstHeaviestLabel(Pawn pawn)
+        {
+            CompDnblCargo cargoComp = pawn.GetComp<CompDnblCargo>();
+            Thing top = null;
+            float topMass = -1f;
+            foreach (Thing held in pawn.inventory.innerContainer)
+            {
+                if (cargoComp != null && cargoComp.IsCarrying(held))
+                {
+                    continue;
+                }
+                float mass = held.GetStatValue(StatDefOf.Mass) * held.stackCount;
+                if (mass > topMass)
+                {
+                    top = held;
+                    topMass = mass;
+                }
+            }
+            return top != null ? top.LabelNoCount : "its own gear";
+        }
+
         // Stuff-first hauling and loading (dnbl-architecture.md section 18).
         // Wraps a persistent-target job in DNBL's own stuffing job
         // (Jobs/JobDriver_StuffAndHaul, fixed-destination mode) when the
@@ -2456,6 +2583,11 @@ namespace DoNotBeLazy.Components
             // calculation as the driver's own PickUpToil: a pawn who can't
             // carry even one unit of the primary target keeps the vehicle's
             // own raw job instead.
+            if (!JobDriver_StuffAndHaul.CanStuffPack(pawn))
+            {
+                return rawJob;
+            }
+
             if (!JobDriver_StuffAndHaul.CanPickUpAtLeastOne(pawn, primary))
             {
                 // Throttled 2026-09-24 (dnbl-architecture.md section 18) -
@@ -2533,6 +2665,12 @@ namespace DoNotBeLazy.Components
                     // Every pawn answers for itself, so this already keeps the
                     // pawns who can and drops the ones who cannot - checked
                     // 2026-09-13 against that rule, architecture doc section 9.
+                    // Order 4.1: a pawn full of its own items does not join.
+                    if (IsTooFullToLoad(pawn, workGiverDef, target))
+                    {
+                        continue;
+                    }
+
                     Job job = WrapForVehicleStuffing(pawn, scanner.JobOnThing(pawn, target, true), workGiverDef, target);
                     if (job == null)
                     {
@@ -3518,6 +3656,14 @@ namespace DoNotBeLazy.Components
                 // first, or a refuel. The old code read a null here as the
                 // end of the order; see WorkstationHadNoJob for why it
                 // usually isn't one.
+                // Order 4.1: a pawn that has filled up with its own items since
+                // the order began leaves it, with the usual ORDER ended line.
+                if (IsTooFullToLoad(pawn, order.WorkGiverDef, order.WorkstationTarget))
+                {
+                    RemoveSweep(pawn, $"too full of its own items to load {order.WorkstationTarget.LabelShort}");
+                    return;
+                }
+
                 Job resumeJob = WrapForVehicleStuffing(pawn, scanner.JobOnThing(pawn, order.WorkstationTarget, true), order.WorkGiverDef, order.WorkstationTarget);
                 if (resumeJob == null)
                 {

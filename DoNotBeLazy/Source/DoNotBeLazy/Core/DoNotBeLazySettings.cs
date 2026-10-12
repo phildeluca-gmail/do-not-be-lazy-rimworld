@@ -44,6 +44,13 @@ namespace DoNotBeLazy.Core
         // it finishes on its own, and no new one starts.
         public bool stuffFirstHauling = true;
 
+        // Added 2026-10-06 (dnbl-architecture.md section 23, answer 2.2:
+        // "yes but allow it to be configured"). A pawn whose own
+        // non-cargo items take this fraction of its carrying capacity is
+        // dropped from a vehicle order. Default 90%, slider 50-100%.
+        public float tooFullThreshold = 0.9f;
+        private string tooFullThresholdBuffer;
+
         // Added 2026-10-04. User order: "allow me to tick a box to toggle
         // dropping weapons. Default tick is OFF. When it is ON, pawn drops
         // all but their weapons." Read by LoopGizmoPatch.QueueDropEverything
@@ -52,6 +59,9 @@ namespace DoNotBeLazy.Core
         // for equipped weapons."); apparel and all inventory, weapons
         // included, are still dropped. Default CHANGED to true 2026-10-04 (user: "The default setting for both is KEEP equipped weapons."); off drops weapons like before.
         public bool dropEverythingKeepsWeapons = true;
+
+        // Added 2026-10-11 (dnbl-architecture.md section 25). Default on.
+        public bool detectLeftoverBulk = true;
 
         // Widgets.TextFieldNumeric and Widgets.TextFieldPercent both take a
         // "ref string buffer" next to the value, and it is not optional. The
@@ -92,7 +102,9 @@ namespace DoNotBeLazy.Core
             Scribe_Values.Look(ref verboseLogging, "verboseLogging", true);
             Scribe_Values.Look(ref jobDiagnostics, "jobDiagnostics", false);
             Scribe_Values.Look(ref stuffFirstHauling, "stuffFirstHauling", true);
+            Scribe_Values.Look(ref tooFullThreshold, "tooFullThreshold", 0.9f);
             Scribe_Values.Look(ref dropEverythingKeepsWeapons, "dropEverythingKeepsWeapons", true);
+            Scribe_Values.Look(ref detectLeftoverBulk, "detectLeftoverBulk", true);
 
             // the toggle only exists to drive this - keep them in sync on
             // load as well as on change, or a saved "on" reads as off until
@@ -158,8 +170,16 @@ namespace DoNotBeLazy.Core
                 "When on, a pawn hauling or loading fills its inventory with extra items along the way instead of carrying one at a time. Turn off to go back to vanilla one-item-at-a-time hauling if this causes a problem.");
 
             listing.Gap();
+            listing.Label($"Pawn counts as too full to load a vehicle at: {tooFullThreshold:P0} of carrying capacity");
+            tooFullThreshold = SliderWithPercentBox(listing, tooFullThreshold, 0.50f, 1.00f, ref tooFullThresholdBuffer);
+
+            listing.Gap();
             listing.CheckboxLabeled("Drop everything keeps weapons", ref dropEverythingKeepsWeapons,
                 "When on (default), the Drop everything button leaves the pawn's equipped weapon alone and drops everything else, including weapons carried in inventory. When off, the equipped weapon is dropped too.");
+
+            listing.Gap();
+            listing.CheckboxLabeled("Deliver leftover bulk goods", ref detectLeftoverBulk,
+                "When on (default), a pawn that gets a new job while holding more than 2 of an item beyond what its inventory rules tell it to carry has the excess delivered to storage after its current job.");
 
             listing.Gap();
             listing.CheckboxLabeled("Verbose logging (for bug reports)", ref verboseLogging,

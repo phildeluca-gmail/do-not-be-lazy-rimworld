@@ -36,7 +36,8 @@ namespace DoNotBeLazy.Core
             // the log without asking the player, the same reason
             // verboseLogging's own no-op history is called out in section 4
             // of the coding guide.
-            Logger.Message($"Stuff-first hauling: {(Settings.stuffFirstHauling ? "on" : "off")}.");
+            // LOCKED (dnbl H4) - passed 5x in play 2026-10-10; do not change without the user's explicit order.
+            Logger.Message($"Stuff-first hauling: {(Settings.stuffFirstHauling ? "on" : "off")}; too-full threshold {Settings.tooFullThreshold:P0}.");
         }
 
         public override void DoSettingsWindowContents(Rect inRect)
