@@ -67,6 +67,10 @@ namespace DoNotBeLazy.Components
         // removed when the job ends). Only drops made by these are batched.
         private static readonly HashSet<Job> activeDeliveries = new HashSet<Job>();
 
+        // Deliveries that have started and not yet ended, kept only so a
+        // save can write them down (architecture section 26).
+        private static readonly List<Pending> running = new List<Pending>();
+
         // Forced-drop batches, ordered 2026-10-11: when leftover delivery has
         // to drop goods beside the pawn because storage is full, drops pile up
         // per pawn and ONE summary line is written 5 real seconds after the
@@ -93,6 +97,8 @@ namespace DoNotBeLazy.Components
         {
             FlushDropBatches("game loaded");
             activeDeliveries.Clear();
+            running.Clear();
+            loadedRows = null;
             if (!quitHooked)
             {
                 quitHooked = true;
@@ -243,12 +249,169 @@ namespace DoNotBeLazy.Components
             }
         }
 
+        // Deliveries still open at save time (queued or running) - architecture
+        // section 26, ordered 2026-10-12: "Make sure the open orders get
+        // picked up again when the game restarts."
+        public class Row : IExposable
+        {
+            public Pawn pawn;
+            public int jobId;
+            public string orderId;
+            public string summary;
+            public int createdTick;
+            public List<Thing> things = new List<Thing>();
+
+            public void ExposeData()
+            {
+                Scribe_References.Look(ref pawn, "pawn");
+                Scribe_Values.Look(ref jobId, "jobId", 0);
+                Scribe_Values.Look(ref orderId, "orderId");
+                Scribe_Values.Look(ref summary, "summary");
+                Scribe_Values.Look(ref createdTick, "createdTick", 0);
+                Scribe_Collections.Look(ref things, "things", LookMode.Reference);
+                if (Scribe.mode == LoadSaveMode.LoadingVars || Scribe.mode == LoadSaveMode.PostLoadInit)
+                {
+                    things = things ?? new List<Thing>();
+                }
+            }
+        }
+
+        private static List<Row> loadedRows;
+
         public override void ExposeData()
         {
-            if (Scribe.mode == LoadSaveMode.Saving)
+            List<Row> rows = null;
+            bool saving = Scribe.mode == LoadSaveMode.Saving;
+            if (saving)
             {
                 FlushDropBatches("game saved");
+                rows = new List<Row>();
+                foreach (Pending p in pending.Values.Concat(running))
+                {
+                    if (p.pawn == null || p.pawn.Destroyed || p.pawn.Discarded || p.job == null)
+                    {
+                        continue;
+                    }
+                    rows.Add(new Row
+                    {
+                        pawn = p.pawn,
+                        jobId = p.job.loadID,
+                        orderId = p.orderId,
+                        summary = p.summary,
+                        createdTick = p.createdTick,
+                        things = p.things.Where(t => t != null && !t.Destroyed && !t.Discarded).ToList()
+                    });
+                }
             }
+
+            if (!saving || rows.Count > 0)
+            {
+                Scribe_Collections.Look(ref rows, "dnblDeliveries", LookMode.Deep);
+            }
+
+            if (Scribe.mode == LoadSaveMode.PostLoadInit)
+            {
+                loadedRows = rows;
+            }
+        }
+
+        // Runs after every map is finalised, so each pawn's job and job
+        // queue are back. Finds each saved delivery's job by load id.
+        public override void LoadedGame()
+        {
+            List<Row> rows = loadedRows;
+            loadedRows = null;
+            if (rows == null)
+            {
+                return;
+            }
+
+            foreach (Row row in rows)
+            {
+                try
+                {
+                    RestoreDelivery(row);
+                }
+                catch (Exception ex)
+                {
+                    Logger.Warning($"Restoring leftover delivery {row?.orderId} after load threw {ex.GetType().Name}: {ex.Message}");
+                }
+            }
+        }
+
+        private static void RestoreDelivery(Row row)
+        {
+            Pawn pawn = row.pawn;
+            string name = pawn?.LabelShort ?? "(a pawn that no longer exists)";
+            if (pawn == null || pawn.Destroyed || pawn.Discarded || pawn.Dead)
+            {
+                // Release the delivery's entries, as the "job no longer exists" path does.
+                // Nothing else does: CompDnblCargo only prunes destroyed things. A null pawn has no comp or ledger entry.
+                if (pawn != null && row.things != null)
+                {
+                    try
+                    {
+                        CompDnblCargo deadComp = pawn.GetComp<CompDnblCargo>();
+                        foreach (Thing t in row.things)
+                        {
+                            if (t == null)
+                            {
+                                continue;
+                            }
+                            deadComp?.Unregister(t);
+                            ItemLedger.Released(pawn, t, "delivery order withdrawn (game loaded, pawn dead or gone)");
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        Logger.Warning($"Releasing cargo of {name} (order {row.orderId}) after load threw {ex.GetType().Name}: {ex.Message}");
+                    }
+                }
+                Logger.Order($"ORDER {row.orderId} ended (game loaded: pawn {(pawn != null && pawn.Dead ? "dead" : "gone")}): {name} {row.summary}; stacks released from DNBL cargo");
+                return;
+            }
+
+            var p = new Pending
+            {
+                pawn = pawn,
+                orderId = row.orderId,
+                summary = row.summary,
+                createdTick = row.createdTick
+            };
+            foreach (Thing t in row.things)
+            {
+                if (t != null && !t.Destroyed)
+                {
+                    p.things.Add(t);
+                }
+            }
+
+            Job cur = pawn.jobs?.curJob;
+            if (cur != null && cur.loadID == row.jobId && cur.def == DnblJobDefOf.StuffAndHaul && pawn.jobs.curDriver != null)
+            {
+                HookRunning(pawn, cur, p, pawn.jobs.curDriver);
+                Logger.Order($"ORDER {p.orderId} resumed: {name} leftover bulk delivery after game load - already running, {p.things.Count} stacks");
+                return;
+            }
+
+            JobQueue queue = pawn.jobs?.jobQueue;
+            if (queue != null)
+            {
+                for (int i = 0; i < queue.Count; i++)
+                {
+                    Job queued = queue[i].job;
+                    if (queued != null && queued.loadID == row.jobId && queued.def == DnblJobDefOf.StuffAndHaul)
+                    {
+                        p.job = queued;
+                        pending[queued] = p;
+                        Logger.Order($"ORDER {p.orderId} resumed: {name} leftover bulk delivery after game load - still queued behind {pawn.CurJob?.def?.defName ?? "no job"}, {p.things.Count} stacks");
+                        return;
+                    }
+                }
+            }
+
+            Unregister(p, "game loaded, the delivery job no longer exists");
+            Logger.Order($"ORDER {p.orderId} ended (game loaded: the delivery job no longer exists): {name} {p.summary}; stacks released from DNBL cargo, still in the pack");
         }
 
         // ---- tick --------------------------------------------------------
@@ -702,10 +865,21 @@ namespace DoNotBeLazy.Components
             }
 
             Logger.Order($"ORDER {p.orderId} started: {pawn.LabelShort} {job.def.defName} leftover bulk delivery");
+            HookRunning(pawn, job, p, driver);
+        }
+
+        // Marks a delivery as running and attaches the line that says how it
+        // ended. Shared by a fresh start and by a delivery found running
+        // after a game load.
+        private static void HookRunning(Pawn pawn, Job job, Pending p, JobDriver driver)
+        {
+            p.job = job;
             activeDeliveries.Add(job);
+            running.Add(p);
             driver.AddFinishAction(condition =>
             {
                 activeDeliveries.Remove(job);
+                running.Remove(p);
                 Logger.Order($"ORDER {p.orderId} ended ({SweepManager.DescribeEnding(pawn, condition, job)}): {pawn.LabelShort} {p.summary} ({condition})");
             });
         }

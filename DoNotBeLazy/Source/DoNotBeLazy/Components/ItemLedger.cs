@@ -68,6 +68,132 @@ namespace DoNotBeLazy.Components
             JobDriver_StuffAndHaul.ResetLogThrottles();
         }
 
+        // ---- open entries survive a game load - architecture section 26 ----
+        // Ordered 2026-10-12: "Make sure the open orders get picked up again
+        // when the game restarts." Each open entry is saved with its id, so
+        // the log reads "resumed" under the same ITEM id after a load.
+        public class Row : IExposable
+        {
+            public string id;
+            public Pawn pawn;
+            public string pawnLabel;
+            public string label;
+            public string orderId;
+            public string lastSeen;
+            public List<Thing> things = new List<Thing>();
+            public List<int> counts = new List<int>();
+
+            public void ExposeData()
+            {
+                Scribe_Values.Look(ref id, "id");
+                Scribe_References.Look(ref pawn, "pawn");
+                Scribe_Values.Look(ref pawnLabel, "pawnLabel");
+                Scribe_Values.Look(ref label, "label");
+                Scribe_Values.Look(ref orderId, "orderId");
+                Scribe_Values.Look(ref lastSeen, "lastSeen");
+                Scribe_Collections.Look(ref things, "things", LookMode.Reference);
+                Scribe_Collections.Look(ref counts, "counts", LookMode.Value);
+                if (Scribe.mode == LoadSaveMode.LoadingVars || Scribe.mode == LoadSaveMode.PostLoadInit)
+                {
+                    things = things ?? new List<Thing>();
+                    counts = counts ?? new List<int>();
+                }
+            }
+        }
+
+        public override void ExposeData()
+        {
+            List<Row> rows = null;
+            bool saving = Scribe.mode == LoadSaveMode.Saving;
+            if (saving)
+            {
+                rows = new List<Row>();
+                foreach (Entry e in open)
+                {
+                    if (e.pawn == null || e.pawn.Destroyed || e.pawn.Discarded)
+                    {
+                        continue;
+                    }
+                    var row = new Row { id = e.id, pawn = e.pawn, pawnLabel = e.pawnLabel, label = e.label, orderId = e.orderId, lastSeen = e.lastSeen };
+                    foreach (KeyValuePair<Thing, int> part in e.parts)
+                    {
+                        if (part.Key == null || part.Key.Destroyed || part.Key.Discarded)
+                        {
+                            continue;
+                        }
+                        row.things.Add(part.Key);
+                        row.counts.Add(part.Value);
+                    }
+                    rows.Add(row);
+                }
+            }
+
+            if (!saving || rows.Count > 0)
+            {
+                Scribe_Collections.Look(ref rows, "dnblLedger", LookMode.Deep);
+            }
+
+            if (Scribe.mode == LoadSaveMode.PostLoadInit && rows != null)
+            {
+                foreach (Row row in rows)
+                {
+                    try
+                    {
+                        Restore(row);
+                    }
+                    catch (Exception ex)
+                    {
+                        Logger.Warning($"Restoring ITEM {row?.id} after load threw {ex.GetType().Name}: {ex.Message}");
+                    }
+                }
+            }
+        }
+
+        private static void Restore(Row row)
+        {
+            var e = new Entry
+            {
+                id = row.id ?? "DNBL-" + launchStamp + "-" + (++counter),
+                pawn = row.pawn,
+                pawnLabel = row.pawnLabel ?? row.pawn?.LabelShort ?? "(a pawn that no longer exists)",
+                label = row.label ?? "item",
+                orderId = row.orderId,
+                lastSeen = row.lastSeen ?? "before the game was saved"
+            };
+
+            int total = 0;
+            for (int i = 0; i < row.things.Count; i++)
+            {
+                Thing t = row.things[i];
+                int count = i < row.counts.Count ? row.counts[i] : 0;
+                if (t == null || t.Destroyed || count <= 0 || owner.ContainsKey(t))
+                {
+                    continue;
+                }
+                e.parts[t] = count;
+                total += count;
+            }
+
+            string forOrder = e.orderId == null ? "no order" : "order " + e.orderId;
+            if (e.pawn == null || e.pawn.Destroyed || e.pawn.Discarded || e.pawn.Dead)
+            {
+                Logger.Order($"ITEM {e.id} ended (game loaded: pawn {(e.pawn != null && e.pawn.Dead ? "dead" : "gone")}): {e.pawnLabel} {e.label} x{total} (last seen: {e.lastSeen})");
+                return;
+            }
+            if (e.parts.Count == 0)
+            {
+                Logger.Order($"ITEM {e.id} ended (game loaded: the item no longer exists): {e.pawnLabel} {e.label} (last seen: {e.lastSeen})");
+                return;
+            }
+
+            open.Add(e);
+            foreach (Thing t in e.parts.Keys)
+            {
+                owner[t] = e;
+            }
+            Logger.Order($"ITEM {e.id} resumed: {e.pawnLabel} {e.label} x{total} after game load ({forOrder})");
+        }
+
         public override void GameComponentTick()
         {
             if (open.Count == 0 || Find.TickManager.TicksGame % ReconcileIntervalTicks != 0)

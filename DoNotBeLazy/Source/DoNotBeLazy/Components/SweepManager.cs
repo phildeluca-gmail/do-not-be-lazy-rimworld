@@ -130,9 +130,9 @@ namespace DoNotBeLazy.Components
     // they're handed the next sweep task (or, for a workstation order, sent
     // back to the same station) automatically.
     //
-    // No ExposeData - per architecture doc 4, sweeps are cleared on
-    // load rather than persisted. Simplest option for v1 and avoids
-    // re-deriving stale reservations against a changed map state.
+    // Since 2026-10-12 (architecture section 26) open orders are saved and
+    // restored on load: see ExposeData / FinalizeInit below. Before that
+    // sweeps were cleared on load.
     public class SweepManager : MapComponent
     {
         private const int StateCheckIntervalTicks = 60;
@@ -272,6 +272,19 @@ namespace DoNotBeLazy.Components
             // already satisfied" line has been written for this pause.
             public string earlyReturnReason;
             public bool foodSatisfiedLogged;
+
+            // Added 2026-10-18 (Tamas: paused for Food while already on a
+            // vanilla Ingest, then 90 s of silence and a warning that
+            // claimed a forced job had failed). foodDeferredToVanilla: the
+            // pause began with vanilla already feeding the pawn, so we never
+            // forced a meal. foodForcedMeal: we did give a forced meal.
+            // foodBusyLogged: TryForceEatIfStuck's "pawn is on another job"
+            // line written for this pause. vanillaIngestEndLogged: how the
+            // deferred vanilla Ingest ended, written once per pause.
+            public bool foodDeferredToVanilla;
+            public bool foodForcedMeal;
+            public bool foodBusyLogged;
+            public bool vanillaIngestEndLogged;
 
             // Change B, 2026-10-02: the "held by Recreation/mood only" line
             // has been written for this pause.
@@ -478,6 +491,361 @@ namespace DoNotBeLazy.Components
 
         public SweepManager(Map map) : base(map)
         {
+        }
+
+        // ---- open orders survive a game load - architecture section 26 ----
+        //
+        // Ordered 2026-10-12: "Make sure the open orders get picked up again
+        // when the game restarts." Saved: the distinct orders and, per pawn,
+        // its active order, ORDER id and queue. Not saved, rebuilt: the
+        // target pool (empty after load; AssignNextTask rescans an empty pool
+        // from the saved centre and radius), retry and failure counts, and
+        // pauses (NeedMonitor re-derives them from current needs).
+        public class SavedOrder : IExposable
+        {
+            public WorkGiverDef workGiver;
+            public bool hasStation;
+            public Thing station;
+            public IntVec3 center;
+            public int radius;
+            public bool centerOut = true;
+            public string orderKind;
+            public float maxScanDays;
+
+            public void ExposeData()
+            {
+                Scribe_Defs.Look(ref workGiver, "workGiver");
+                Scribe_Values.Look(ref hasStation, "hasStation", false);
+                Scribe_References.Look(ref station, "station");
+                Scribe_Values.Look(ref center, "center");
+                Scribe_Values.Look(ref radius, "radius", 0);
+                Scribe_Values.Look(ref centerOut, "centerOut", true);
+                Scribe_Values.Look(ref orderKind, "orderKind");
+                Scribe_Values.Look(ref maxScanDays, "maxScanDays", 0f);
+            }
+        }
+
+        public class SavedPawn : IExposable
+        {
+            public Pawn pawn;
+            public int active = -1;
+            public string orderId;
+            public bool started;
+            public List<int> queued;
+            // loadID of the job this mod last handed the pawn (ourJob), so a
+            // restored pawn's forced job is only trusted when it is that job.
+            public int ourJobId = -1;
+            // The need label of a pause held at save (null when not paused).
+            // NeedMonitor re-pauses only on its own interval and only while
+            // the need is still critical, so a pawn mid-meal could reach the
+            // watchdog first with no pause and lose its order.
+            public string pausedNeed;
+
+            public void ExposeData()
+            {
+                Scribe_References.Look(ref pawn, "pawn");
+                Scribe_Values.Look(ref pausedNeed, "pausedNeed");
+                Scribe_Values.Look(ref ourJobId, "ourJobId", -1);
+                Scribe_Values.Look(ref active, "active", -1);
+                Scribe_Values.Look(ref orderId, "orderId");
+                Scribe_Values.Look(ref started, "started", false);
+                Scribe_Collections.Look(ref queued, "queued", LookMode.Value);
+            }
+        }
+
+        // Read at PostLoadInit, consumed once by FinalizeInit.
+        private List<SavedOrder> loadedOrders;
+        private List<SavedPawn> loadedPawns;
+
+        public override void ExposeData()
+        {
+            base.ExposeData();
+
+            List<SavedOrder> orders = null;
+            List<SavedPawn> rows = null;
+            bool saving = Scribe.mode == LoadSaveMode.Saving;
+            if (saving)
+            {
+                orders = new List<SavedOrder>();
+                rows = new List<SavedPawn>();
+                BuildSaveRows(orders, rows);
+            }
+
+            // nothing to write: leave the nodes out, as CompDnblCargo does
+            if (!saving || rows.Count > 0)
+            {
+                Scribe_Collections.Look(ref orders, "dnblSweepOrders", LookMode.Deep);
+                Scribe_Collections.Look(ref rows, "dnblSweepPawns", LookMode.Deep);
+            }
+
+            if (Scribe.mode == LoadSaveMode.PostLoadInit)
+            {
+                loadedOrders = orders;
+                loadedPawns = rows;
+            }
+        }
+
+        private void BuildSaveRows(List<SavedOrder> orders, List<SavedPawn> rows)
+        {
+            var index = new Dictionary<SweepOrder, int>();
+            foreach (KeyValuePair<Pawn, SweepOrder> kv in activeSweeps)
+            {
+                Pawn pawn = kv.Key;
+                if (pawn == null || pawn.Destroyed || pawn.Discarded)
+                {
+                    continue;
+                }
+
+                var row = new SavedPawn
+                {
+                    pawn = pawn,
+                    active = SavedIndex(kv.Value, index, orders),
+                    started = orderStarted.Contains(pawn)
+                };
+                orderIds.TryGetValue(pawn, out row.orderId);
+                if (pausedForNeed.TryGetValue(pawn, out PauseInfo pausedNow))
+                {
+                    row.pausedNeed = string.IsNullOrEmpty(pausedNow.need) ? "a need" : pausedNow.need;
+                }
+                if (ourJob.TryGetValue(pawn, out Job handedOut) && handedOut != null && ReferenceEquals(handedOut, pawn.jobs?.curJob))
+                {
+                    row.ourJobId = handedOut.loadID;
+                }
+
+                if (queuedOrders.TryGetValue(pawn, out List<SweepOrder> queue) && queue.Count > 0)
+                {
+                    row.queued = new List<int>();
+                    foreach (SweepOrder queuedOrder in queue)
+                    {
+                        row.queued.Add(SavedIndex(queuedOrder, index, orders));
+                    }
+                }
+                rows.Add(row);
+            }
+        }
+
+        private static int SavedIndex(SweepOrder order, Dictionary<SweepOrder, int> index, List<SavedOrder> orders)
+        {
+            if (index.TryGetValue(order, out int at))
+            {
+                return at;
+            }
+
+            orders.Add(new SavedOrder
+            {
+                workGiver = order.WorkGiverDef,
+                hasStation = order.WorkstationTarget != null,
+                station = order.WorkstationTarget,
+                center = order.ScanCenter,
+                radius = order.ScanRadius,
+                centerOut = order.CenterOut,
+                orderKind = order.OrderKind,
+                maxScanDays = order.MaxScanDays
+            });
+            index[order] = orders.Count - 1;
+            return orders.Count - 1;
+        }
+
+        // Why a saved order cannot be rebuilt, or null when it can; the
+        // order itself comes out in `built`.
+        private string RebuildOrder(SavedOrder saved, out SweepOrder built)
+        {
+            built = null;
+            if (saved.workGiver == null)
+            {
+                return "its work type is no longer in the game";
+            }
+            if (!(saved.workGiver.Worker is WorkGiver_Scanner))
+            {
+                return "the WorkGiver is no longer a scanner";
+            }
+
+            if (saved.hasStation)
+            {
+                if (saved.station == null || saved.station.Destroyed)
+                {
+                    return "the station no longer exists";
+                }
+                if (saved.station.Map != map)
+                {
+                    return "the station is not on this map";
+                }
+                built = new SweepOrder(saved.workGiver, new List<LocalTargetInfo>(), saved.station);
+                built.MaxScanDays = saved.maxScanDays;
+                return null;
+            }
+
+            built = new SweepOrder(saved.workGiver, new List<LocalTargetInfo>(), null, saved.center, saved.radius,
+                saved.centerOut, PlantCompat.FilterForKind(saved.orderKind), saved.orderKind);
+            return null;
+        }
+
+        private static string SavedWhere(SavedOrder saved)
+        {
+            return saved.hasStation ? (saved.station?.LabelShort ?? "a station") : saved.center.ToString();
+        }
+
+        public override void FinalizeInit()
+        {
+            base.FinalizeInit();
+
+            List<SavedOrder> table = loadedOrders;
+            List<SavedPawn> rows = loadedPawns;
+            loadedOrders = null;
+            loadedPawns = null;
+            if (rows == null || rows.Count == 0)
+            {
+                return;
+            }
+
+            try
+            {
+                RestoreOrders(table ?? new List<SavedOrder>(), rows);
+            }
+            catch (Exception ex)
+            {
+                Logger.Warning($"Restoring open orders after load threw {ex.GetType().Name}: {ex}");
+            }
+        }
+
+        private void RestoreOrders(List<SavedOrder> table, List<SavedPawn> rows)
+        {
+            var built = new SweepOrder[table.Count];
+            var whyNot = new string[table.Count];
+            for (int i = 0; i < table.Count; i++)
+            {
+                whyNot[i] = table[i] == null ? "the saved order is unreadable" : RebuildOrder(table[i], out built[i]);
+            }
+
+            int resumed = 0, ended = 0;
+            foreach (SavedPawn row in rows)
+            {
+                try
+                {
+                    if (RestoreRow(row, table, built, whyNot))
+                    {
+                        resumed++;
+                    }
+                    else
+                    {
+                        ended++;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    ended++;
+                    Logger.Warning($"{row?.pawn?.LabelShort}: restoring this pawn's open order after load threw {ex.GetType().Name}: {ex.Message}");
+                }
+            }
+
+            Logger.Message($"Open orders after game load: {resumed} resumed, {ended} ended ({rows.Count} saved)");
+        }
+
+        private bool RestoreRow(SavedPawn row, List<SavedOrder> table, SweepOrder[] built, string[] whyNot)
+        {
+            Pawn pawn = row.pawn;
+            bool activeKnown = row.active >= 0 && row.active < table.Count && table[row.active] != null;
+            SavedOrder savedActive = activeKnown ? table[row.active] : null;
+            string id = row.orderId ?? NextOrderId();
+            string name = pawn?.LabelShort ?? "(a pawn that no longer exists)";
+            string kind = savedActive?.workGiver?.defName ?? "unknown";
+            string where = savedActive != null ? SavedWhere(savedActive) : "?";
+            int queuedCount = row.queued?.Count ?? 0;
+
+            string gone = null;
+            if (pawn == null || pawn.Destroyed || pawn.Discarded)
+            {
+                gone = "pawn gone";
+            }
+            else if (pawn.Dead)
+            {
+                gone = "pawn dead";
+            }
+            else if (!pawn.Spawned || pawn.Map != map)
+            {
+                gone = "pawn not on this map";
+            }
+            else if (!activeKnown)
+            {
+                gone = "the saved order is unreadable";
+            }
+            else if (whyNot[row.active] != null)
+            {
+                gone = whyNot[row.active];
+            }
+
+            if (gone != null)
+            {
+                Logger.Order($"ORDER {id} ended (game loaded: {gone}): {name} sweep {kind} {where}"
+                    + (queuedCount > 0 ? $"; {queuedCount} queued order{(queuedCount == 1 ? "" : "s")} dropped" : ""));
+                return false;
+            }
+
+            SweepOrder order = built[row.active];
+            activeSweeps[pawn] = order;
+            orderIds[pawn] = id;
+            if (row.started)
+            {
+                orderStarted.Add(pawn);
+            }
+            else
+            {
+                orderStarted.Remove(pawn);
+            }
+
+            int queuedKept = 0;
+            if (queuedCount > 0)
+            {
+                var queue = new List<SweepOrder>();
+                foreach (int at in row.queued)
+                {
+                    if (at >= 0 && at < built.Length && built[at] != null)
+                    {
+                        queue.Add(built[at]);
+                    }
+                    else
+                    {
+                        string queuedWhy = at >= 0 && at < whyNot.Length ? whyNot[at] : "the saved order is unreadable";
+                        Logger.Message($"{name}: a queued order was dropped after game load - {queuedWhy}");
+                    }
+                }
+                queuedKept = queue.Count;
+                if (queue.Count > 0)
+                {
+                    queuedOrders[pawn] = queue;
+                }
+            }
+
+            // The job the pawn is on came back with the save. Trusted as ours
+            // only when it is forced AND it is the very job this mod had
+            // handed the pawn at save time (matched by saved load id). Any
+            // other forced job is left unrecorded so TryReportForeignJob
+            // reads it as the player taking over and clears the order.
+            Job current = pawn.jobs?.curJob;
+            if (current != null && current.playerForced && row.ourJobId >= 0 && current.loadID == row.ourJobId)
+            {
+                ourJob[pawn] = current;
+            }
+
+            // A pause held at save is put back as it was, for every order
+            // kind, so the pawn's own eat/sleep/joy job is not read as a
+            // takeover and the order resumes once the need is met.
+            if (row.pausedNeed != null)
+            {
+                int nowTick = Find.TickManager?.TicksGame ?? 0;
+                pausedForNeed[pawn] = new PauseInfo
+                {
+                    tick = nowTick,
+                    need = row.pausedNeed,
+                    lastForceCheckTick = nowTick
+                };
+            }
+
+            Logger.Order($"ORDER {id} resumed: {name} after game load - sweep {kind} {where}"
+                + (queuedKept > 0 ? $", {queuedKept} queued" : "")
+                + (row.pausedNeed != null ? $", paused for {row.pausedNeed} (restored)" : "")
+                + $"; pawn is on {DescribeJob(current)}");
+            return true;
         }
 
         // Throttle for GiveJobFailedThrottled below - one line per pawn per
@@ -1746,6 +2114,11 @@ namespace DoNotBeLazy.Components
                 if (!isRetry)
                 {
                     Logger.Message($"{pawn.LabelShort}: paused for Food but already on {DescribeJob(curJob)} - leaving vanilla to feed it");
+                    if (pausedForNeed.TryGetValue(pawn, out PauseInfo deferred))
+                    {
+                        deferred.foodDeferredToVanilla = true;
+                        pausedForNeed[pawn] = deferred;
+                    }
                 }
                 return;
             }
@@ -1777,6 +2150,7 @@ namespace DoNotBeLazy.Components
             {
                 resumed.foodDeclineLogged = false;
                 resumed.foodDeclineReason = null;
+                resumed.foodForcedMeal = true;
                 pausedForNeed[pawn] = resumed;
             }
         }
@@ -1880,7 +2254,18 @@ namespace DoNotBeLazy.Components
             }
             else
             {
-                Logger.Warning($"{pawn.LabelShort}: still paused and not eating {FoodStuckWarnTicks} ticks after the pause began - the forced Ingest job did not take, or something replaced it. Now: {NeedMonitor.LevelsText(pawn)}; still under threshold: {held}");
+                // Worded by what happened (2026-10-18): the old text always
+                // said a forced Ingest "did not take", even when we never
+                // forced one. Names the current job, who issued it and its
+                // target so the next one is answerable from this line.
+                string what = paused.foodForcedMeal
+                    ? "the meal we forced did not take, or something replaced it"
+                    : paused.foodDeferredToVanilla
+                        ? "vanilla's own Ingest was left to feed it and it did not finish the job"
+                        : "no meal was forced";
+                string target = curJob?.targetA.Thing?.LabelShort ?? (curJob != null && curJob.targetA.IsValid ? curJob.targetA.Cell.ToString() : "none");
+                string nowText = curJob == null ? "no job" : $"{DescribeJob(curJob)} from {DescribeJobSource(curJob)}, target {target}";
+                Logger.Warning($"{pawn.LabelShort}: still paused and not eating {FoodStuckWarnTicks} ticks after the pause began - {what}. Now on: {nowText}. Levels: {NeedMonitor.LevelsText(pawn)}; still under threshold: {held}");
                 ScreenNote(pawn, $"{pawn.LabelShort}: paused a long time and not eating - still under: {held}");
             }
         }
@@ -1929,6 +2314,15 @@ namespace DoNotBeLazy.Components
             bool onNonForcedRestJob = curJob != null && !curJob.playerForced && curJob.def == JobDefOf.LayDown;
             if (!idle && !onNonForcedRestJob)
             {
+                // 2026-10-18: this return was silent. Once per pause.
+                if (!paused.foodBusyLogged)
+                {
+                    paused.foodBusyLogged = true;
+                    pausedForNeed[pawn] = paused;
+                    string busyTarget = curJob.targetA.Thing?.LabelShort ?? (curJob.targetA.IsValid ? curJob.targetA.Cell.ToString() : "none");
+                    Logger.Message($"{pawn.LabelShort}: no forced-meal retry while paused for Food - pawn is on {DescribeJob(curJob)}{(curJob.playerForced ? " (player-forced)" : "")} from {DescribeJobSource(curJob)}, target {busyTarget}, so it is not replaced ({NeedMonitor.LevelsText(pawn)})");
+                }
+
                 return;
             }
 
@@ -3158,6 +3552,18 @@ namespace DoNotBeLazy.Components
                         ? "nothing - pawn is idle"
                         : $"{DescribeJob(replacement)} from {DescribeJobSource(replacement)}";
                     Logger.Message($"{pawn.LabelShort}: forced meal ended {condition} - now on {replacementText}");
+                }
+                else if (endedJob != null && endedJob.def == JobDefOf.Ingest && paused.need.StartsWith("Food")
+                    && paused.foodDeferredToVanilla && !paused.vanillaIngestEndLogged)
+                {
+                    // 2026-10-18: the vanilla Ingest we deferred to ended while
+                    // the pause still holds; once per pause, how and at what
+                    // Food level.
+                    paused.vanillaIngestEndLogged = true;
+                    pausedForNeed[pawn] = paused;
+                    Job after = pawn.jobs?.curJob;
+                    string afterText = after == null ? "nothing - pawn is idle" : $"{DescribeJob(after)} from {DescribeJobSource(after)}";
+                    Logger.Message($"{pawn.LabelShort}: vanilla Ingest we deferred to ended {condition} while still paused for Food - now on {afterText} ({NeedMonitor.LevelsText(pawn)})");
                 }
 
                 // This is NOT a sweep task ending - the pawn is off dealing

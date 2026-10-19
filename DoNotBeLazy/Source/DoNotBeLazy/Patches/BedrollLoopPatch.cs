@@ -221,6 +221,8 @@ namespace DoNotBeLazy.Patches
                 // says it.
                 string why;
                 string outcome;
+                string bedName = Plain(bed.LabelNoCount) + " [" + bed.ThingID + "]";
+                string whereBed = DescribeWhere(bed, pawn, spawnedHolder);
 
                 if (gone)
                 {
@@ -236,14 +238,19 @@ namespace DoNotBeLazy.Patches
                         ? "Cleared that pawn's entry from PlacedBedsMapComponent.placedBeds, so it will not be offered again."
                         : "Could NOT clear the entry from PlacedBedsMapComponent.placedBeds, so the job will keep being offered and refused.";
                 }
+                else if (spawnedHolder is Pawn)
+                {
+                    why = "Another pawn is carrying it, so there is nothing to fetch yet.";
+                    outcome = "Kept that pawn's entry in PlacedBedsMapComponent.placedBeds on purpose - it is still true and the bedroll should be back on the map shortly. The job stays refused until it is.";
+                }
                 else
                 {
-                    why = $"The bedroll is being carried by {DescribeHolder(spawnedHolder)}, so there is nothing to fetch yet.";
-                    outcome = "Kept that pawn's entry in PlacedBedsMapComponent.placedBeds on purpose - it is still true and the bedroll should be back on the map shortly. The job stays refused until it is.";
+                    why = "It is not lying on the map as a bedroll, so there is nothing to fetch.";
+                    outcome = "Kept that pawn's entry in PlacedBedsMapComponent.placedBeds on purpose - it is still true. The job stays refused until the bedroll is placed again.";
                 }
 
                 Logger.Warning($"refused a Use Bedrolls TakeBedroll job for {pawn.LabelShort}: " +
-                    $"{JobLoopWatch.DescribeThing(bed)}. {why} {outcome}");
+                    $"{bedName} {whereBed}. {why} {outcome}");
             }
             catch (Exception e)
             {
@@ -297,14 +304,41 @@ namespace DoNotBeLazy.Patches
             }
         }
 
-        // Names whatever is holding the bedroll, for the one warning line.
-        // Null when the walk found nothing on the map - a caravan or a world
-        // object holds things through something that is not a Thing at all.
-        private static string DescribeHolder(Thing holder)
+        // Removes rich-text colour tags such as <color=#fff>...</color> so the
+        // log line reads as plain text.
+        private static readonly System.Text.RegularExpressions.Regex TagPattern =
+            new System.Text.RegularExpressions.Regex("<[^>]*>", System.Text.RegularExpressions.RegexOptions.Compiled);
+
+        private static string Plain(string text)
         {
-            return holder == null
-                ? "something that is not on this map"
-                : holder.LabelShort + " [" + holder.ThingID + "]";
+            return text == null ? "" : TagPattern.Replace(text, "");
+        }
+
+        // States where the bedroll is, plainly: packed or not, and the first
+        // holder up the chain that is on the map (a pawn, a container
+        // building, or the packed item lying on the ground).
+        private static string DescribeWhere(Thing bed, Pawn pawn, Thing spawnedHolder)
+        {
+            bool packed = bed.ParentHolder is RimWorld.MinifiedThing;
+            string state = packed ? "packed (minified)" : "not lying on the map";
+
+            if (spawnedHolder == null)
+            {
+                return state + ", inside something that is not on this map";
+            }
+
+            if (spawnedHolder is Pawn)
+            {
+                return state + ", carried by " + ((Pawn)spawnedHolder).LabelShort;
+            }
+
+            string name = Plain(spawnedHolder.LabelNoCount) + " [" + spawnedHolder.ThingID + "]";
+            if (spawnedHolder is RimWorld.MinifiedThing)
+            {
+                return state + ", lying on the map at " + spawnedHolder.Position;
+            }
+
+            return state + ", stored inside " + name + " at " + spawnedHolder.Position;
         }
 
         // Removes this pawn's stale record from

@@ -84,10 +84,10 @@ namespace DoNotBeLazy.Utility
 
             if (order == DesignationDefOf.CutPlant)
             {
-                return "Cut plants";
+                return KindCutPlants;
             }
 
-            return IsTree(thing) ? "Chop trees" : "Harvest plants";
+            return IsTree(thing) ? KindChopTrees : KindHarvestPlants;
         }
 
         // The pool filter for a sweep started from this thing, or null when
@@ -116,5 +116,30 @@ namespace DoNotBeLazy.Utility
             bool wantTrees = IsTree(clicked);
             return t => OrderOn(t) == DesignationDefOf.HarvestPlant && IsTree(t) == wantTrees;
         }
+
+        // The same filter rebuilt from the saved order kind (LabelFor's
+        // words), for an order restored after a game load - architecture
+        // section 26. Null for any kind that carried no filter.
+        public static Predicate<Thing> FilterForKind(string kind)
+        {
+            if (kind == KindCutPlants)
+            {
+                return t => OrderOn(t) == DesignationDefOf.CutPlant;
+            }
+            if (kind == KindChopTrees)
+            {
+                return t => OrderOn(t) == DesignationDefOf.HarvestPlant && IsTree(t);
+            }
+            if (kind == KindHarvestPlants)
+            {
+                return t => OrderOn(t) == DesignationDefOf.HarvestPlant && !IsTree(t);
+            }
+            return null;
+        }
+
+        // The three order words, shared by LabelFor and FilterForKind.
+        private const string KindCutPlants = "Cut plants";
+        private const string KindChopTrees = "Chop trees";
+        private const string KindHarvestPlants = "Harvest plants";
     }
 }
