@@ -15,8 +15,22 @@ namespace DoNotBeLazy.Core
         // existing save keeps the behaviour it has.
         public bool centerOutOrder = true;
 
-        public float needThreshold = 0.05f;
+        // Section 28 (2026-10-22): hunger and recreation used to share one
+        // slider (needThreshold). They are separate now. A saved
+        // needThreshold seeds both on load - see ExposeData.
+        // Section 30 (2026-10-24): hungerThreshold, recreationThreshold and
+        // restThreshold are no longer read or shown; the safety* fields below
+        // are the single set. Still scribed so an old file loads cleanly.
+        public float hungerThreshold = 0.05f;
+        public float recreationThreshold = 0.05f;
         public float moodThreshold = 0.10f;
+
+        // Section 28: the safety net, for colonists NOT on a `*` order.
+        // Same three needs, own values. Level at or below the value sends
+        // the pawn to eat / bed / recreation. 0 switches that need off.
+        public float safetyHungerThreshold = 0.10f;
+        public float safetyRecreationThreshold = 0.10f;
+        public float safetySleepThreshold = 0.10f;
 
         // Rest gets its own, higher threshold for the same reason mood does:
         // 5% rest is not "getting tired", it is a pawn about to collapse
@@ -76,8 +90,9 @@ namespace DoNotBeLazy.Core
         // number. Added 2026-09-12 with the number boxes; see architecture
         // doc section 7.
         private string sweepRadiusBuffer;
-        private string needThresholdBuffer;
-        private string restThresholdBuffer;
+        private string safetyHungerBuffer;
+        private string safetyRecreationBuffer;
+        private string safetySleepBuffer;
         private string moodThresholdBuffer;
 
         // Row geometry for a slider with a number box beside it. 22f is the
@@ -96,7 +111,20 @@ namespace DoNotBeLazy.Core
             base.ExposeData();
             Scribe_Values.Look(ref sweepRadius, "sweepRadius", 16);
             Scribe_Values.Look(ref centerOutOrder, "centerOutOrder", true);
-            Scribe_Values.Look(ref needThreshold, "needThreshold", 0.05f);
+            // Section 28 migration: -1 means "not saved yet". A file from
+            // before the split holds only needThreshold, which seeds both.
+            // Read only when loading; never written again.
+            float legacyNeed = -1f;
+            if (Scribe.mode == LoadSaveMode.LoadingVars)
+            {
+                Scribe_Values.Look(ref legacyNeed, "needThreshold", -1f);
+            }
+
+            Scribe_Values.Look(ref hungerThreshold, "hungerThreshold", legacyNeed >= 0f ? legacyNeed : 0.05f);
+            Scribe_Values.Look(ref recreationThreshold, "recreationThreshold", legacyNeed >= 0f ? legacyNeed : 0.05f);
+            Scribe_Values.Look(ref safetyHungerThreshold, "safetyHungerThreshold", 0.10f);
+            Scribe_Values.Look(ref safetyRecreationThreshold, "safetyRecreationThreshold", 0.10f);
+            Scribe_Values.Look(ref safetySleepThreshold, "safetySleepThreshold", 0.10f);
             Scribe_Values.Look(ref moodThreshold, "moodThreshold", 0.10f);
             Scribe_Values.Look(ref restThreshold, "restThreshold", 0.10f);
             Scribe_Values.Look(ref verboseLogging, "verboseLogging", true);
@@ -154,12 +182,15 @@ namespace DoNotBeLazy.Core
             Text.Font = GameFont.Small;
 
             listing.Gap();
-            listing.Label($"Need interrupt threshold (hunger, recreation): {needThreshold:P0}");
-            needThreshold = SliderWithPercentBox(listing, needThreshold, 0.01f, 0.20f, ref needThresholdBuffer);
+            listing.Label("Need thresholds (section 30): one per need, for every pawn. Below it the pawn is sent to eat, bed or recreation - a * order pauses for it, other colonists are sent by the safety net. 0% switches that need off. The safety net skips drafted, downed, in a mental state, already doing it, or on a job you forced:");
+            listing.Label($"Hunger threshold: {safetyHungerThreshold:P0}");
+            safetyHungerThreshold = SliderWithPercentBox(listing, safetyHungerThreshold, 0f, 0.30f, ref safetyHungerBuffer);
 
-            listing.Gap();
-            listing.Label($"Sleep interrupt threshold: {restThreshold:P0}");
-            restThreshold = SliderWithPercentBox(listing, restThreshold, 0.01f, 0.30f, ref restThresholdBuffer);
+            listing.Label($"Recreation threshold: {safetyRecreationThreshold:P0}");
+            safetyRecreationThreshold = SliderWithPercentBox(listing, safetyRecreationThreshold, 0f, 0.30f, ref safetyRecreationBuffer);
+
+            listing.Label($"Sleep threshold: {safetySleepThreshold:P0}");
+            safetySleepThreshold = SliderWithPercentBox(listing, safetySleepThreshold, 0f, 0.30f, ref safetySleepBuffer);
 
             listing.Gap();
             listing.Label($"Mood interrupt threshold: {moodThreshold:P0}");

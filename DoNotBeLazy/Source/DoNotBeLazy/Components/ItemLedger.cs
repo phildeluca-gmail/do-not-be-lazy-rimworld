@@ -101,13 +101,19 @@ namespace DoNotBeLazy.Components
             }
         }
 
+        // Scribed straight into this field and passed every pass; a local
+        // would be lost between LoadingVars and FinalizeInit.
+        private List<Row> loadedRows;
+
+        // Total for the one game-wide load line (LeftoverCargo.LoadedGame); reset in its constructor.
+        public static int LoadSummaryItemRows;
+
         public override void ExposeData()
         {
-            List<Row> rows = null;
             bool saving = Scribe.mode == LoadSaveMode.Saving;
             if (saving)
             {
-                rows = new List<Row>();
+                List<Row> rows = new List<Row>();
                 foreach (Entry e in open)
                 {
                     if (e.pawn == null || e.pawn.Destroyed || e.pawn.Discarded)
@@ -126,25 +132,44 @@ namespace DoNotBeLazy.Components
                     }
                     rows.Add(row);
                 }
+                loadedRows = rows;
             }
 
-            if (!saving || rows.Count > 0)
+            if (!saving || loadedRows.Count > 0)
             {
-                Scribe_Collections.Look(ref rows, "dnblLedger", LookMode.Deep);
+                Scribe_Collections.Look(ref loadedRows, "dnblLedger", LookMode.Deep);
             }
 
-            if (Scribe.mode == LoadSaveMode.PostLoadInit && rows != null)
+            if (saving)
             {
-                foreach (Row row in rows)
+                loadedRows = null;
+            }
+        }
+
+        // Runs after every pass, so each row's pawn and things are resolved.
+        public override void FinalizeInit()
+        {
+            base.FinalizeInit();
+
+            List<Row> rows = loadedRows;
+            loadedRows = null;
+            if (rows == null || rows.Count == 0)
+            {
+                return;
+            }
+
+            LoadSummaryItemRows += rows.Count;
+
+            Logger.Message($"Load: read {rows.Count} saved ITEM row(s); restoring");
+            foreach (Row row in rows)
+            {
+                try
                 {
-                    try
-                    {
-                        Restore(row);
-                    }
-                    catch (Exception ex)
-                    {
-                        Logger.Warning($"Restoring ITEM {row?.id} after load threw {ex.GetType().Name}: {ex.Message}");
-                    }
+                    Restore(row);
+                }
+                catch (Exception ex)
+                {
+                    Logger.Warning($"Restoring ITEM {row?.id} after load threw {ex.GetType().Name}: {ex.Message}");
                 }
             }
         }

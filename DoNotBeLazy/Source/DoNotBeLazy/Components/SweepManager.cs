@@ -286,6 +286,22 @@ namespace DoNotBeLazy.Components
             public bool foodBusyLogged;
             public bool vanillaIngestEndLogged;
 
+            // Section 27, 2026-10-19: watch on an Ingest job that is making no
+            // progress. ingestWatchId and ingestLoggedId are Job.loadID (fresh
+            // per JobMaker.MakeJob, verified). The window restarts whenever the
+            // pawn's cell, the driver's toil index or Food changes, or the pawn
+            // is moving. stalledFood is the most recent target given up on.
+            public bool ingestWatching;
+            public int ingestWatchId;
+            public int ingestWatchSince;
+            public float ingestWatchFood;
+            public int ingestWatchToil;
+            // Section 28: the smallest distance (cells, straight-line) to the
+            // meal seen so far; the window restarts only when it shrinks.
+            public float ingestWatchDist;
+            public int ingestLoggedId;
+            public Thing stalledFood;
+
             // Change B, 2026-10-02: the "held by Recreation/mood only" line
             // has been written for this pause.
             public bool otherNeedLogged;
@@ -557,31 +573,36 @@ namespace DoNotBeLazy.Components
         private List<SavedOrder> loadedOrders;
         private List<SavedPawn> loadedPawns;
 
+        // Totals for the one game-wide load line (LeftoverCargo.LoadedGame); reset in its constructor.
+        public static int LoadSummaryOrderRows;
+        public static int LoadSummaryMaps;
+
         public override void ExposeData()
         {
             base.ExposeData();
 
-            List<SavedOrder> orders = null;
-            List<SavedPawn> rows = null;
+            // The lists go straight into instance fields and are passed in every
+            // pass: ExposeData runs once per pass and a local would be lost
+            // between LoadingVars (where the list is built) and FinalizeInit.
             bool saving = Scribe.mode == LoadSaveMode.Saving;
             if (saving)
             {
-                orders = new List<SavedOrder>();
-                rows = new List<SavedPawn>();
-                BuildSaveRows(orders, rows);
+                loadedOrders = new List<SavedOrder>();
+                loadedPawns = new List<SavedPawn>();
+                BuildSaveRows(loadedOrders, loadedPawns);
             }
 
             // nothing to write: leave the nodes out, as CompDnblCargo does
-            if (!saving || rows.Count > 0)
+            if (!saving || loadedPawns.Count > 0)
             {
-                Scribe_Collections.Look(ref orders, "dnblSweepOrders", LookMode.Deep);
-                Scribe_Collections.Look(ref rows, "dnblSweepPawns", LookMode.Deep);
+                Scribe_Collections.Look(ref loadedOrders, "dnblSweepOrders", LookMode.Deep);
+                Scribe_Collections.Look(ref loadedPawns, "dnblSweepPawns", LookMode.Deep);
             }
 
-            if (Scribe.mode == LoadSaveMode.PostLoadInit)
+            if (saving)
             {
-                loadedOrders = orders;
-                loadedPawns = rows;
+                loadedOrders = null;
+                loadedPawns = null;
             }
         }
 
@@ -695,9 +716,13 @@ namespace DoNotBeLazy.Components
             loadedPawns = null;
             if (rows == null || rows.Count == 0)
             {
+                // nothing saved for this map: say nothing (new games and temporary maps land here); the game-wide line is in LeftoverCargo.LoadedGame
                 return;
             }
 
+            LoadSummaryOrderRows += rows.Count;
+            LoadSummaryMaps++;
+            Logger.Message($"Load: map {map?.uniqueID} read {rows.Count} saved pawn row(s) and {(table == null ? 0 : table.Count)} saved order(s); restoring");
             try
             {
                 RestoreOrders(table ?? new List<SavedOrder>(), rows);
@@ -708,6 +733,7 @@ namespace DoNotBeLazy.Components
             }
         }
 
+        // LOCKED (dnbl H7) - passed 5x in play 2026-10-22; do not change without the user's explicit order.
         private void RestoreOrders(List<SavedOrder> table, List<SavedPawn> rows)
         {
             var built = new SweepOrder[table.Count];
@@ -974,6 +1000,51 @@ namespace DoNotBeLazy.Components
         private const int MaxGiveJobThrowsInARow = 5;
         private static readonly Dictionary<Pawn, int> giveJobThrowStreak = new Dictionary<Pawn, int>();
 
+        // Section 30 (2026-10-24): every job GiveJob hands out also carries
+        // playerForced (TryTakeOrderedJob sets it unconditionally - see the
+        // comment above TryReportForeignJob), so the flag alone cannot tell
+        // the player's order from this mod's. The jobs this mod issued are
+        // remembered here by reference and loadID (a pooled, reused Job gets
+        // a new loadID) with the tick they were issued; entries older than
+        // ModIssuedJobTicks are dropped when a new one is added.
+        private const int ModIssuedJobTicks = 60000;
+        private static readonly Dictionary<Job, KeyValuePair<int, int>> modIssuedJobs = new Dictionary<Job, KeyValuePair<int, int>>();
+
+        public static bool IsModIssued(Job job)
+        {
+            return job != null
+                && modIssuedJobs.TryGetValue(job, out KeyValuePair<int, int> stamp)
+                && stamp.Key == job.loadID;
+        }
+
+        public static void ResetModIssuedJobs()
+        {
+            modIssuedJobs.Clear();
+        }
+
+        private static void NoteModIssued(Job job)
+        {
+            int now = Find.TickManager.TicksGame;
+            if (modIssuedJobs.Count > 64)
+            {
+                List<Job> old = new List<Job>();
+                foreach (KeyValuePair<Job, KeyValuePair<int, int>> entry in modIssuedJobs)
+                {
+                    if (now - entry.Value.Value > ModIssuedJobTicks)
+                    {
+                        old.Add(entry.Key);
+                    }
+                }
+
+                foreach (Job gone in old)
+                {
+                    modIssuedJobs.Remove(gone);
+                }
+            }
+
+            modIssuedJobs[job] = new KeyValuePair<int, int>(job.loadID, now);
+        }
+
         public static bool GiveJob(Pawn pawn, Job job, bool appendBehindCurrentJob = false, string forcedKind = null)
         {
             bool took = false;
@@ -997,6 +1068,7 @@ namespace DoNotBeLazy.Components
             if (took)
             {
                 giveJobThrowStreak.Remove(pawn);
+                NoteModIssued(job);
             }
 
             if (forcedKind != null)
@@ -1130,7 +1202,7 @@ namespace DoNotBeLazy.Components
         // answer. job.bill and Bill.recipe are both plain fields (read off
         // lib\Assembly-CSharp.dll, not remembered), so this cannot throw and
         // allocates only when there is a bill. Added 2026-09-18.
-        private static string DescribeJob(Job job)
+        internal static string DescribeJob(Job job)
         {
             if (job?.def == null)
             {
@@ -2106,10 +2178,10 @@ namespace DoNotBeLazy.Components
         // without clearing Food, and this skip logged nothing, so the log
         // could not even show that a decision was made here. One line
         // fixes it.
-        private void TryForceEatNow(Pawn pawn, bool isRetry = false)
+        private void TryForceEatNow(Pawn pawn, bool isRetry = false, bool replaceIngest = false)
         {
             Job curJob = pawn.jobs?.curJob;
-            if (curJob != null && curJob.def == JobDefOf.Ingest)
+            if (!replaceIngest && curJob != null && curJob.def == JobDefOf.Ingest)
             {
                 if (!isRetry)
                 {
@@ -2123,8 +2195,14 @@ namespace DoNotBeLazy.Components
                 return;
             }
 
-            string tag = isRetry ? "retry: " : "";
-            Job job = NeedMonitor.TryFindBestFoodJob(pawn, out int candidateCount, out float moodEffect, out string declineReason);
+            string tag = replaceIngest ? "replacing stalled Ingest: " : isRetry ? "retry: " : "";
+            Thing skip = pausedForNeed.TryGetValue(pawn, out PauseInfo skipInfo) ? skipInfo.stalledFood : null;
+
+            // Section 28: "Drop nothing except current job cargo". Only what
+            // the current job holds in the hands (carryTracker), never the
+            // inventory pack. Dropped once a meal is found (or when the
+            // carried thing is the meal) - see FindMealDroppingCargo.
+            Job job = NeedMonitor.FindMealDroppingCargo(pawn, out int candidateCount, out float moodEffect, out string declineReason, out string choiceNote, out string dropped, skip);
             if (job == null)
             {
                 LogFoodDecline(pawn, tag, declineReason, candidateCount);
@@ -2141,7 +2219,7 @@ namespace DoNotBeLazy.Components
             ourJob[pawn] = job;
             GiveJob(pawn, job, false, "forced meal");
             Thing food = job.targetA.Thing;
-            Logger.Message($"{pawn.LabelShort}: {tag}forced to eat {food?.LabelShort ?? job.def.defName} (mood effect {moodEffect:F0}, {candidateCount} candidate{(candidateCount == 1 ? "" : "s")} considered) - sweep stays paused until Food is satisfied");
+            Logger.Message($"{pawn.LabelShort}: {tag}forced to eat {food?.LabelShort ?? job.def.defName} (mood effect {moodEffect:F0}, {candidateCount} candidate{(candidateCount == 1 ? "" : "s")} considered; {choiceNote}){dropped} - sweep stays paused until Food is satisfied");
 
             // A forced meal succeeded - clear the decline suppression below
             // so a fresh decline later in the same pause (if the pawn gets
@@ -2155,6 +2233,50 @@ namespace DoNotBeLazy.Components
             }
         }
 
+        // Section 28. Drops the thing the pawn's current job is carrying, if
+        // any, and returns a log fragment (" , dropped X at Y" or ""). The
+        // inventory pack is never touched. A pawn mid-Ingest keeps its
+        // meal; callers here never run for one except a stall replacement,
+        // where the stalled meal going back on the map is wanted.
+        // Pawn_CarryTracker.TryDropCarriedThing(IntVec3, ThingPlaceMode,
+        // out Thing, Action) - verified by reflection 2026-10-22.
+        internal static string DropCurrentJobCargo(Pawn pawn)
+        {
+            Thing carried = pawn.carryTracker?.CarriedThing;
+            if (carried == null || carried is Pawn || !pawn.Spawned)
+            {
+                return "";
+            }
+
+            string label = carried.LabelShort;
+            if (pawn.carryTracker.TryDropCarriedThing(pawn.Position, ThingPlaceMode.Near, out Thing _))
+            {
+                return $"; dropped the carried {label} at {pawn.Position} first";
+            }
+
+            return $"; could not drop the carried {label}";
+        }
+
+        // Section 28, the safety net's recreation job: vanilla's own giver,
+        // the same call TryForceJoyIfStuck makes (that method is locked and
+        // keeps its own copy of these lines).
+        internal static Job FindVanillaJoyJob(Pawn pawn)
+        {
+            if (joyGiver == null)
+            {
+                joyGiver = new JobGiver_GetJoy();
+                joyGiver.ResolveReferences();
+            }
+
+            Job job = joyGiver.TryIssueJobPackage(pawn, default(JobIssueParams)).Job;
+            if (job != null)
+            {
+                job.ignoreJoyTimeAssignment = true;
+            }
+
+            return job;
+        }
+
         // Review 2026-09-28: a pawn with no eligible food logged this
         // warning every ForceEatRetryTicks for as long as the pause
         // lasted. One line per pause per distinct reason now - same shape
@@ -2166,13 +2288,13 @@ namespace DoNotBeLazy.Components
         {
             if (pausedForNeed.TryGetValue(pawn, out PauseInfo paused))
             {
-                if (paused.foodDeclineLogged && paused.foodDeclineReason == declineReason)
+                if (paused.foodDeclineLogged && paused.foodDeclineReason == NeedMonitor.DeclineKey(declineReason))
                 {
                     return;
                 }
 
                 paused.foodDeclineLogged = true;
-                paused.foodDeclineReason = declineReason;
+                paused.foodDeclineReason = NeedMonitor.DeclineKey(declineReason);
                 pausedForNeed[pawn] = paused;
             }
 
@@ -2310,6 +2432,13 @@ namespace DoNotBeLazy.Components
             }
 
             Job curJob = pawn.jobs?.curJob;
+            CheckIngestStall(pawn, curJob);
+            curJob = pawn.jobs?.curJob;
+            if (!pausedForNeed.TryGetValue(pawn, out paused))
+            {
+                return;
+            }
+
             bool idle = curJob == null || (IdleJobDefs.Contains(curJob.def) && !curJob.playerForced);
             bool onNonForcedRestJob = curJob != null && !curJob.playerForced && curJob.def == JobDefOf.LayDown;
             if (!idle && !onNonForcedRestJob)
@@ -2377,6 +2506,108 @@ namespace DoNotBeLazy.Components
             // One line per retry (already throttled to ForceEatRetryTicks).
             Logger.Message($"{pawn.LabelShort}: retrying a forced meal - {NeedMonitor.LevelsText(pawn)}");
             TryForceEatNow(pawn, isRetry: true);
+        }
+
+        // Section 27, 2026-10-19. A Food-paused pawn on an Ingest job that has
+        // not raised Food for IngestStallTicks gets a forced meal of our own
+        // instead. Called from TryForceEatIfStuck, so it runs at the
+        // NeedMonitor interval and only for a paused pawn. Guess: 2000 ticks.
+        private const int IngestStallTicks = 2000;
+
+        private void CheckIngestStall(Pawn pawn, Job curJob)
+        {
+            if (!pausedForNeed.TryGetValue(pawn, out PauseInfo paused))
+            {
+                return;
+            }
+
+            int now = Find.TickManager.TicksGame;
+            if (curJob == null || curJob.def != JobDefOf.Ingest)
+            {
+                if (paused.ingestWatching)
+                {
+                    paused.ingestWatching = false;
+                    pausedForNeed[pawn] = paused;
+                }
+
+                return;
+            }
+
+            // A player-ordered Ingest is never replaced, unless it is the
+            // forced meal this mod gave (GiveJob also sets playerForced).
+            if (curJob.playerForced
+                && !(ourJob.TryGetValue(pawn, out Job mine) && mine != null && ReferenceEquals(mine, curJob) && mine.loadID == curJob.loadID))
+            {
+                paused.ingestWatching = false;
+                pausedForNeed[pawn] = paused;
+                return;
+            }
+
+            // Section 28 (2026-10-22): real progress only. Walking no longer
+            // counts by itself - the pawn must be getting nearer the meal, or
+            // Food rises, or the driver moves to its next toil (picked up,
+            // started chewing). A pawn walking in circles or stuck against
+            // something while "moving" now stalls.
+            float food = pawn.needs?.food?.CurLevelPercentage ?? 1f;
+            int toil = pawn.jobs?.curDriver?.CurToilIndex ?? -1;
+            float dist = curJob.targetA.IsValid ? pawn.Position.DistanceTo(curJob.targetA.Cell) : 0f;
+            bool newJob = !paused.ingestWatching || paused.ingestWatchId != curJob.loadID;
+            bool closer = !newJob && dist < paused.ingestWatchDist - 0.5f;
+            if (newJob
+                || closer
+                || paused.ingestWatchToil != toil
+                || food > paused.ingestWatchFood + 0.01f)
+            {
+                paused.ingestWatching = true;
+                paused.ingestWatchId = curJob.loadID;
+                paused.ingestWatchSince = now;
+                paused.ingestWatchFood = food;
+                paused.ingestWatchToil = toil;
+                paused.ingestWatchDist = newJob || closer ? dist : paused.ingestWatchDist;
+                pausedForNeed[pawn] = paused;
+                return;
+            }
+
+            int watched = now - paused.ingestWatchSince;
+            if (watched < IngestStallTicks)
+            {
+                return;
+            }
+
+            Thing stalledOn = curJob.targetA.Thing;
+            if (stalledOn != null)
+            {
+                paused.stalledFood = stalledOn;
+            }
+
+            // Restart the window first, so a decline below is retried one
+            // window later rather than every poll.
+            paused.ingestWatchSince = now;
+
+            // One stall line per job; the retry below still runs each window.
+            if (paused.ingestLoggedId != curJob.loadID)
+            {
+                paused.ingestLoggedId = curJob.loadID;
+                Logger.Message($"{pawn.LabelShort}: Ingest stalled - {watched} ticks without progress on toil {toil} of {DescribeJob(curJob)} from {DescribeJobSource(curJob)}, target {stalledOn?.LabelShort ?? "none"}, pawn at {pawn.Position} ({(pawn.pather != null && pawn.pather.Moving ? "still moving" : "not moving")}), meal at {stalledOn?.Position.ToString() ?? "none"}, {paused.ingestWatchDist:F0} cells from it at best, Food has not risen ({NeedMonitor.LevelsText(pawn)}) - trying to force another meal");
+            }
+
+            pausedForNeed[pawn] = paused;
+
+            // TryForceEatNow overwrites ourJob[pawn] before the old job ends,
+            // so Notify_JobEnded never logs "forced meal ended" for it. When
+            // the stalled job was our own forced meal, write its ending here,
+            // but only if the call really replaced it (a decline leaves the
+            // old meal running and is logged elsewhere).
+            bool stalledWasOurs = ourJob.TryGetValue(pawn, out Job oldMine) && oldMine != null
+                && ReferenceEquals(oldMine, curJob) && oldMine.loadID == curJob.loadID;
+
+            TryForceEatNow(pawn, isRetry: true, replaceIngest: true);
+
+            if (stalledWasOurs
+                && (!ourJob.TryGetValue(pawn, out Job newMine) || newMine == null || !ReferenceEquals(newMine, oldMine)))
+            {
+                Logger.Message($"{pawn.LabelShort}: forced meal ended because it stalled ({watched} ticks, target {stalledOn?.LabelShort ?? "none"}) - replaced by another forced meal");
+            }
         }
 
         // Why TryForceEatIfStuck did not retry, once per distinct reason

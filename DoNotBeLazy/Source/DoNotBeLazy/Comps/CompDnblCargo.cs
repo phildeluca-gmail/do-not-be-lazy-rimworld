@@ -21,8 +21,9 @@ namespace DoNotBeLazy.Comps
     // only plain Thing. A pawn is always ThingWithComps, so tagging the
     // pawn is the only place this can safely live.
     //
-    // Registered onto every humanlike ThingDef with thingClass="Pawn" by
-    // Patches/DnblCargoComp.xml (a vanilla XML patch, not Harmony). Narrowed
+    // Registered onto every humanlike pawn ThingDef in code by
+    // CargoCompRegistration (the old XML patch never matched anything,
+    // fixed 2026-10-19). Narrowed
     // further to colonists only at runtime, below - see AppliesToThisPawn.
     //
     // JobDriver_StuffAndHaul registers each item it picks into this set the
@@ -38,7 +39,7 @@ namespace DoNotBeLazy.Comps
         // logic only to colonists. Mechanoids never pick anything up, the
         // animals are okay and already provide a bonus, and raiders don't
         // have time to stuff their inventory. Most animals don't haul, so
-        // checking them is nonsensical anyway." Patches/DnblCargoComp.xml
+        // checking them is nonsensical anyway." CargoCompRegistration
         // already keeps this comp off every animal and mechanoid ThingDef,
         // but a hostile or prisoner Human is still the same ThingDef as a
         // colonist, so that XML narrowing cannot finish the job - only a

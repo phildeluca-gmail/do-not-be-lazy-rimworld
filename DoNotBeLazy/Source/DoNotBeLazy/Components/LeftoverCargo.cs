@@ -99,6 +99,10 @@ namespace DoNotBeLazy.Components
             activeDeliveries.Clear();
             running.Clear();
             loadedRows = null;
+            // per-game reset: a new Game constructs its components before anything loads
+            SweepManager.LoadSummaryOrderRows = 0;
+            SweepManager.LoadSummaryMaps = 0;
+            ItemLedger.LoadSummaryItemRows = 0;
             if (!quitHooked)
             {
                 quitHooked = true;
@@ -280,12 +284,13 @@ namespace DoNotBeLazy.Components
 
         public override void ExposeData()
         {
-            List<Row> rows = null;
+            // Scribed straight into a static field and passed every pass; a
+            // local would be lost between LoadingVars and LoadedGame.
             bool saving = Scribe.mode == LoadSaveMode.Saving;
             if (saving)
             {
                 FlushDropBatches("game saved");
-                rows = new List<Row>();
+                List<Row> rows = new List<Row>();
                 foreach (Pending p in pending.Values.Concat(running))
                 {
                     if (p.pawn == null || p.pawn.Destroyed || p.pawn.Discarded || p.job == null)
@@ -302,16 +307,17 @@ namespace DoNotBeLazy.Components
                         things = p.things.Where(t => t != null && !t.Destroyed && !t.Discarded).ToList()
                     });
                 }
-            }
-
-            if (!saving || rows.Count > 0)
-            {
-                Scribe_Collections.Look(ref rows, "dnblDeliveries", LookMode.Deep);
-            }
-
-            if (Scribe.mode == LoadSaveMode.PostLoadInit)
-            {
                 loadedRows = rows;
+            }
+
+            if (!saving || loadedRows.Count > 0)
+            {
+                Scribe_Collections.Look(ref loadedRows, "dnblDeliveries", LookMode.Deep);
+            }
+
+            if (saving)
+            {
+                loadedRows = null;
             }
         }
 
@@ -321,11 +327,19 @@ namespace DoNotBeLazy.Components
         {
             List<Row> rows = loadedRows;
             loadedRows = null;
-            if (rows == null)
+            int deliveryRows = rows == null ? 0 : rows.Count;
+            int orderRows = SweepManager.LoadSummaryOrderRows;
+            int itemRows = ItemLedger.LoadSummaryItemRows;
+            // the one game-wide load line; LoadedGame runs only when a save is loaded, after every map is finalised
+            Logger.Message(orderRows + itemRows + deliveryRows == 0
+                ? "Load: no open orders, ITEM entries or leftover deliveries were saved in this game, nothing to restore"
+                : $"Load: game load read {orderRows} saved pawn order row(s) on {SweepManager.LoadSummaryMaps} map(s), {itemRows} ITEM row(s), {deliveryRows} leftover delivery row(s)");
+            if (rows == null || rows.Count == 0)
             {
                 return;
             }
 
+            Logger.Message($"Load: read {rows.Count} saved leftover delivery row(s); restoring");
             foreach (Row row in rows)
             {
                 try
@@ -838,11 +852,20 @@ namespace DoNotBeLazy.Components
             job.haulMode = HaulMode.ToCellStorage;
 
             string now = pawn.CurJob?.def?.defName ?? "no job";
-            Logger.Order($"ORDER {orderId} issued: {pawn.LabelShort} leftover bulk delivery - {p.summary}; queued behind {now} (keys: none - issued by the mod's own check, not a click)");
+            // Section 31: an idle job the player did not force is interrupted
+            // rather than queued behind (a queued job waits out the whole idle).
+            Job cur = pawn.CurJob;
+            bool idle = cur != null && !cur.playerForced && !pawn.Drafted && pawn.GetLord() == null
+                && (cur.def == JobDefOf.Wait_MaintainPosture
+                    || cur.def == JobDefOf.Wait_Wander
+                    || cur.def == JobDefOf.GotoWander
+                    || (cur.def == JobDefOf.Wait && cur.workGiverDef == null));
+            string how = idle ? $"replaced idle {now}" : $"queued behind {now}";
+            Logger.Order($"ORDER {orderId} issued: {pawn.LabelShort} leftover bulk delivery - {p.summary}; {how} (keys: none - issued by the mod's own check, not a click)");
 
             p.job = job;
             pending[job] = p;
-            bool took = SweepManager.GiveJob(pawn, job, true);
+            bool took = SweepManager.GiveJob(pawn, job, !idle);
             if (!took)
             {
                 if (pending.Remove(job))
