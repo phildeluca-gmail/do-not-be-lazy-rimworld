@@ -195,33 +195,41 @@ namespace DoNotBeLazy.Jobs
         }
 
         // Shared by all three substitution points (HaulInterceptPatch,
-        // TransporterInterceptPatch, SweepManager.WrapForVehicleStuffing) -
-        // same reason CanReserveItem's log throttle is shared.
-        // Once per pawn per ThingDef per game hour. Keyed by def, not by Thing:
-        // every stack of Food is a different Thing, so the old per-Thing key
-        // logged again for each stack the pawn was offered (10-14 repeats of
-        // identical numbers, 2026-10-12).
+        // TransporterInterceptPatch, SweepManager.WrapForVehicleStuffing).
+        // 2026-10-30, user: "would overencumber should only report once per
+        // pawn per order, why do anything else?" One click by one pawn had
+        // written ~45 lines in a second (one per item def). Now one line per
+        // pawn per ORDER id (SweepManager.CurrentOrderIdOrNull); the line
+        // names the first item skipped and its numbers. With no order id
+        // (a plain right-click haul or load, outside a sweep) there is no
+        // order to key on, so the pawn gets one line per game hour.
         internal static void LogOverencumberSkipThrottled(Pawn pawn, Thing thing, string message)
         {
             if (pawn == null || thing == null || Find.TickManager == null)
             {
                 return;
             }
-            if (!overencumberDefLogExpiry.TryGetValue(pawn, out Dictionary<ThingDef, int> byDef))
+            string orderId = SweepManager.CurrentOrderIdOrNull(pawn);
+            int now = Find.TickManager.TicksGame;
+            if (overencumberLogged.TryGetValue(pawn, out OverencumberMark mark))
             {
-                byDef = new Dictionary<ThingDef, int>();
-                overencumberDefLogExpiry[pawn] = byDef;
+                if (orderId != null ? mark.orderId == orderId : (mark.orderId == null && now < mark.expiryTick))
+                {
+                    return;
+                }
             }
-            if (byDef.TryGetValue(thing.def, out int expiryTick) && Find.TickManager.TicksGame < expiryTick)
-            {
-                return;
-            }
-            byDef[thing.def] = Find.TickManager.TicksGame + GenDate.TicksPerHour;
-            Logger.Message(message + OverencumberNumbers(pawn, thing));
+            overencumberLogged[pawn] = new OverencumberMark { orderId = orderId, expiryTick = now + GenDate.TicksPerHour };
+            Logger.Message(message + OverencumberNumbers(pawn, thing) + (orderId != null ? $" (first item skipped; no more reported for {orderId})" : " (first item skipped; no more reported for this pawn for an hour)"));
         }
 
-        private static readonly Dictionary<Pawn, Dictionary<ThingDef, int>> overencumberDefLogExpiry
-            = new Dictionary<Pawn, Dictionary<ThingDef, int>>();
+        private struct OverencumberMark
+        {
+            public string orderId;
+            public int expiryTick;
+        }
+
+        private static readonly Dictionary<Pawn, OverencumberMark> overencumberLogged
+            = new Dictionary<Pawn, OverencumberMark>();
 
         // 2026-10-12: stuff-first hauling is for pawns who can fill an
         // inventory pack. Verified by reflection on lib\Assembly-CSharp.dll:
@@ -239,7 +247,7 @@ namespace DoNotBeLazy.Jobs
         internal static void ResetLogThrottles()
         {
             ignoredPawnsLogged.Clear();
-            overencumberDefLogExpiry.Clear();
+            overencumberLogged.Clear();
         }
 
         internal static bool CanStuffPack(Pawn pawn)

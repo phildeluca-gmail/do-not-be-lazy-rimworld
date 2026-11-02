@@ -57,10 +57,25 @@ namespace DoNotBeLazy.Components
         }
         private static readonly Dictionary<Pawn, SkipNote> skipLogged = new Dictionary<Pawn, SkipNote>();
 
+        // Section 34 decision: pawns told once, this low-mood episode, that
+        // recreation cannot help.
+        private static readonly HashSet<Pawn> moodFutileLogged = new HashSet<Pawn>();
+
         // Section 29: needs already alerted for a drafted pawn ("Food",
         // "Rest"). A need leaves the set when it recovers; the pawn leaves it
         // when undrafted, so a redraft alerts again.
         private static readonly Dictionary<Pawn, HashSet<string>> draftedAlerted = new Dictionary<Pawn, HashSet<string>>();
+
+        // Section 34 item 4.4: ONE accumulated letter for every drafted pawn
+        // below a food or rest threshold. draftedLow is rebuilt each pass
+        // (pawn -> "Food 8%, Rest 6%"); letteredPawns is who the open letter
+        // lists. A pass that finds a pawn not yet listed replaces the letter
+        // (the previous one is removed from the letter stack) with one
+        // listing everybody now low; a pass where nobody is low removes it.
+        // A pawn who recovers or is undrafted drops off the next replacement.
+        private static readonly Dictionary<Pawn, string> draftedLow = new Dictionary<Pawn, string>();
+        private static readonly HashSet<Pawn> letteredPawns = new HashSet<Pawn>();
+        private static Letter draftedLetter;
 
         // Called from the NeedMonitor constructor: a new or loaded game must
         // not inherit the last game's pass tick, timers or Pawn references.
@@ -70,7 +85,11 @@ namespace DoNotBeLazy.Components
             quietUntil.Clear();
             lastDecline.Clear();
             skipLogged.Clear();
+            moodFutileLogged.Clear();
             draftedAlerted.Clear();
+            draftedLow.Clear();
+            letteredPawns.Clear();
+            draftedLetter = null;
             SweepManager.ResetModIssuedJobs();
         }
 
@@ -89,6 +108,7 @@ namespace DoNotBeLazy.Components
             }
 
             lastPassTick = now;
+            draftedLow.Clear();
 
             foreach (Map map in Find.Maps)
             {
@@ -110,6 +130,15 @@ namespace DoNotBeLazy.Components
                         }
                     }
                 }
+            }
+
+            try
+            {
+                UpdateDraftedLetter();
+            }
+            catch (Exception ex)
+            {
+                Logger.Warning($"safety net: the drafted-pawn letter failed: {ex}");
             }
         }
 
@@ -141,8 +170,23 @@ namespace DoNotBeLazy.Components
             bool lowFood = Low(food, settings.safetyHungerThreshold);
             bool lowRest = Low(rest, settings.safetySleepThreshold);
             bool lowJoy = Low(joy, settings.safetyRecreationThreshold);
+            // Section 34 item 4.6: mood at or below the mood setting
+            // Recreation is the only thing that serves mood: with Recreation
+            // at NeedMonitor.RecreationFullLevel or more it cannot help, so
+            // the pawn is not sent (manager's decision, section 34).
+            bool moodAtBreak = NeedMonitor.MoodAtSetting(pawn);
+            bool lowMood = moodAtBreak && NeedMonitor.RecreationCanHelpMood(pawn);
+            if (!moodAtBreak)
+            {
+                moodFutileLogged.Remove(pawn);
+            }
+            else if (!lowMood && pawn.needs.joy != null && moodFutileLogged.Add(pawn))
+            {
+                Logger.Message($"safety net: {pawn.LabelShort} Mood {pawn.needs.mood.CurLevelPercentage:P0} is at or below the mood setting {DoNotBeLazyMod.Settings.moodThreshold:P0} but Recreation is already {pawn.needs.joy.CurLevelPercentage:P0} - recreation cannot help, not sending");
+            }
+
             AlertIfDrafted(pawn, lowFood, lowRest, food, rest, settings);
-            if (!lowFood && !lowRest && !lowJoy)
+            if (!lowFood && !lowRest && !lowJoy && !lowMood)
             {
                 lastDecline.Remove(pawn);
                 quietUntil.Remove(pawn);
@@ -265,8 +309,35 @@ namespace DoNotBeLazy.Components
 
             if (lowJoy)
             {
+                // recreation itself is low: the same job also serves mood
                 TrySendToRecreation(pawn, joy, settings, levels, interrupted, now);
             }
+            else if (lowMood)
+            {
+                TrySendToCalmMood(pawn, levels, interrupted, now);
+            }
+        }
+
+        // Section 34 item 4.6. Not H5's TrySendToRecreation (locked): the same
+        // vanilla joy job, but sent because mood reached the mood setting
+        // (DoNotBeLazySettings.moodThreshold, 2026-10-30), not because recreation is low.
+        private static bool TrySendToCalmMood(Pawn pawn, string levels, string interrupted, int now)
+        {
+            Job joyJob = SweepManager.FindVanillaJoyJob(pawn);
+            if (joyJob == null)
+            {
+                Decline(pawn, "Mood", "vanilla's recreation giver found no job", levels, now);
+                return false;
+            }
+
+            if (SweepManager.GiveJob(pawn, joyJob, false, "safety net recreation for mood"))
+            {
+                Sent(pawn, now, "Mood", $"safety net: {pawn.LabelShort} Mood {pawn.needs.mood.CurLevelPercentage:P0} is at or below the mood setting {DoNotBeLazyMod.Settings.moodThreshold:P0} - sent to {joyJob.def.defName} to avoid a break{interrupted} ({levels})");
+                return true;
+            }
+
+            Decline(pawn, "Mood", "the game refused the recreation job", levels, now);
+            return false;
         }
 
         // Section 30: queued jobs that are a player's order (player-forced,
@@ -364,6 +435,93 @@ namespace DoNotBeLazy.Components
 
             AlertNeed(pawn, done, "Food", lowFood, food, settings.safetyHungerThreshold);
             AlertNeed(pawn, done, "Rest", lowRest, rest, settings.safetySleepThreshold);
+
+            if (lowFood || lowRest)
+            {
+                var parts = new List<string>();
+                if (lowFood) parts.Add($"Food {food.CurLevelPercentage:P0}");
+                if (lowRest) parts.Add($"Rest {rest.CurLevelPercentage:P0}");
+                draftedLow[pawn] = string.Join(", ", parts.ToArray());
+            }
+        }
+
+        // Section 34 item 4.4 (ordered 2026-10-25): the letter that goes with
+        // the on-screen message. One letter, replaced when a pawn not yet
+        // listed qualifies. Verified by reflection 2026-10-25 on
+        // lib\Assembly-CSharp.dll: LetterMaker.MakeLetter(TaggedString,
+        // TaggedString, LetterDef, LookTargets, Faction, Quest,
+        // List<ThingDef>) returns a ChoiceLetter; LetterStack.ReceiveLetter
+        // (Letter, string, int, bool), RemoveLetter(Letter) and
+        // LettersListForReading exist; LetterDefOf.NegativeEvent exists;
+        // LookTargets has a constructor taking IEnumerable<Pawn>.
+        private static void UpdateDraftedLetter()
+        {
+            LetterStack stack = Find.LetterStack;
+            if (stack == null)
+            {
+                return;
+            }
+
+            bool anyNew = false;
+            foreach (Pawn pawn in draftedLow.Keys)
+            {
+                if (!letteredPawns.Contains(pawn))
+                {
+                    anyNew = true;
+                    break;
+                }
+            }
+
+            if (draftedLow.Count == 0)
+            {
+                if (draftedLetter != null)
+                {
+                    if (stack.LettersListForReading.Contains(draftedLetter))
+                    {
+                        stack.RemoveLetter(draftedLetter);
+                    }
+
+                    draftedLetter = null;
+                    Logger.Order("safety net: LETTER removed - no drafted pawn is below a need threshold now");
+                }
+
+                letteredPawns.Clear();
+                return;
+            }
+
+            if (!anyNew)
+            {
+                // nobody new: keep the open letter; a recovered pawn drops
+                // off at the next replacement, and is "new" if it falls again
+                letteredPawns.IntersectWith(draftedLow.Keys);
+                return;
+            }
+
+            var pawns = new List<Pawn>(draftedLow.Keys);
+            var lines = new List<string>();
+            foreach (Pawn pawn in pawns)
+            {
+                lines.Add($"{pawn.LabelShort}: {draftedLow[pawn]}");
+            }
+
+            if (draftedLetter != null && stack.LettersListForReading.Contains(draftedLetter))
+            {
+                stack.RemoveLetter(draftedLetter);
+            }
+
+            string label = pawns.Count == 1 ? "Drafted colonist in need" : "Drafted colonists in need";
+            string text = "These drafted colonists are at or below a food or rest threshold. The safety net does not send drafted pawns - undraft them to let it act.\n\n"
+                + string.Join("\n", lines.ToArray());
+            ChoiceLetter letter = LetterMaker.MakeLetter(label, text, LetterDefOf.NegativeEvent, new LookTargets(pawns), null, null, null);
+            stack.ReceiveLetter(letter, null, 0, true);
+            draftedLetter = letter;
+            letteredPawns.Clear();
+            foreach (Pawn pawn in pawns)
+            {
+                letteredPawns.Add(pawn);
+            }
+
+            Logger.Order($"safety net: LETTER sent - {pawns.Count} drafted pawn{(pawns.Count == 1 ? "" : "s")} below a need threshold: {string.Join("; ", lines.ToArray())}");
         }
 
         private static void AlertNeed(Pawn pawn, HashSet<string> done, string need, bool low, Need level, float threshold)

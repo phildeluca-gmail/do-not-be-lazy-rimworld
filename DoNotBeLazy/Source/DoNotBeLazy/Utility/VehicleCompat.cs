@@ -6,6 +6,7 @@ using System.Reflection;
 using HarmonyLib;
 using RimWorld;
 using Verse;
+using Verse.AI;
 
 namespace DoNotBeLazy.Utility
 {
@@ -495,6 +496,141 @@ namespace DoNotBeLazy.Utility
             }
             pendingLeft = Math.Max(0, entry.CountToTransfer);
             return added;
+        }
+
+        // ---- Why a null from Vehicle Framework is not yet an ending (section 32) ----
+
+        // Total units the vehicle's load list still asks for; -1 when the
+        // list cannot be read.
+        public static int PendingCargoCount(Thing vehicle)
+        {
+            List<TransferableOneWay> pending = CargoToLoad(vehicle);
+            if (pending == null)
+            {
+                return -1;
+            }
+
+            int total = 0;
+            foreach (TransferableOneWay entry in pending)
+            {
+                total += Math.Max(0, entry.CountToTransfer);
+            }
+            return total;
+        }
+
+        // Is `other` carrying an item to `vehicle` right now? Vehicle
+        // Framework's LoadVehicle and CarryItemToVehicle jobs and this mod's
+        // own StuffAndHaul all keep the vehicle in targetB (read off
+        // WorkGiver_CarryToVehicle.JobOnThing, which makes LoadVehicle with
+        // (item, vehicle)). Matched by defName so no VF type is named.
+        private static bool IsLoadingJobFor(Job job, Thing vehicle)
+        {
+            if (job == null || job.def == null || job.targetB.Thing != vehicle)
+            {
+                return false;
+            }
+
+            return job.def == DoNotBeLazy.Jobs.DnblJobDefOf.StuffAndHaul
+                || job.def.defName == "LoadVehicle"
+                || job.def.defName == "CarryItemToVehicle";
+        }
+
+        // How many pawns other than `pawn` are loading `vehicle` this moment.
+        public static int OtherPawnsLoading(Pawn pawn, Thing vehicle)
+        {
+            if (pawn?.Map == null || vehicle == null)
+            {
+                return 0;
+            }
+
+            int count = 0;
+            foreach (Pawn other in pawn.Map.mapPawns.AllPawnsSpawned)
+            {
+                if (other != pawn && other.Faction == pawn.Faction && IsLoadingJobFor(other.CurJob, vehicle))
+                {
+                    count++;
+                }
+            }
+            return count;
+        }
+
+        // One sentence on why Vehicle Framework found nothing for `pawn` to
+        // carry, for the outstanding cargo. Mirrors the tests in
+        // WorkGiver_CarryToVehicle.FindThingToPack (verified by decompiling
+        // the 1.5 Vehicles.dll 2026-10-25): a candidate must be listed in a
+        // transferable still asking for units, reservable, not forbidden,
+        // and reachable. Vehicle Framework sets no distance limit (it
+        // searches 9999 cells), so "too far" is reported as the nearest
+        // distance rather than as a count. A stack is counted once, under
+        // the first test it fails.
+        public static string DescribeRefusal(Pawn pawn, Thing vehicle)
+        {
+            List<TransferableOneWay> pending = CargoToLoad(vehicle);
+            if (pending == null || pawn == null)
+            {
+                return "load list unreadable";
+            }
+
+            var seen = new HashSet<Thing>();
+            int stacks = 0, free = 0, reserved = 0, unreachable = 0, forbidden = 0, elsewhere = 0, units = 0;
+            float nearestFree = -1f, nearestAny = -1f;
+
+            foreach (TransferableOneWay entry in pending)
+            {
+                if (entry.CountToTransfer <= 0 || entry.things == null)
+                {
+                    continue;
+                }
+
+                units += entry.CountToTransfer;
+                foreach (Thing t in entry.things)
+                {
+                    if (t == null || !seen.Add(t))
+                    {
+                        continue;
+                    }
+
+                    stacks++;
+                    if (t.Destroyed || !t.Spawned || t.Map != pawn.Map)
+                    {
+                        elsewhere++; // in a container, a pawn's hands or pack, or off this map
+                        continue;
+                    }
+
+                    float distance = pawn.Position.DistanceTo(t.Position);
+                    if (nearestAny < 0f || distance < nearestAny)
+                    {
+                        nearestAny = distance;
+                    }
+
+                    if (ForbidUtility.IsForbidden(t, pawn.Faction))
+                    {
+                        forbidden++;
+                    }
+                    else if (!pawn.CanReserve(t))
+                    {
+                        reserved++;
+                    }
+                    else if (!pawn.CanReach(t, PathEndMode.ClosestTouch, Danger.Deadly))
+                    {
+                        unreachable++;
+                    }
+                    else
+                    {
+                        free++;
+                        if (nearestFree < 0f || distance < nearestFree)
+                        {
+                            nearestFree = distance;
+                        }
+                    }
+                }
+            }
+
+            bool vehicleReachable = pawn.CanReach(vehicle, PathEndMode.Touch, Danger.Deadly);
+            return $"{units} units pending in {stacks} stacks: {reserved} reserved by others, {unreachable} unreachable, "
+                + $"{forbidden} forbidden, {elsewhere} in containers or off the map, {free} free"
+                + (nearestFree >= 0f ? $" (nearest free {nearestFree:F0} cells)" : nearestAny >= 0f ? $" (nearest of any {nearestAny:F0} cells)" : "")
+                + (vehicleReachable ? "" : "; the vehicle itself is unreachable");
         }
     }
 }
