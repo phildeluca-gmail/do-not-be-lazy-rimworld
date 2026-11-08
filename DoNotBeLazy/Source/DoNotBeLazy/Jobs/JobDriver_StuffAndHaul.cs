@@ -571,7 +571,45 @@ namespace DoNotBeLazy.Jobs
                         return;
                     }
 
-                    Job found = scanner.JobOnThing(pawn, persistentTarget, true);
+                    // Section 39 item A (2026-11-07): a transport pod whose
+                    // load list is broken made the vanilla scanner throw a
+                    // NullReferenceException here (Darcey, Narda, ratro) and
+                    // the pawn dropped what it carried. A pod that is gone,
+                    // or any throw, ends the trip: what is carried goes to
+                    // storage via deliver, the order's other queued jobs for
+                    // this target are dropped, one line says why.
+                    Job found = null;
+                    string scannerFault = null;
+                    if (!persistentTarget.Spawned || persistentTarget.Map != pawn.Map)
+                    {
+                        scannerFault = "the target is no longer spawned on this pawn's map";
+                    }
+                    else
+                    {
+                        try
+                        {
+                            found = scanner.JobOnThing(pawn, persistentTarget, true);
+                        }
+                        catch (System.Exception ex)
+                        {
+                            scannerFault = $"{job.workGiverDef.defName} threw {ex.GetType().Name}: {ex.Message}";
+                        }
+                    }
+                    if (scannerFault != null)
+                    {
+                        int dropped = DropQueuedJobsFor(pawn, persistentTarget);
+                        Logger.Warning($"{pawn.LabelShort}: cannot look for more for {persistentTarget.LabelShort} ({scannerFault}) - taking {carried.Count} carried stack(s) to storage, dropped {dropped} queued job(s) for it, ending the trip");
+                        toStorage.UnionWith(carried);
+                        // Review 2026-11-07: a thrown scanner means the target
+                        // is broken for good; end the pawn's order on it so
+                        // the next hand-out does not throw again. The carried
+                        // stacks still go to storage via deliver.
+                        // Ending it here would start the next queued order and
+                        // end THIS job before delivery; it ends once the job has.
+                        pawn.Map?.GetComponent<SweepManager>()?.EndOrderWhenJobEnds(pawn, job, $"cannot look for more for {persistentTarget.LabelShort}: {scannerFault}");
+                        pawn.jobs.curDriver.JumpToToil(deliver);
+                        return;
+                    }
                     Thing foundThing = found?.targetA.Thing;
                     if (foundThing == null || foundThing == persistentTarget || carried.Contains(foundThing))
                     {
@@ -723,7 +761,7 @@ namespace DoNotBeLazy.Jobs
                     // something offers the same Thing again some other way.
                     if (refused.Add(thing))
                     {
-                        Logger.Message($"{pawn.LabelShort}: {thing.LabelCap} would overencumber, leaving it");
+                        LogOverencumberSkipThrottled(pawn, thing, $"{pawn.LabelShort}: {thing.LabelCap} would overencumber, leaving it");
                     }
                     // Same release as below - an opportunistic item reserved
                     // in GatherStorageCandidatesToil or the askScanner loop
@@ -1109,6 +1147,24 @@ namespace DoNotBeLazy.Jobs
         // for storage: `deliver` then finds it a storage destination like a
         // storage-mode trip, so the pawn does not carry it on into the next
         // trip. With no storage it is dropped near the pawn (DropAndSkip).
+        // Section 39 item A. Removes the pawn's queued jobs aimed at the
+        // target (as A or B). Returns how many were removed.
+        private static int DropQueuedJobsFor(Pawn pawn, Thing target)
+        {
+            int removed = 0;
+            if (pawn.jobs?.jobQueue == null)
+            {
+                return 0;
+            }
+            pawn.jobs.jobQueue.RemoveAll(pawn, j =>
+            {
+                bool hit = j != null && (j.targetA.Thing == target || j.targetB.Thing == target);
+                if (hit) { removed++; }
+                return hit;
+            });
+            return removed;
+        }
+
         private void SendToStorage(Thing thing, string reason)
         {
             toStorage.Add(thing);

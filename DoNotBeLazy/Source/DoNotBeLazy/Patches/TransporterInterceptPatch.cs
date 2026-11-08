@@ -96,6 +96,9 @@ namespace DoNotBeLazy.Patches
             }
         }
 
+        // one warning per faulty transporter, not per evaluation
+        private static readonly System.Collections.Generic.HashSet<int> faultLogged = new System.Collections.Generic.HashSet<int>();
+
         internal static void TrySubstitute(Pawn pawn, CompTransporter transporter, ref Job __result)
         {
             // Kill switch, dnbl-architecture.md section 18. Cheapest check
@@ -132,7 +135,24 @@ namespace DoNotBeLazy.Patches
                 return;
             }
 
-            ThingCount toLoad = LoadTransportersJobUtility.FindThingToLoad(pawn, transporter);
+            // Section 39 item A: vanilla's FindThingToLoad threw a
+            // NullReferenceException on a pod with a broken load list. Leave
+            // vanilla's own job alone rather than throw out of the postfix.
+            ThingCount toLoad;
+            try
+            {
+                toLoad = LoadTransportersJobUtility.FindThingToLoad(pawn, transporter);
+            }
+            catch (System.Exception ex)
+            {
+                if (faultLogged.Add(transporter.parent.thingIDNumber))
+                    Logger.Warning($"{pawn.LabelShort}: FindThingToLoad threw {ex.GetType().Name} for {transporter.parent.LabelShort} - offering no load job for it (vanilla's own job would throw the same way when it starts)");
+                // Review 2026-11-07: vanilla's HaulToTransporter.Notify_Starting
+                // calls FindThingToLoad itself, so handing its job back threw
+                // inside the job hand-off and looped. No job at all instead.
+                __result = null;
+                return;
+            }
             if (toLoad.Thing == null || toLoad.Count <= 0)
             {
                 // HasJobOnTransporter said yes but nothing is actually

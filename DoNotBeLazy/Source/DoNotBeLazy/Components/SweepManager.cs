@@ -93,6 +93,12 @@ namespace DoNotBeLazy.Components
         // closure on every click. Added 2026-09-13, architecture section 12.
         public string OrderKind { get; }
 
+        // Bench orders: Bill.GetUniqueLoadID() of the bill the order was
+        // given for. Every job and resume is for this bill only. Null for
+        // orders that are not bill orders, or until the first DoBill job is
+        // known. Added 2026-11-07, architecture section 38.
+        public string BillLoadId { get; set; }
+
         // The area wait line is written at most once per order per
         // AreaRetryTicks, and the waits in between are counted rather than
         // written. Added 2026-09-13: 13 pawns on one pool wrote that line
@@ -678,9 +684,11 @@ namespace DoNotBeLazy.Components
             public bool centerOut = true;
             public string orderKind;
             public float maxScanDays;
+            public string billLoadId;
 
             public void ExposeData()
             {
+                Scribe_Values.Look(ref billLoadId, "billLoadId");
                 Scribe_Defs.Look(ref workGiver, "workGiver");
                 Scribe_Values.Look(ref hasStation, "hasStation", false);
                 Scribe_References.Look(ref station, "station");
@@ -822,7 +830,8 @@ namespace DoNotBeLazy.Components
                 radius = order.ScanRadius,
                 centerOut = order.CenterOut,
                 orderKind = order.OrderKind,
-                maxScanDays = order.MaxScanDays
+                maxScanDays = order.MaxScanDays,
+                billLoadId = order.BillLoadId
             });
             index[order] = orders.Count - 1;
             return orders.Count - 1;
@@ -854,6 +863,7 @@ namespace DoNotBeLazy.Components
                 }
                 built = new SweepOrder(saved.workGiver, new List<LocalTargetInfo>(), saved.station);
                 built.MaxScanDays = saved.maxScanDays;
+                built.BillLoadId = saved.billLoadId;
                 return null;
             }
 
@@ -1341,7 +1351,15 @@ namespace DoNotBeLazy.Components
         public static bool GiveJob(Pawn pawn, Job job, bool appendBehindCurrentJob = false, string forcedKind = null)
         {
             bool took = false;
+            bool thisCallThrew = false;
             LastGiveJobThrew = false;
+            // Diagnostic only (order "3.1", 2026-11-06): the pawn's state
+            // just before the hand-off, for forced jobs. The job's def text and
+            // loadID are saved now: a job that fails goes back to the pool and
+            // can be reused, so the object cannot be trusted afterwards.
+            string beforeState = forcedKind != null ? DescribeHandOffState(pawn) : null;
+            string givenText = forcedKind != null ? DescribeJob(job) : null;
+            int givenLoadID = job != null ? job.loadID : -1;
             BeginAssigningJob(pawn);
             try
             {
@@ -1349,6 +1367,7 @@ namespace DoNotBeLazy.Components
             }
             catch (Exception ex)
             {
+                thisCallThrew = true;
                 LastGiveJobThrew = true;
                 LastGiveJobExceptionType = ex.GetType().Name;
                 GiveJobFailedThrottled(pawn, job, ex);
@@ -1367,6 +1386,7 @@ namespace DoNotBeLazy.Components
             if (forcedKind != null)
             {
                 TrackForcedOrder(pawn, forcedKind, job, took);
+                LogHandOff(pawn, forcedKind, givenText, givenLoadID, took, thisCallThrew, beforeState);
             }
             else if (took && orderIds.TryGetValue(pawn, out string sweepOrderId) && orderStarted.Add(pawn))
             {
@@ -1374,6 +1394,59 @@ namespace DoNotBeLazy.Components
             }
 
             return took;
+        }
+
+        // Order "3.1", 2026-11-06. Why is a forced job sometimes "accepted but
+        // not running"? One line per forced hand-off, success or failure, so
+        // the two can be compared. Members verified on Assembly-CSharp.dll:
+        // Pawn_JobTracker.curJob / curDriver / jobQueue /
+        // IsCurrentJobPlayerInterruptible(), JobQueue.Count,
+        // JobDriver.PlayerInterruptable, Job.playerForced, Job.loadID,
+        // JobDef.forceCompleteBeforeNextJob. Covers every forced job that
+        // passes forcedKind, "unload stuffed cargo" included. Never throws.
+        // The ORDER id is made inside TrackForcedOrder (locked) and is not
+        // handed back, so the line cannot carry it; it follows that
+        // method's "issued" line for the same pawn and job.
+        private static string DescribeHandOffState(Pawn pawn)
+        {
+            try
+            {
+                Pawn_JobTracker jobs = pawn?.jobs;
+                if (jobs == null) return "no job tracker";
+                Job cur = jobs.curJob;
+                string curText = cur == null ? "no current job" : $"current job {DescribeJob(cur)}, playerForced {cur.playerForced}, forceCompleteBeforeNextJob {cur.def != null && cur.def.forceCompleteBeforeNextJob}";
+                string driverText = jobs.curDriver == null ? "no driver" : $"driver interruptable {jobs.curDriver.PlayerInterruptable}";
+                int queued = jobs.jobQueue != null ? jobs.jobQueue.Count : -1;
+                return $"{curText}, player-interruptible {jobs.IsCurrentJobPlayerInterruptible()}, {driverText}, {queued} in queue";
+            }
+            catch (Exception ex)
+            {
+                return "state unreadable (" + ex.GetType().Name + ")";
+            }
+        }
+
+        private static void LogHandOff(Pawn pawn, string kind, string givenText, int givenLoadID, bool took, bool threw, string before)
+        {
+            try
+            {
+                Pawn_JobTracker jobs = pawn?.jobs;
+                Job cur = jobs?.curJob;
+                bool running = cur != null && givenLoadID != -1 && cur.loadID == givenLoadID;
+                bool queuedNow = false;
+                if (jobs?.jobQueue != null)
+                {
+                    for (int i = 0; i < jobs.jobQueue.Count; i++)
+                    {
+                        if (givenLoadID != -1 && jobs.jobQueue[i].job != null && jobs.jobQueue[i].job.loadID == givenLoadID) { queuedNow = true; break; }
+                    }
+                }
+
+                Logger.Order($"HANDOFF {pawn?.LabelShort}: {kind} {givenText} - game {(threw ? "threw an exception" : took ? "accepted it" : "refused it")}, our job running now: {running}, our job in queue: {queuedNow}, pawn now on {DescribeJob(cur)}; before the call: {before}");
+            }
+            catch (Exception ex)
+            {
+                Logger.Warning("hand-off diagnostic failed: " + ex.GetType().Name);
+            }
         }
 
         // ORDER lines, ordered 2026-10-02 - one id per order per pawn, three
@@ -1711,6 +1784,19 @@ namespace DoNotBeLazy.Components
                 return;
             }
 
+            // Section 38 item 6: a job queued ahead of our still-queued order
+            // runs first by design; it is not a takeover.
+            if (current != null && current.playerForced && !ReferenceEquals(current, mine) && JobIsQueued(pawn, mine))
+            {
+                lastReportedForeignJob.TryGetValue(pawn, out Job seenAhead);
+                if (!ReferenceEquals(seenAhead, current))
+                {
+                    lastReportedForeignJob[pawn] = current;
+                    Logger.Message($"{pawn.LabelShort}: on {DescribeJob(current)} from {DescribeJobSource(current)}, a job queued ahead of the {order.WorkGiverDef.defName} order; the order stays and its job is still queued behind it");
+                }
+                return;
+            }
+
             if (current != null && current.playerForced && !ReferenceEquals(current, mine))
             {
                 ClearSweeps(pawn, $"the player gave this pawn a different order (now on {DescribeJob(current)} from {DescribeJobSource(current)})");
@@ -1729,6 +1815,11 @@ namespace DoNotBeLazy.Components
                 || workstationRetryAt.ContainsKey(pawn)
                 || areaRetryAt.ContainsKey(pawn)
                 || ScannerCompat.IsScannerWork(order.WorkGiverDef))
+            {
+                return;
+            }
+
+            if (TryReturnToOrderedBill(pawn, order, current))
             {
                 return;
             }
@@ -1758,6 +1849,129 @@ namespace DoNotBeLazy.Components
                 + (order.WorkstationTarget != null ? $" at {order.WorkstationTarget.LabelShort}" : "")
                 + $", but the pawn {now}"
                 + (mine == null ? " - we have given it no job yet" : $" - the last job we gave was {DescribeJob(mine)}"));
+        }
+
+        // ---- section 38: a bench order stays on its own bill ----
+        private const int StrayBillQuietTicks = 600;
+        private static readonly Dictionary<Pawn, int> strayBillLogAt = new Dictionary<Pawn, int>();
+
+        private static string BillIdOf(Job job)
+        {
+            return job != null && job.def == JobDefOf.DoBill && job.bill != null ? job.bill.GetUniqueLoadID() : null;
+        }
+
+        private static Bill FindBill(Thing station, string id)
+        {
+            if (id == null || !(station is IBillGiver giver) || giver.BillStack == null)
+            {
+                return null;
+            }
+
+            foreach (Bill bill in giver.BillStack.Bills)
+            {
+                if (bill.GetUniqueLoadID() == id)
+                {
+                    return bill;
+                }
+            }
+
+            return null;
+        }
+
+        // JobOnThing for the order's bill only. WorkGiver_DoBill's bill
+        // chooser is private and takes the first bill whose ShouldDoNow is
+        // true; Bill_Production.ShouldDoNow is false while Bill.suspended, so
+        // the other bills are suspended for this one synchronous call and
+        // each is put back in the finally.
+        private static Job BillJobFor(WorkGiver_Scanner scanner, Pawn pawn, SweepOrder order)
+        {
+            if (order.BillLoadId == null || !(order.WorkstationTarget is IBillGiver giver) || giver.BillStack == null)
+            {
+                return scanner.JobOnThing(pawn, order.WorkstationTarget, true);
+            }
+
+            var saved = new List<KeyValuePair<Bill, bool>>();
+            foreach (Bill bill in giver.BillStack.Bills)
+            {
+                saved.Add(new KeyValuePair<Bill, bool>(bill, bill.suspended));
+            }
+
+            try
+            {
+                foreach (KeyValuePair<Bill, bool> entry in saved)
+                {
+                    if (entry.Key.GetUniqueLoadID() != order.BillLoadId)
+                    {
+                        entry.Key.suspended = true;
+                    }
+                }
+
+                return scanner.JobOnThing(pawn, order.WorkstationTarget, true);
+            }
+            finally
+            {
+                foreach (KeyValuePair<Bill, bool> entry in saved)
+                {
+                    entry.Key.suspended = entry.Value;
+                }
+            }
+        }
+
+        private static bool JobIsQueued(Pawn pawn, Job job)
+        {
+            JobQueue queue = pawn.jobs?.jobQueue;
+            if (job == null || queue == null)
+            {
+                return false;
+            }
+
+            for (int i = 0; i < queue.Count; i++)
+            {
+                if (ReferenceEquals(queue[i].job, job))
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        // The pawn is on a DoBill job at the order's bench for another bill
+        // (vanilla's JobGiver_Work took the bench's first bill after an
+        // interruption): hand it the ordered bill's job instead. Silent when
+        // the ordered bill has nothing startable now; the pawn is left alone.
+        private bool TryReturnToOrderedBill(Pawn pawn, SweepOrder order, Job current)
+        {
+            if (order.BillLoadId == null || current == null || current.def != JobDefOf.DoBill || current.bill == null
+                || current.targetA.Thing != order.WorkstationTarget
+                || current.bill.GetUniqueLoadID() == order.BillLoadId)
+            {
+                return false;
+            }
+
+            // The ordered bill is waiting behind this job (section 12, decision
+            // 7): do not interrupt the job and jump the queue.
+            if ((ourJob.TryGetValue(pawn, out Job queuedMine) && JobIsQueued(pawn, queuedMine))
+                || (awaitingCurrentJob.TryGetValue(pawn, out Job awaitedJob) && ReferenceEquals(awaitedJob, current)))
+            {
+                return false;
+            }
+
+            if (!(order.WorkGiverDef.Worker is WorkGiver_Scanner scanner) || BillJobFor(scanner, pawn, order) == null)
+            {
+                return false;
+            }
+
+            int now = Find.TickManager.TicksGame;
+            if (!strayBillLogAt.TryGetValue(pawn, out int quietUntil) || now >= quietUntil)
+            {
+                strayBillLogAt[pawn] = now + StrayBillQuietTicks;
+                Bill ordered = FindBill(order.WorkstationTarget, order.BillLoadId);
+                Logger.Message($"{pawn.LabelShort}: on {DescribeJob(current)} from {DescribeJobSource(current)} at {order.WorkstationTarget.LabelShort}, not the ordered bill {ordered?.recipe?.defName}; interrupting it to return to the ordered bill");
+            }
+
+            AssignNextTask(pawn, order, "straying to another bill", false, true);
+            return true;
         }
 
         // A job end was thrown away because this pawn's own assignment
@@ -1802,6 +2016,17 @@ namespace DoNotBeLazy.Components
             {
                 awaitingCurrentJob.Remove(pawn);
                 Logger.Message($"{pawn.LabelShort}: the job the queued {order.WorkGiverDef.defName} order waited on ended {condition} during our own assignment; no longer waiting on it");
+            }
+
+            // Section 39 review: same pooling risk for the deferred order end.
+            // Our own hand-out ended the faulted job, so the pending end is
+            // void; the 5-throw streak and the unspawned-station check bound
+            // any repeat.
+            if (endOrderAfterJob.TryGetValue(pawn, out KeyValuePair<Job, string> pendingDiscarded) && endedJob != null
+                && ReferenceEquals(endedJob, pendingDiscarded.Key))
+            {
+                endOrderAfterJob.Remove(pawn);
+                Logger.Message($"{pawn.LabelShort}: the faulted job whose order end was pending ended {condition} during our own assignment; pending end dropped ({pendingDiscarded.Value})");
             }
 
             int now = Find.TickManager.TicksGame;
@@ -2086,6 +2311,30 @@ namespace DoNotBeLazy.Components
             lastPendingSeen.Remove(pawn);
         }
 
+        // Review 2026-11-07 (section 39): ending an order from inside the
+        // running StuffAndHaul job starts the next queued order on the spot,
+        // which ends that very job before its carried stacks reach storage.
+        // The toil records the ending here instead, jumps to its deliver
+        // toil, and Notify_JobEnded performs RemoveSweep once THIS job has
+        // ended - the reason is logged once, by EndOrder, as usual.
+        private readonly Dictionary<Pawn, KeyValuePair<Job, string>> endOrderAfterJob = new Dictionary<Pawn, KeyValuePair<Job, string>>();
+
+        public void EndOrderWhenJobEnds(Pawn pawn, Job runningJob, string reason)
+        {
+            if (!activeSweeps.ContainsKey(pawn))
+            {
+                return;
+            }
+            // Only the job we handed out: a StuffAndHaul job vanilla gave a
+            // paused or retrying sweep pawn must not end the order.
+            if (!ourJob.TryGetValue(pawn, out Job mineNow) || !ReferenceEquals(mineNow, runningJob))
+            {
+                Logger.Message($"{pawn.LabelShort}: not ending the order after a faulted trip - the job is not the one we handed out ({reason})");
+                return;
+            }
+            endOrderAfterJob[pawn] = new KeyValuePair<Job, string>(runningJob, reason);
+        }
+
         public void RemoveSweep(Pawn pawn, string reason)
         {
             EndOrder(pawn, reason);
@@ -2191,8 +2440,8 @@ namespace DoNotBeLazy.Components
             }
 
             activeSweeps.Remove(pawn);
+            endOrderAfterJob.Remove(pawn);
             pausedForNeed.Remove(pawn);
-            pauseLifted.Remove(pawn);
             consecutiveFailures.Remove(pawn);
             ClearUncountedState(pawn);
             lastAssignedTarget.Remove(pawn);
@@ -2260,12 +2509,11 @@ namespace DoNotBeLazy.Components
                 // is being replaced, so a non-shift click has nothing to
                 // destroy.
                 ahead = -1;
-                // Section 34 item 4.5: a plain click on the same order while
-                // this pawn is paused for a need lifts the pause. Shift-click
-                // is unchanged.
-                if (!queueOrder)
+                // 2026-11-07: a click never lifts a need pause. Log once per
+                // click that it did not.
+                if (pausedForNeed.TryGetValue(pawn, out PauseInfo heldPause))
                 {
-                    LiftPauseByRepeatClick(pawn, current);
+                    Logger.Message($"{pawn.LabelShort}: repeated click on {current.WorkGiverDef.defName} did not lift the need pause ({heldPause.need}) - a click never overrides a need threshold");
                 }
 
                 return false;
@@ -2308,54 +2556,6 @@ namespace DoNotBeLazy.Components
             ahead = 1 + queue.Count;
             queue.Add(order);
             return false;
-        }
-
-        // Section 34 item 4.5 (ordered 2026-10-25). The pawn is paused for a
-        // need and the player plain-clicked the same * order again: drop the
-        // pause and hand out the order's next job at once. The need monitor
-        // will not poll or re-pause the pawn while it is in pauseLifted (see
-        // IsPauseLifted); the entry is dropped once no need is critical
-        // any more, so the next dip pauses as normal. There is no tick
-        // guard.
-        private void LiftPauseByRepeatClick(Pawn pawn, SweepOrder order)
-        {
-            if (!pausedForNeed.TryGetValue(pawn, out PauseInfo paused))
-            {
-                return;
-            }
-
-            string low = NeedMonitor.UnsatisfiedNeedsText(pawn);
-            string levels = NeedMonitor.LevelsText(pawn);
-            pausedForNeed.Remove(pawn);
-            pauseLifted.Add(pawn);
-            Logger.Message($"{pawn.LabelShort}: repeated click on {order.WorkGiverDef.defName} lifted the need pause (began on {paused.need}; low: {(low.Length > 0 ? low : "none now")}) - restarting the order ({levels})");
-            Logger.Order($"ORDER {OrderIdFor(pawn)} resumed: {pawn.LabelShort} ({levels}) - pause lifted by a repeated click");
-            Messages.Message(low.Length > 0
-                ? $"{pawn.LabelShort} resumes {order.WorkGiverDef.defName} although needs are low: {low}."
-                : $"{pawn.LabelShort} resumes {order.WorkGiverDef.defName}; the need pause was lifted.",
-                pawn, MessageTypeDefOf.CautionInput, false);
-            AssignNextTask(pawn, order);
-        }
-
-        // Pawns whose pause a repeated click lifted. NeedMonitor leaves them
-        // unpaused until no need is critical any more (then the entry is
-        // dropped, so the next dip pauses as normal) or the order ends.
-        private readonly HashSet<Pawn> pauseLifted = new HashSet<Pawn>();
-
-        public bool IsPauseLifted(Pawn pawn)
-        {
-            if (!pauseLifted.Contains(pawn))
-            {
-                return false;
-            }
-
-            if (NeedMonitor.CriticalNeedLabelFor(pawn) == null)
-            {
-                pauseLifted.Remove(pawn);
-                return false;
-            }
-
-            return true;
         }
 
         // A repeat click is the same order when it is the same WorkGiverDef
@@ -3974,6 +4174,7 @@ namespace DoNotBeLazy.Components
 
             var order = new SweepOrder(workGiverDef, new List<LocalTargetInfo>(), target);
             int joined = 0;
+            int joinedPaused = 0;
 
             // architecture section 12 - pawns already on an order queue this
             // one instead of starting it
@@ -4045,6 +4246,19 @@ namespace DoNotBeLazy.Components
                     NoteOrderIssued(pawn, order);
                     joined++;
 
+                    // 2026-11-07, section 8: a pawn below a need threshold
+                    // joins paused, exactly as in an area sweep. The job is
+                    // not handed out; AssignNextTask re-asks after the need
+                    // is served.
+                    string needNow = NeedMonitor.CriticalNeedLabelFor(pawn);
+                    if (needNow != null)
+                    {
+                        PauseForNeed(pawn, needNow, false);
+                        Logger.Message($"{pawn.LabelShort} joined the sweep paused: {needNow} ({workGiverDef.defName}) - left on its current job");
+                        joinedPaused++;
+                        continue;
+                    }
+
                     Logger.Message($"BeginSweep {workGiverDef.defName} at {target.LabelShort}: {pawn.LabelShort} joined, first job {DescribeJob(job)}"
                         + (appendBehindCurrentJob ? $" - queued behind {pawn.LabelShort}'s current job, not interrupting it" : ""));
                     ourJob[pawn] = job;
@@ -4064,6 +4278,21 @@ namespace DoNotBeLazy.Components
 
             Logger.Message($"BeginSweep {workGiverDef.defName} at {target.LabelShort}: {joined} of {eligiblePawns.Count} pawns joined"
                 + QueueSummary(queued, eligiblePawns.Count, minAhead, maxAhead, duplicates));
+
+            if (joinedPaused > 0)
+            {
+                ShowNeedPauseMessage(new TargetInfo(target), workGiverDef, joinedPaused);
+            }
+        }
+
+        // One message per order, shown and logged, when at least one pawn
+        // joined it paused for a need. Text ordered 2026-09-12; applied to
+        // bench and vehicle orders 2026-11-07 (section 8).
+        private void ShowNeedPauseMessage(TargetInfo look, WorkGiverDef workGiverDef, int joinedPaused)
+        {
+            const string text = "Some pawns are too hungry, tired, or overworked.";
+            Logger.Message($"BeginSweep {workGiverDef.defName}: {joinedPaused} pawn(s) joined paused; message shown: \"{text}\"");
+            Messages.Message(text, look, MessageTypeDefOf.RejectInput, false);
         }
 
         private void BeginWorkstationSweep(List<Pawn> eligiblePawns, Thing billGiver, WorkGiverDef workGiverDef, WorkGiver_Scanner scanner, bool queueOrder)
@@ -4084,6 +4313,47 @@ namespace DoNotBeLazy.Components
             // ranked pawn is asked for itself, so one pawn's "no" never stops
             // the next being asked - checked 2026-09-13, section 9.
             List<Pawn> ranked = RankForWorkstation(eligiblePawns, workGiverDef);
+
+            // 2026-11-07, section 8: a pawn below a need threshold cannot take
+            // the bench now. Move such pawns behind every pawn that is not, so
+            // one hungry pawn never holds up the bench; rank order is kept
+            // within each part. Only when every pawn that can do the job is
+            // below a threshold does the best-ranked of them join paused.
+            // Skipped pawns are logged once, here.
+            var fit = new List<Pawn>();
+            var needy = new List<Pawn>();
+            var needyText = new List<string>();
+            foreach (Pawn p in ranked)
+            {
+                string lack = NeedMonitor.CriticalNeedLabelFor(p);
+                if (lack == null) { fit.Add(p); }
+                else { needy.Add(p); needyText.Add($"{p.LabelShort} ({lack})"); }
+            }
+            // A pawn that already holds this bench's order keeps its place in
+            // the ranking, so the "already has it" check still stops a second
+            // order going to a fit pawn on the same bench.
+            bool benchAlreadyHeld = false;
+            var heldProbe = new SweepOrder(workGiverDef, new List<LocalTargetInfo>(), billGiver);
+            foreach (Pawn p in ranked)
+            {
+                if (activeSweeps.TryGetValue(p, out SweepOrder heldOrder) && SameOrder(heldOrder, heldProbe))
+                {
+                    benchAlreadyHeld = true;
+                    break;
+                }
+                // A shift-click queues the order instead of making it active.
+                if (queuedOrders.TryGetValue(p, out List<SweepOrder> heldQueue) && heldQueue.Exists(q => SameOrder(q, heldProbe)))
+                {
+                    benchAlreadyHeld = true;
+                    break;
+                }
+            }
+            if (!benchAlreadyHeld && needy.Count > 0 && fit.Count > 0)
+            {
+                Logger.Message($"BeginSweep {workGiverDef.defName} at {billGiver.LabelShort}: {needy.Count} pawn(s) below a need threshold ranked last: {string.Join(", ", needyText.ToArray())}");
+                ranked = new List<Pawn>(fit);
+                ranked.AddRange(needy);
+            }
 
             foreach (Pawn pawn in ranked)
             {
@@ -4106,6 +4376,7 @@ namespace DoNotBeLazy.Components
                     // order: every job after this one comes from AssignNextTask
                     // re-asking this same station.
                     var order = new SweepOrder(workGiverDef, new List<LocalTargetInfo>(), billGiver);
+                    order.BillLoadId = BillIdOf(job);
 
                     // The best-ranked pawn with a job takes the order even when
                     // it is busy: the order queues behind what it is doing,
@@ -4141,6 +4412,18 @@ namespace DoNotBeLazy.Components
 
                     activeSweeps[pawn] = order;
                     NoteOrderIssued(pawn, order);
+
+                    // 2026-11-07, section 8: a pawn below a need threshold
+                    // joins paused, exactly as in an area sweep; the station
+                    // is re-asked after the need is served.
+                    string needNow = NeedMonitor.CriticalNeedLabelFor(pawn);
+                    if (needNow != null)
+                    {
+                        PauseForNeed(pawn, needNow, false);
+                        Logger.Message($"{pawn.LabelShort} joined the sweep paused: {needNow} ({workGiverDef.defName}) - left on its current job");
+                        ShowNeedPauseMessage(new TargetInfo(billGiver), workGiverDef, 1);
+                        return;
+                    }
 
                     // Section 33: the order stands, but a bench a teammate
                     // holds is not taken; the retry clock hands the job over
@@ -4386,11 +4669,7 @@ namespace DoNotBeLazy.Components
             // look target on the clicked cell, not historical.
             if (joinedPaused > 0)
             {
-                Messages.Message(
-                    "Some pawns are too hungry, tired, or overworked.",
-                    new TargetInfo(clickCell, map),
-                    MessageTypeDefOf.RejectInput,
-                    false);
+                ShowNeedPauseMessage(new TargetInfo(clickCell, map), workGiverDef, joinedPaused);
             }
         }
 
@@ -4467,6 +4746,26 @@ namespace DoNotBeLazy.Components
                     ? "no job"
                     : $"{DescribeJob(nowOn)} from {DescribeJobSource(nowOn)}";
                 ClearSweeps(pawn, $"the player gave this pawn a different order (now on {nowText})");
+                return;
+            }
+
+            // Section 39 review: the order was marked to end when this job
+            // ended (see EndOrderWhenJobEnds). The job is over and its
+            // carried stacks have been delivered, so the ending - and the
+            // next queued order - can run safely now.
+            if (endOrderAfterJob.TryGetValue(pawn, out KeyValuePair<Job, string> pendingEnd)
+                && endedJob != null && ReferenceEquals(endedJob, pendingEnd.Key))
+            {
+                endOrderAfterJob.Remove(pawn);
+                // A pawn who can no longer work (drafted, mental break,
+                // downed, off the map) ends the order the fatal way: no
+                // next queued order is started for it.
+                if (pawn.Dead || pawn.Downed || pawn.InMentalState || pawn.Drafted || !pawn.Spawned)
+                {
+                    ClearSweeps(pawn, pendingEnd.Value);
+                    return;
+                }
+                RemoveSweep(pawn, pendingEnd.Value);
                 return;
             }
 
@@ -4975,7 +5274,7 @@ namespace DoNotBeLazy.Components
         // which is correct: by the time those run, this order's own prior
         // job on this pawn has already ended, so there is nothing of the
         // pawn's own to preserve. Added 2026-09-21.
-        private void AssignNextTask(Pawn pawn, SweepOrder order, string resumedBecause = null, bool appendBehindCurrentJob = false)
+        private void AssignNextTask(Pawn pawn, SweepOrder order, string resumedBecause = null, bool appendBehindCurrentJob = false, bool neverEndOrder = false)
         {
             string resumed = resumedBecause == null ? "" : $", resumed after {resumedBecause}";
             string queuedNote = appendBehindCurrentJob ? ", queued behind current job" : "";
@@ -5022,6 +5321,17 @@ namespace DoNotBeLazy.Components
                     return;
                 }
 
+                // Section 39 review: the deferred end of a faulted trip is not
+                // saved. After a load, a persistent target (transport pod)
+                // that is no longer spawned ends the order here; a scanner
+                // throw is bounded by the 5-throw streak below.
+                if (VehicleCompat.IsPersistentTargetWork(order.WorkGiverDef)
+                    && (!order.WorkstationTarget.Spawned || order.WorkstationTarget.Map != map))
+                {
+                    RemoveSweep(pawn, "the target is no longer spawned on this map");
+                    return;
+                }
+
                 // WorkGiver_OperateScanner.JobOnThing has no null path - its
                 // whole body is one JobMaker call - so the "station gave me
                 // nothing, we are done" ending below is unreachable for a
@@ -5043,13 +5353,36 @@ namespace DoNotBeLazy.Components
                 // usually isn't one.
                 // Order 4.1: a pawn that has filled up with its own items since
                 // the order began leaves it, with the usual ORDER ended line.
-                if (IsTooFullToLoad(pawn, order.WorkGiverDef, order.WorkstationTarget))
+                // neverEndOrder: the 60-tick stray-bill return must not end the
+                // order from here; the pawn is left alone instead.
+                if (neverEndOrder)
+                {
+                    // skipped: the check logs and messages on every call
+                }
+                else if (IsTooFullToLoad(pawn, order.WorkGiverDef, order.WorkstationTarget))
                 {
                     RemoveSweep(pawn, $"too full of its own items to load {order.WorkstationTarget.LabelShort}");
                     return;
                 }
 
-                Job resumeJob = WrapForVehicleStuffing(pawn, scanner.JobOnThing(pawn, order.WorkstationTarget, true), order.WorkGiverDef, order.WorkstationTarget);
+                // Section 38: the ordered bill first; when it can no longer be
+                // done (done, suspended, count reached, removed) the order
+                // moves on to whatever the bench offers next and adopts that
+                // bill as its current one.
+                Job billJob = BillJobFor(scanner, pawn, order);
+                if (billJob == null && order.BillLoadId != null)
+                {
+                    billJob = scanner.JobOnThing(pawn, order.WorkstationTarget, true);
+                }
+                Job resumeJob = WrapForVehicleStuffing(pawn, billJob, order.WorkGiverDef, order.WorkstationTarget);
+                if (resumeJob != null)
+                {
+                    string adopted = BillIdOf(billJob);
+                    if (adopted != null)
+                    {
+                        order.BillLoadId = adopted;
+                    }
+                }
                 if (resumeJob == null)
                 {
                     WorkstationHadNoJob(pawn, order);
@@ -5072,6 +5405,30 @@ namespace DoNotBeLazy.Components
                 Logger.Message($"{pawn.LabelShort}: {DescribeJob(resumeJob)} at {order.WorkstationTarget.LabelShort} ({order.WorkGiverDef.defName}){resumed}{queuedNote}");
                 ourJob[pawn] = resumeJob;
                 GiveJob(pawn, resumeJob, appendBehindCurrentJob);
+
+                // Review 2026-11-07, section 39: a job that throws while
+                // starting (a transport pod with a broken load list: vanilla's
+                // HaulToTransporter.Notify_Starting calls FindThingToLoad and
+                // throws) was never counted on this path, so the order never
+                // ended and every idle poll threw again. Same streak and
+                // limit as the area path below.
+                if (LastGiveJobThrew)
+                {
+                    LastGiveJobThrew = false;
+                    giveJobThrowStreak.TryGetValue(pawn, out int benchStreak);
+                    benchStreak++;
+                    giveJobThrowStreak[pawn] = benchStreak;
+                    if (benchStreak >= MaxGiveJobThrowsInARow)
+                    {
+                        giveJobThrowStreak.Remove(pawn);
+                        Logger.Message($"{pawn.LabelShort}: starting the job at {order.WorkstationTarget.LabelShort} threw {benchStreak} times in a row - ending the {order.WorkGiverDef.defName} order");
+                        RemoveSweep(pawn, $"job kept failing to start at {order.WorkstationTarget.LabelShort}: {LastGiveJobExceptionType}");
+                    }
+                    else
+                    {
+                        Logger.Message($"{pawn.LabelShort}: starting the job at {order.WorkstationTarget.LabelShort} threw (throw {benchStreak} of {MaxGiveJobThrowsInARow})");
+                    }
+                }
                 return;
             }
 

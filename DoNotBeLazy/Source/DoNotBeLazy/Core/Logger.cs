@@ -98,11 +98,25 @@ namespace DoNotBeLazy.Core
             return text;
         }
 
+        // Always-on, same "MSG " level as Message but never gated by VerboseLogging.
+        // For the single per-game-load line the log watcher depends on.
+        public static void Always(string text)
+        {
+            if (LogFile.Available)
+            {
+                LogFile.Write("MSG ", text);
+                return;
+            }
+
+            Verse.Log.Message(Prefix + text);
+        }
+
         // ORDER lines (2026-10-02) - the record of every order issued,
         // started and ended. Written whether or not verbose logging is on,
         // once per event, to the mod's own file.
         public static void Order(string text)
         {
+            // The game tick is stamped on every line by LogFile.Write.
             if (LogFile.Available)
             {
                 LogFile.Write("ORD ", text);

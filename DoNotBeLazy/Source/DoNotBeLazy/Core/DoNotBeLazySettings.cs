@@ -77,6 +77,9 @@ namespace DoNotBeLazy.Core
         // Added 2026-10-11 (dnbl-architecture.md section 25). Default on.
         public bool detectLeftoverBulk = true;
 
+        // Added 2026-11-07 (dnbl-architecture.md section 41). Default on.
+        public bool cancelUnfinishedOnBillDone = true;
+
         // Widgets.TextFieldNumeric and Widgets.TextFieldPercent both take a
         // "ref string buffer" next to the value, and it is not optional. The
         // buffer is what is currently TYPED, which a float or an int cannot
@@ -133,6 +136,7 @@ namespace DoNotBeLazy.Core
             Scribe_Values.Look(ref tooFullThreshold, "tooFullThreshold", 0.9f);
             Scribe_Values.Look(ref dropEverythingKeepsWeapons, "dropEverythingKeepsWeapons", true);
             Scribe_Values.Look(ref detectLeftoverBulk, "detectLeftoverBulk", true);
+            Scribe_Values.Look(ref cancelUnfinishedOnBillDone, "cancelUnfinishedOnBillDone", true);
 
             // the toggle only exists to drive this - keep them in sync on
             // load as well as on change, or a saved "on" reads as off until
@@ -211,6 +215,10 @@ namespace DoNotBeLazy.Core
             listing.Gap();
             listing.CheckboxLabeled("Deliver leftover bulk goods", ref detectLeftoverBulk,
                 "When on (default), a pawn that gets a new job while holding more than 2 of an item beyond what its inventory rules tell it to carry has the excess delivered to storage after its current job.");
+
+            listing.Gap();
+            listing.CheckboxLabeled("Cancel unfinished items when their bill is finished", ref cancelUnfinishedOnBillDone,
+                "When on (default), finishing a bill's last repeat cancels every unfinished item of that bill whose pawn is no longer on the map, returning 75% of the ingredients. An item whose pawn is on the map is left alone. A deleted bill cancels nothing.");
 
             listing.Gap();
             listing.CheckboxLabeled("Verbose logging (for bug reports)", ref verboseLogging,

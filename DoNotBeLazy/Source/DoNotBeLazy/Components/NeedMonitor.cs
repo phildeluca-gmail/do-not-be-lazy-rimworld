@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using RimWorld;
 using Verse;
 using Verse.AI;
+using Verse.AI.Group;
 using DoNotBeLazy.Core;
 
 namespace DoNotBeLazy.Components
@@ -70,6 +71,7 @@ namespace DoNotBeLazy.Components
             // constructs this component, so start it clean.
             SafetyNet.Reset();
             moodFutileLogged.Clear();
+            gatheringRetryAt.Clear();
         }
 
         // Throttle for GameComponentTickExceptionThrottled below - one line
@@ -164,16 +166,12 @@ namespace DoNotBeLazy.Components
                             continue;
                         }
 
-                        // Section 34 item 4.5: a repeated plain click on the
-                        // same order lifted this pawn's pause; it works on
-                        // until every need has recovered or the order ends.
-                        if (sweepManager.IsPauseLifted(pawn))
-                        {
-                            continue;
-                        }
-
                         if (!NeedIsCritical(pawn, hungerThreshold, recreationThreshold, moodThreshold, restThreshold))
                         {
+                            // Section 39: a wedding or party calling this
+                            // pawn releases it from the order; the order
+                            // resumes once the gathering is over.
+                            TryPauseForGathering(pawn, sweepManager);
                             continue;
                         }
 
@@ -187,6 +185,152 @@ namespace DoNotBeLazy.Components
                     }
                 }
             }
+        }
+
+        // Section 39 (2026-11-07): "Add to interrupt conditions wedding and
+        // party, but they go back to forced order like all other
+        // interruptions." Vanilla's ThinkNode_JoinVoluntarilyJoinableLord
+        // only runs when the think tree does, and a pawn on a forced job
+        // never reaches it, so the pawn would never be called. When an
+        // invited gathering lord exists this pause ends the current job
+        // (PauseForNeed, label "Gathering"); EndCurrentJob runs the think
+        // tree, which joins the lord. NeedsSatisfied then holds the pause
+        // while the pawn is in a gathering lord.
+        private const int GatheringRetryTicks = 2500;
+        private static readonly Dictionary<Pawn, int> gatheringRetryAt = new Dictionary<Pawn, int>();
+
+        private static bool IsGatheringLordJob(LordJob lordJob)
+        {
+            // LordJob_Ritual (verified in Assembly-CSharp.dll 2026-11-07) derives
+            // from LordJob_Joinable_Gathering, as do LordJob_Joinable_Speech,
+            // _Party and _Concert, so Ideology rituals and speeches are
+            // covered by the first test. LordJob_BestowingCeremony derives
+            // from LordJob_Ritual. LordJob_PsychicRitual derives straight from
+            // LordJob and is not joinable; pawns are placed in it, so it only
+            // counts for InGathering. All live in the same assembly: a
+            // missing DLC leaves the types present and the lords never exist.
+            return lordJob is LordJob_Joinable_Gathering || lordJob is LordJob_Joinable_MarriageCeremony
+                || lordJob is LordJob_PsychicRitual;
+        }
+
+        private static string GatheringKind(LordJob lordJob)
+        {
+            if (lordJob is LordJob_Joinable_MarriageCeremony)
+            {
+                return "wedding";
+            }
+            if (lordJob is LordJob_Joinable_Speech)
+            {
+                return "speech";
+            }
+            if (lordJob is LordJob_PsychicRitual)
+            {
+                return "psychic ritual";
+            }
+            return lordJob is LordJob_Ritual ? "ritual" : "party";
+        }
+
+        // True while the pawn belongs to a party/gathering or wedding lord.
+        public static bool InGathering(Pawn pawn)
+        {
+            Lord lord = pawn?.GetLord();
+            return lord != null && IsGatheringLordJob(lord.LordJob);
+        }
+
+        // The lord (party or wedding) that wants this pawn and that it is
+        // not yet in, or null. VoluntaryJoinPriorityFor is vanilla's own
+        // invitation test (faction, forbidden spot, about to end, blocking
+        // hediffs, fiance/guest rules); VoluntaryJoinDutyHookFor is non-None
+        // when the lord's current toil takes joiners.
+        private static Lord FindCallingGathering(Pawn pawn)
+        {
+            if (pawn.Map?.lordManager == null || pawn.Drafted || pawn.Downed)
+            {
+                return null;
+            }
+
+            // Review 2026-11-07. Mirror what the think tree needs before it
+            // reaches ThinkNode_JoinVoluntarilyJoinableLord (Humanlike.xml):
+            // a pawn already in another lord only changes lord when the other
+            // lord is itself voluntarily joinable (the node returns early
+            // otherwise), a queued job (ThinkNode_QueuedJob) and a starving
+            // pawn (JobGiver_GetFood, 'only if starving') come first, and a
+            // mental state outranks everything. Emergency work (JobGiver_Work
+            // emergency) also comes first but is not cheaply testable here;
+            // the retry throttle bounds that case.
+            Lord current = pawn.GetLord();
+            if (current != null)
+            {
+                return null;
+            }
+            if (pawn.InMentalState || (pawn.jobs?.jobQueue != null && pawn.jobs.jobQueue.Count > 0))
+            {
+                return null;
+            }
+            if (pawn.needs?.food != null && pawn.needs.food.CurCategory >= HungerCategory.Starving)
+            {
+                return null;
+            }
+
+            List<Lord> lords = pawn.Map.lordManager.lords;
+            for (int i = 0; i < lords.Count; i++)
+            {
+                Lord lord = lords[i];
+                if (!(lord.LordJob is LordJob_VoluntarilyJoinable joinable) || !IsGatheringLordJob(lord.LordJob)
+                    || lord.CurLordToil == null || lord.ownedPawns.Contains(pawn))
+                {
+                    continue;
+                }
+
+                if (lord.CurLordToil.VoluntaryJoinDutyHookFor(pawn) != ThinkTreeDutyHook.None
+                    && joinable.VoluntaryJoinPriorityFor(pawn) > 0f)
+                {
+                    return lord;
+                }
+            }
+
+            return null;
+        }
+
+        private static void TryPauseForGathering(Pawn pawn, SweepManager sweepManager)
+        {
+            if (pawn.Map == null || !pawn.Spawned)
+            {
+                return;
+            }
+
+            // Review 2026-11-07: a pawn already inside the gathering lord (the
+            // organizer is in the party lord from its creation, ritual
+            // participants are placed in theirs) never goes through the
+            // think-tree join, so it stayed on our job. Pause it now; the
+            // caller only reaches here for a pawn that is not yet paused, and
+            // NeedsSatisfied holds the pause while InGathering.
+            if (InGathering(pawn))
+            {
+                Lord inLord = pawn.GetLord();
+                Logger.Message($"{pawn.LabelShort}: is part of a {GatheringKind(inLord.LordJob)} ({inLord.LordJob.GetType().Name}) - pausing the order, it resumes when the gathering is over");
+                sweepManager.PauseForNeed(pawn, "Gathering (" + GatheringKind(inLord.LordJob) + ")");
+                return;
+            }
+
+            int now = Find.TickManager.TicksGame;
+            if (gatheringRetryAt.TryGetValue(pawn, out int retryAt) && now < retryAt)
+            {
+                return;
+            }
+
+            Lord lord = FindCallingGathering(pawn);
+            if (lord == null)
+            {
+                return;
+            }
+
+            // Throttle: if the think tree gives the pawn something else and it
+            // never joins, do not pause again for GatheringRetryTicks.
+            gatheringRetryAt[pawn] = now + GatheringRetryTicks;
+            string kind = GatheringKind(lord.LordJob);
+            Logger.Message($"{pawn.LabelShort}: a {kind} ({lord.LordJob.GetType().Name}) is calling this pawn - pausing the order to attend, it resumes when the gathering is over");
+            sweepManager.PauseForNeed(pawn, "Gathering (" + kind + ")");
         }
 
         // Each need has its own threshold. Rest was split out 2026-09-06 - see
@@ -402,6 +546,27 @@ namespace DoNotBeLazy.Components
                 DoNotBeLazyMod.Settings.safetySleepThreshold);
         }
 
+        // Names ("Food", "Rest", "Recreation", "Mood") of every need now at or
+        // below its pause threshold - the same tests as CriticalNeedLabel, but
+        // all of them rather than the first. Used by SweepManager's repeat-click
+        // exemption (section 34 item 4.5) so it covers only the needs that were
+        // critical when the player clicked. Added 2026-11-07.
+        public static System.Collections.Generic.HashSet<string> CriticalNeedNamesFor(Pawn pawn)
+        {
+            var names = new System.Collections.Generic.HashSet<string>();
+            if (pawn?.needs == null || DoNotBeLazyMod.Settings == null)
+            {
+                return names;
+            }
+
+            var s = DoNotBeLazyMod.Settings;
+            if (NeedIsCritical(pawn.needs.food, s.safetyHungerThreshold)) names.Add("Food");
+            if (NeedIsCritical(pawn.needs.rest, s.safetySleepThreshold)) names.Add("Rest");
+            if (NeedIsCritical(pawn.needs.joy, s.safetyRecreationThreshold)) names.Add("Recreation");
+            if (RecreationCanHelpMood(pawn) && NeedIsCritical(pawn.needs.mood, EffectiveMoodThreshold(pawn, s.moodThreshold), false)) names.Add("Mood");
+            return names;
+        }
+
         // What SweepManager asks before resuming a paused pawn. Same four
         // needs, thresholds raised by ResumeMargin - see the comment on it.
         public static bool NeedsSatisfied(Pawn pawn)
@@ -417,6 +582,12 @@ namespace DoNotBeLazy.Components
             float restThreshold = ResumeAt(DoNotBeLazyMod.Settings.safetySleepThreshold);
 
             if (NeedIsCritical(pawn, hungerThreshold, recreationThreshold, moodThreshold, restThreshold))
+            {
+                return false;
+            }
+
+            // Section 39: attending a wedding or party holds the pause.
+            if (InGathering(pawn))
             {
                 return false;
             }

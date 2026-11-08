@@ -43,6 +43,7 @@ namespace DoNotBeLazy.Components
             public string orderId;
             public string summary;
             public int createdTick;
+            public bool sleepPauseLogged;
             public readonly List<Thing> things = new List<Thing>();
         }
 
@@ -330,8 +331,8 @@ namespace DoNotBeLazy.Components
             int deliveryRows = rows == null ? 0 : rows.Count;
             int orderRows = SweepManager.LoadSummaryOrderRows;
             int itemRows = ItemLedger.LoadSummaryItemRows;
-            // the one game-wide load line; LoadedGame runs only when a save is loaded, after every map is finalised
-            Logger.Message(orderRows + itemRows + deliveryRows == 0
+            // the one game-wide load line, always written (the watcher depends on it); LoadedGame runs only when a save is loaded, after every map is finalised
+            Logger.Always(orderRows + itemRows + deliveryRows == 0
                 ? "Load: no open orders, ITEM entries or leftover deliveries were saved in this game, nothing to restore"
                 : $"Load: game load read {orderRows} saved pawn order row(s) on {SweepManager.LoadSummaryMaps} map(s), {itemRows} ITEM row(s), {deliveryRows} leftover delivery row(s)");
             if (rows == null || rows.Count == 0)
@@ -916,7 +917,57 @@ namespace DoNotBeLazy.Components
             foreach (KeyValuePair<Job, Pending> pair in pending.ToList())
             {
                 Pending p = pair.Value;
-                bool gone = p.pawn == null || p.pawn.Dead || p.pawn.Destroyed || p.pawn.Downed;
+                // A downed pawn is NOT gone (2026-11-07, Q4.5): she keeps the order waiting until she lies
+                // in a medical bed (block below) or the normal expiry ends it.
+                bool gone = p.pawn == null || p.pawn.Dead || p.pawn.Destroyed;
+                if (!gone && !p.pawn.Downed && p.pawn.Spawned && p.pawn.jobs != null && p.job != null
+                    && p.pawn.jobs.curJob != p.job && !p.pawn.jobs.jobQueue.Contains(p.job))
+                {
+                    // Q4.2 (user, 2026-11-07): when the queued delivery is dropped, the pawn drops
+                    // anything its assigned apparel policy does not allow; the equipped weapon is
+                    // never touched (it is not in the inventory).
+                    pending.Remove(pair.Key);
+                    Unregister(p, "queued delivery job gone");
+                    // Q4.4 (user, 2026-11-07): "drafting drops the items which are part of the
+                    // current job." A drafted pawn drops only this delivery's own stacks.
+                    bool drafted = p.pawn.Drafted;
+                    string dropSummary = drafted ? DropDeliveryGoods(p) : DropDisallowed(p.pawn);
+                    Logger.Order($"ORDER {p.orderId} ended ({(drafted ? "the pawn was drafted, the delivery's own goods were dropped" : "the queued delivery job was cleared by the game or the player")}): {p.pawn.LabelShort} {p.summary}; stacks released from DNBL cargo; {dropSummary}");
+                    continue;
+                }
+                // Q4.1 (user, 2026-11-07): a pawn on a medical bed drops carried items that its
+                // assignment does not allow. The delivery's stacks are by construction the
+                // excess over what the pawn's rules keep (TryKeepCount), so drop all of them.
+                // Verified: Pawn.InBed() / RestUtility.CurrentBed(pawn).Medical.
+                if (!gone && p.pawn.Spawned && p.pawn.Map != null && p.pawn.InBed() && (p.pawn.CurrentBed()?.Medical ?? false))
+                {
+                    pending.Remove(pair.Key);
+                    Unregister(p, "pawn on a medical bed");
+                    bool removedQ = false;
+                    try
+                    {
+                        removedQ = p.pawn.jobs?.jobQueue != null && p.job != null && p.pawn.jobs.jobQueue.Extract(p.job) != null;
+                    }
+                    catch (Exception)
+                    {
+                        // a queue we cannot edit: the order is ended either way
+                    }
+                    string dropSummary = DropDisallowed(p.pawn);
+                    Logger.Order($"ORDER {p.orderId} ended (pawn on a medical bed, carried goods its assignment does not allow were dropped): {p.pawn.LabelShort} {p.summary}; {dropSummary}; queued job {(removedQ ? "removed" : "not found in the queue")}");
+                    continue;
+                }
+                // A sleeping or lying-down pawn never consults the job queue, so the
+                // expiry clock stands still until she wakes (Watchdog runs every 60 ticks).
+                if (!gone && !p.pawn.Downed && (p.pawn.CurJob?.def == JobDefOf.LayDown || !p.pawn.Awake()))
+                {
+                    p.createdTick += 60;
+                    if (!p.sleepPauseLogged)
+                    {
+                        p.sleepPauseLogged = true;
+                        Logger.Order($"ORDER {p.orderId} expiry clock paused while {p.pawn.LabelShort} sleeps or lies down");
+                    }
+                    continue;
+                }
                 if (!gone && now - p.createdTick < PendingExpiryTicks)
                 {
                     continue;
@@ -937,6 +988,98 @@ namespace DoNotBeLazy.Components
                 Unregister(p, reason);
                 Logger.Order($"ORDER {p.orderId} ended ({reason}): {p.pawn?.LabelShort} {p.summary}; stacks released from DNBL cargo, still in the pack; queued job {(removed ? "removed" : "not found in the queue")}");
             }
+        }
+
+        // Called by DraftDropPatch (prefix on Pawn_DraftController.Drafted) just before the game
+        // clears the job queue because the pawn is being drafted. User, 2026-11-07: "drafting
+        // drops the items which are part of the current job." Drops each queued delivery's own
+        // stacks at once and ends the order, so the 60-tick watchdog cannot misjudge it.
+        internal static void Notify_Drafting(Pawn pawn)
+        {
+            if (pawn == null || pending.Count == 0) return;
+            foreach (KeyValuePair<Job, Pending> pair in pending.ToList())
+            {
+                Pending p = pair.Value;
+                if (p.pawn != pawn) continue;
+                pending.Remove(pair.Key);
+                Unregister(p, "pawn drafted");
+                string dropSummary = DropDeliveryGoods(p);
+                Logger.Order($"ORDER {p.orderId} ended (the pawn was drafted, the delivery's own goods were dropped): {pawn.LabelShort} {p.summary}; stacks released from DNBL cargo; {dropSummary}");
+            }
+        }
+
+        // User, 2026-11-07: "it should drop anything that isn't in the allowed assigned
+        // wardrobe except for equipped weapon." Drops every inventory item the pawn's
+        // apparel policy filter does not allow (medicine, food and drugs included: they are
+        // not apparel). Equipment and worn apparel are not in pawn.inventory.innerContainer
+        // and are never touched. Returns the dropped/kept line for the ORDER log.
+        private static string DropDisallowed(Pawn pawn)
+        {
+            var dropped = new List<string>();
+            var kept = new List<string>();
+            try
+            {
+                ThingFilter filter = pawn.outfits?.CurrentApparelPolicy?.filter;
+                if (filter == null || pawn.inventory == null || pawn.Map == null)
+                {
+                    return "dropped: nothing (no apparel policy or map)";
+                }
+                foreach (Thing t in pawn.inventory.innerContainer.ToList())
+                {
+                    string label = t.def.label + " x" + t.stackCount;
+                    if (filter.Allows(t)
+                        || !pawn.inventory.innerContainer.TryDrop(t, pawn.Position, pawn.Map, ThingPlaceMode.Near, out Thing _))
+                    {
+                        kept.Add(label);
+                    }
+                    else
+                    {
+                        dropped.Add(label);
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Logger.Warning($"{pawn.LabelShort}: DropDisallowed failed: {ex.GetType().Name}: {ex.Message}");
+            }
+            return "dropped: " + (dropped.Count > 0 ? string.Join(", ", dropped.ToArray()) : "nothing")
+                + "; kept: " + (kept.Count > 0 ? string.Join(", ", kept.ToArray()) : "nothing");
+        }
+
+        // Q4.4: drops only the stacks registered to this delivery order, nothing else the
+        // pawn carries. Returns the dropped/kept line for the ORDER log.
+        private static string DropDeliveryGoods(Pending p)
+        {
+            var dropped = new List<string>();
+            var kept = new List<string>();
+            try
+            {
+                Pawn pawn = p.pawn;
+                if (pawn.inventory == null || pawn.Map == null)
+                {
+                    return "dropped: nothing (no inventory or map)";
+                }
+                foreach (Thing t in p.things)
+                {
+                    if (t == null || t.Destroyed || t.Discarded) continue;
+                    string label = t.def.label + " x" + t.stackCount;
+                    if (!pawn.inventory.innerContainer.Contains(t)
+                        || !pawn.inventory.innerContainer.TryDrop(t, pawn.Position, pawn.Map, ThingPlaceMode.Near, out Thing _))
+                    {
+                        kept.Add(label);
+                    }
+                    else
+                    {
+                        dropped.Add(label);
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Logger.Warning($"{p.pawn?.LabelShort}: DropDeliveryGoods failed: {ex.GetType().Name}: {ex.Message}");
+            }
+            return "dropped: " + (dropped.Count > 0 ? string.Join(", ", dropped.ToArray()) : "nothing")
+                + "; kept: " + (kept.Count > 0 ? string.Join(", ", kept.ToArray()) : "nothing");
         }
 
         private static void Unregister(Pending p, string why)

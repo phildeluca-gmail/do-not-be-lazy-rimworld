@@ -88,6 +88,22 @@ namespace DoNotBeLazy.Core
             }
         }
 
+        // Game tick stamped on every line so the log watcher can age orders in
+        // game time. Current.Game is null at the main menu and during load,
+        // where Find.TickManager would throw; the suffix is then omitted.
+        private static string TickSuffix()
+        {
+            try
+            {
+                var tm = Current.Game?.tickManager;
+                return tm == null ? "" : " [tick " + tm.TicksGame + "]";
+            }
+            catch (Exception)
+            {
+                return "";
+            }
+        }
+
         public static void Write(string level, string text)
         {
             lock (FileLock)
@@ -100,7 +116,7 @@ namespace DoNotBeLazy.Core
 
                 try
                 {
-                    writer.WriteLine(DateTime.Now.ToString("HH:mm:ss") + "  " + level + "  " + text);
+                    writer.WriteLine(DateTime.Now.ToString("HH:mm:ss") + "  " + level + "  " + text + TickSuffix());
                 }
                 catch (Exception e)
                 {
