@@ -1,5 +1,4 @@
 using System;
-using System.Collections.Generic;
 using System.Diagnostics;
 using System.Text;
 using DoNotBeLazy.Core;
@@ -10,20 +9,17 @@ using Verse;
 namespace DoNotBeLazy.Patches
 {
     // Diagnostic only (dnbl-architecture.md section 42). Postfix on the
-    // CompForbiddable.Forbidden setter. ForbidUtility.SetForbidden ends in
-    // that setter (verified by decompile), so one patch covers both. When a
-    // player-faction Blueprint or Frame becomes forbidden, writes one line
-    // to DoNotBeLazy.log with the stack, so the forbidding mod or method is
-    // named. Once per thing; changes no behaviour.
+    // CompForbiddable.Forbidden setter, the only writer of forbiddenInt
+    // during play besides PostPostMake (verified 2026-11-08). PostExposeData
+    // also writes it when a save loads, bypassing the setter, so a structure
+    // already forbidden in a save writes no line until it is allowed and
+    // forbidden again. When an owned Building, Blueprint or Frame changes from allowed
+    // to forbidden, writes one line to DoNotBeLazy.log with the stack, so the
+    // forbidding mod or method is named. Logs every real change, so a thing
+    // forbidden again after being allowed logs again; changes no behaviour.
     [HarmonyPatch(typeof(CompForbiddable), nameof(CompForbiddable.Forbidden), MethodType.Setter)]
     internal static class ForbiddenBlueprintLogPatch
     {
-        private static readonly HashSet<int> Logged = new HashSet<int>();
-        // Thing ids restart in another save or a new game, so the set is
-        // emptied whenever the Game object changes, and capped.
-        private static Game loggedFor;
-        private const int LoggedCap = 5000;
-
         // Prefix: the setter returns early when the value is unchanged, but the
         // postfix still runs. Capture the old value so only a real change logs.
         private static void Prefix(CompForbiddable __instance, out bool __state)
@@ -36,15 +32,11 @@ namespace DoNotBeLazy.Patches
             try
             {
                 if (__state || !value) return;
-                if (!ReferenceEquals(loggedFor, Current.Game) || Logged.Count >= LoggedCap)
-                {
-                    Logged.Clear();
-                    loggedFor = Current.Game;
-                }
                 Thing t = __instance.parent;
-                if (!(t is Blueprint) && !(t is Frame)) return;
-                if (t.Faction != Faction.OfPlayer) return;
-                if (!Logged.Add(t.thingIDNumber)) return;
+                // Structural = Building with the forbid component (doors, turrets and
+                // other buildings), plus Blueprint and Frame. Unowned ones are skipped.
+                if (!(t is Building) && !(t is Blueprint) && !(t is Frame)) return;
+                if (t.Faction == null) return;
                 if (!LogFile.Available) return;
 
                 string map = t.Map != null ? "map " + t.Map.uniqueID : "no map";
@@ -72,7 +64,7 @@ namespace DoNotBeLazy.Patches
                 }
 
                 LogFile.Write("FBD ", "Forbidden: " + t.LabelCap + " (" + t.ThingID + ") at " + t.Position + ", " + map
-                    + ", tick " + Find.TickManager.TicksGame + ", selected pawn: " + selected + ", stack: " + sb);
+                    + ", owner " + t.Faction.Name + ", tick " + Find.TickManager.TicksGame + ", selected pawn: " + selected + ", stack: " + sb);
             }
             catch (Exception e)
             {
