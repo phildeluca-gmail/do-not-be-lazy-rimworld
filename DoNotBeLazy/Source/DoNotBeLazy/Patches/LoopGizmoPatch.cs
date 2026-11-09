@@ -54,7 +54,9 @@ namespace DoNotBeLazy.Patches
                 yield return new Command_Action
                 {
                     defaultLabel = "Drop everything",
-                    defaultDesc = "Drop every carried item, worn apparel piece and the weapon. "
+                    defaultDesc = (DoNotBeLazy.Core.DoNotBeLazyMod.Settings != null && DoNotBeLazy.Core.DoNotBeLazyMod.Settings.dropEverythingKeepsWeapons
+                        ? "Drop every carried item and worn apparel piece. The equipped weapon is kept (Mod options). "
+                        : "Drop every carried item, worn apparel piece and the weapon. ")
                         + "Locked apparel and warcaskets are left where they are.",
                     icon = TexButton.Drop,
                     groupKey = DropEverythingGroupKey,
