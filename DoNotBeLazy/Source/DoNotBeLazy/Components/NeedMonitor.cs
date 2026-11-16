@@ -71,6 +71,7 @@ namespace DoNotBeLazy.Components
             // constructs this component, so start it clean.
             SafetyNet.Reset();
             moodFutileLogged.Clear();
+            lowNeedLogged.Clear();
             gatheringRetryAt.Clear();
         }
 
@@ -114,6 +115,7 @@ namespace DoNotBeLazy.Components
             // SafetyNet.PassIntervalTicks.
             SafetyNet.Run();
 
+            var sweptIds = new HashSet<string>();
             foreach (Map map in Find.Maps)
             {
                 SweepManager sweepManager = map.GetComponent<SweepManager>();
@@ -124,6 +126,7 @@ namespace DoNotBeLazy.Components
 
                 foreach (Pawn pawn in sweepManager.GetSweptPawns())
                 {
+                    sweptIds.Add(pawn.ThingID);
                     // Wrapped per-pawn 2026-09-27 per user order: "Don't end
                     // all pawn's activities because one pawn stopped." An
                     // exception checking one pawn's needs used to abort the
@@ -144,6 +147,16 @@ namespace DoNotBeLazy.Components
                         // to vanilla and vanilla's own JobGiver_GetRest declines
                         // anyway because the timetable says Work - see its
                         // comment in SweepManager.
+                        // 2026-11-15, order (B): one line per threshold crossing.
+                        NoteThresholdCrossings(pawn, sweepManager);
+
+                        // Q58, 2026-11-15: a drafted pawn is left alone; its order
+                        // is paused by SweepManager and resumes on undraft.
+                        if (pawn.Drafted)
+                        {
+                            continue;
+                        }
+
                         if (sweepManager.IsPaused(pawn))
                         {
                             // Section 33: one line when a need is served.
@@ -175,8 +188,28 @@ namespace DoNotBeLazy.Components
                             continue;
                         }
 
+                        // 2026-11-15: a drafted, downed, mad or unspawned pawn is not newly paused or interrupted.
+                        if (pawn.Drafted || pawn.Downed || pawn.InMentalState || !pawn.Spawned)
+                        {
+                            continue;
+                        }
+
                         string need = CriticalNeedLabel(pawn, hungerThreshold, recreationThreshold, moodThreshold, restThreshold);
-                        sweepManager.PauseForNeed(pawn, need);
+                        // 2026-11-15, order (C): "Hungry pawn below 10% should go
+                        // eat. Pause other jobs." Any job is ended except vanilla's
+                        // own need jobs (eat, sleep, recreation), which finish by
+                        // vanilla's rules. Changed the same day ("would rather pause
+                        // than end", Q56): the job is paused, kept by
+                        // SweepManager.PauseForNeed and given back on resume.
+                        Job running = pawn.jobs?.curJob;
+                        bool needJob = SweepManager.IsProtectedFromNeedInterrupt(running);
+                        if (running != null)
+                        {
+                            Logger.Message($"{pawn.LabelShort}: {need} below threshold - " + (needJob ? $"not interrupting {running.def.defName} (a need, emergency or self-preservation job)" : $"pausing {running.def.defName}, given back once needs are served (on a * order job: {(sweepManager.IsOnOwnOrderJob(pawn) ? "yes" : "no")})"));
+                        }
+
+                        sweepManager.PauseForNeed(pawn, need, !needJob);
+
                         Logger.Message($"{pawn.LabelShort} paused from sweep: {need} at/below threshold. Will resume once addressed.");
                     }
                     catch (Exception ex)
@@ -185,6 +218,51 @@ namespace DoNotBeLazy.Components
                     }
                 }
             }
+
+            // Drop threshold-log keys of pawns that left every order (or died
+            // or despawned) so the set cannot grow without bound.
+            if (lowNeedLogged.Count > 0)
+            {
+                lowNeedLogged.RemoveWhere(k => !sweptIds.Contains(k.Substring(0, k.IndexOf('|'))));
+            }
+        }
+
+        // 2026-11-15, order (B), "make log when pawn reaches threshold": one
+        // line when a swept pawn's need first goes to or below its own
+        // threshold, not repeated until it has risen above it again.
+        private static readonly HashSet<string> lowNeedLogged = new HashSet<string>();
+
+        private static void NoteThresholdCrossings(Pawn pawn, SweepManager sweepManager)
+        {
+            var s = DoNotBeLazyMod.Settings;
+            Pawn_NeedsTracker n = pawn.needs;
+            if (n == null || s == null)
+            {
+                return;
+            }
+
+            CheckCrossing(pawn, sweepManager, "Food", n.food, s.safetyHungerThreshold, true);
+            CheckCrossing(pawn, sweepManager, "Rest", n.rest, s.safetySleepThreshold, true);
+            CheckCrossing(pawn, sweepManager, "Recreation", n.joy, s.safetyRecreationThreshold, true);
+            CheckCrossing(pawn, sweepManager, "Mood", n.mood, EffectiveMoodThreshold(pawn, s.moodThreshold), false);
+        }
+
+        private static void CheckCrossing(Pawn pawn, SweepManager sweepManager, string label, Need need, float threshold, bool zeroIsOff)
+        {
+            string key = pawn.ThingID + "|" + label;
+            if (!NeedIsCritical(need, threshold, zeroIsOff))
+            {
+                lowNeedLogged.Remove(key);
+                return;
+            }
+
+            if (!lowNeedLogged.Add(key))
+            {
+                return;
+            }
+
+            Job cur = pawn.jobs?.curJob;
+            Logger.Message($"{pawn.LabelShort}: {label} reached its threshold - {need.CurLevelPercentage:P0} at/below {threshold:P0}; current job {(cur == null ? "none" : cur.def.defName)}; on a * order: yes, current job is {(sweepManager.IsOnOwnOrderJob(pawn) ? "the order's job" : "not the order's job")}");
         }
 
         // Section 39 (2026-11-07): "Add to interrupt conditions wedding and
@@ -812,6 +890,10 @@ namespace DoNotBeLazy.Components
             int leftDrugs = 0;
             int leftBelowFloor = 0;
             int leftRotting = 0;
+            // Q45, 2026-11-15, by order: the other skip reasons are counted too.
+            int leftRejected = 0;      // will not eat, forbidden, or no ingestible def
+            int leftNotIngestible = 0; // not ingestible right now
+            int leftUnreachable = 0;   // cannot reserve or reach (dispenser: foreign, unpowered, empty, blocked or unreachable)
 
             // Vanilla FoodUtility.BestFoodSourceOnMap floor: a Starving pawn is
             // "desperate" (floor DesperateOnly); otherwise the floor is RawBad,
@@ -838,13 +920,14 @@ namespace DoNotBeLazy.Components
                     case FoodFilterResult.Drug: leftDrugs++; return;
                     case FoodFilterResult.BelowFloor: leftBelowFloor++; return;
                     case FoodFilterResult.Rotting: leftRotting++; return;
-                    case FoodFilterResult.Rejected: return;
+                    case FoodFilterResult.Rejected: leftRejected++; return;
                 }
 
                 if (inInventory)
                 {
                     if (!candidate.IngestibleNow)
                     {
+                        leftNotIngestible++;
                         return;
                     }
                 }
@@ -856,14 +939,21 @@ namespace DoNotBeLazy.Components
                         || !dispenser.InteractionCell.Standable(dispenser.Map)
                         || !pawn.CanReach(dispenser.InteractionCell, PathEndMode.OnCell, Danger.Some))
                     {
+                        leftUnreachable++;
                         return;
                     }
                 }
                 else
                 {
-                    if (!candidate.IngestibleNow
-                        || !pawn.CanReserveAndReach(candidate, PathEndMode.ClosestTouch, Danger.Some))
+                    if (!candidate.IngestibleNow)
                     {
+                        leftNotIngestible++;
+                        return;
+                    }
+
+                    if (!pawn.CanReserveAndReach(candidate, PathEndMode.ClosestTouch, Danger.Some))
+                    {
+                        leftUnreachable++;
                         return;
                     }
                 }
@@ -945,7 +1035,7 @@ namespace DoNotBeLazy.Components
                 {
                     declineReason += $" ({skipped} stalled target(s) skipped)";
                 }
-                declineReason += $" (left out: {leftCorpses} corpses, {leftDrugs} drugs, {leftBelowFloor} below floor, {leftRotting} rotting)";
+                declineReason += $" (left out: {leftCorpses} corpses, {leftDrugs} drugs, {leftBelowFloor} below floor, {leftRotting} rotting, {leftRejected} will not eat or forbidden, {leftNotIngestible} not ingestible now, {leftUnreachable} cannot reserve or reach)";
                 return null;
             }
 

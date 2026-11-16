@@ -249,7 +249,7 @@ namespace DoNotBeLazy.Patches
                     outcome = "Kept that pawn's entry in PlacedBedsMapComponent.placedBeds on purpose - it is still true. The job stays refused until the bedroll is placed again.";
                 }
 
-                Logger.Warning($"refused a Use Bedrolls TakeBedroll job for {pawn.LabelShort}: " +
+                Logger.Always($"refused a Use Bedrolls TakeBedroll job for {pawn.LabelShort}: " +
                     $"{bedName} {whereBed}. {why} {outcome}");
             }
             catch (Exception e)

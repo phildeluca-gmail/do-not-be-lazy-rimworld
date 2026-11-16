@@ -643,7 +643,9 @@ namespace DoNotBeLazy.Components
             {
                 Thing t = inv[i];
                 ThingDef key = CountDef(t);
-                if (key.IsBed || IsPersonal(pawn, t) || pawn.inventory.NotForSale(t) || cargoComp.IsCarrying(t))
+                // bedrolls (building.bed_caravansCanUse) are the pawn's own; any
+                // other minified bed left in the pack goes to storage or a drop
+                if ((key.IsBed && key.building != null && key.building.bed_caravansCanUse) || IsPersonal(pawn, t) || pawn.inventory.NotForSale(t) || cargoComp.IsCarrying(t))
                 {
                     continue;
                 }
@@ -657,7 +659,9 @@ namespace DoNotBeLazy.Components
             float foodBudget = pawn.needs?.food != null ? pawn.needs.food.MaxLevel : 0f;
             foreach (KeyValuePair<ThingDef, int> pair in totals)
             {
-                if (pair.Value < MinExcess)
+                // a pawn carries one minified bed, so beds need only 1
+                int minExcess = pair.Key.IsBed ? 1 : MinExcess;
+                if (pair.Value < minExcess)
                 {
                     continue;
                 }
@@ -666,7 +670,7 @@ namespace DoNotBeLazy.Components
                     continue;
                 }
                 int excess = pair.Value - keep;
-                if (excess >= MinExcess)
+                if (excess >= minExcess)
                 {
                     findings.Add(new Finding { def = pair.Key, held = pair.Value, keep = keep, why = why, excess = excess });
                 }
@@ -692,8 +696,8 @@ namespace DoNotBeLazy.Components
         }
 
         // The def a pack item is counted under. Every minified building is a
-        // MinifiedThing, so those count under the building's own def; beds
-        // (Use Bedrolls' carried bedroll included) are skipped by the caller.
+        // MinifiedThing, so those count under the building's own def; bedrolls
+        // (building.bed_caravansCanUse) are skipped by the caller.
         // Non-stackable items (stackLimit 1) are counted per item, summed
         // across their separate stacks. Equipped weapons and worn apparel
         // live in pawn.equipment / pawn.apparel, not in the inventory.

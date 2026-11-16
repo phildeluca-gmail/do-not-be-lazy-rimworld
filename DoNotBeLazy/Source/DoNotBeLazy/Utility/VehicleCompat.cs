@@ -391,6 +391,34 @@ namespace DoNotBeLazy.Utility
             return null;
         }
 
+        // The load-list entry `item` counts against, as an identity key for
+        // VehicleClaims; null when none matches or the list cannot be read.
+        public static object EntryKey(Thing vehicle, Thing item)
+        {
+            List<TransferableOneWay> pending = CargoToLoad(vehicle);
+            return pending == null || item == null ? null : FindEntry(pending, item);
+        }
+
+        // Defs of load-list entries that still ask for something.
+        public static List<ThingDef> WantedDefs(Thing vehicle)
+        {
+            var result = new List<ThingDef>();
+            List<TransferableOneWay> pending = CargoToLoad(vehicle);
+            if (pending == null)
+            {
+                return result;
+            }
+            foreach (TransferableOneWay entry in pending)
+            {
+                Thing first = entry.things?.FirstOrDefault(t => t != null);
+                if (entry.CountToTransfer > 0 && first != null && !result.Contains(first.def))
+                {
+                    result.Add(first.def);
+                }
+            }
+            return result;
+        }
+
         // Null when the vehicle still wants `item`, otherwise why not.
         public static string WhyNotWanted(Thing vehicle, Thing item)
         {

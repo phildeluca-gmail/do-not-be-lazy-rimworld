@@ -39,6 +39,12 @@ namespace DoNotBeLazy.Patches
                 if (!DoNotBeLazyMod.Settings.cancelUnfinishedOnBillDone) return;
                 Bill_ProductionWithUft bill = __instance as Bill_ProductionWithUft;
                 if (bill == null) return;
+                // Section 51: force-finish wins over cancel. Record the decision once per repeat.
+                if (DoNotBeLazyMod.Settings.forceFinishUnfinished)
+                {
+                    Logger.Message("Bill repeat done: " + bill.Label + "; cancel skipped, Force-finish unfinished items is on.");
+                    return;
+                }
                 if (bill.repeatMode == BillRepeatModeDefOf.RepeatCount)
                 {
                     if (bill.repeatCount == 0) RunCancel(bill);
@@ -119,6 +125,7 @@ namespace DoNotBeLazy.Patches
                     if (__result) { metBills.Remove(bill); return; }
                     if (bill.suspended) return;
                     if (!DoNotBeLazyMod.Settings.cancelUnfinishedOnBillDone) return;
+                    if (DoNotBeLazyMod.Settings.forceFinishUnfinished) return; // section 51
                     if (!metBills.Add(bill)) return;
                     PendingBillChecker checker = Current.Game?.GetComponent<PendingBillChecker>();
                     if (checker != null) checker.Queue(bill);

@@ -151,6 +151,9 @@ namespace DoNotBeLazy.Components
         {
             base.FinalizeInit();
 
+            // Vehicle load claims never survive a load (section 45).
+            DoNotBeLazy.Utility.VehicleClaims.Clear();
+
             List<Row> rows = loadedRows;
             loadedRows = null;
             if (rows == null || rows.Count == 0)

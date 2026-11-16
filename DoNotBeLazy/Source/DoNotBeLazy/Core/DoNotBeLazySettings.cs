@@ -80,6 +80,11 @@ namespace DoNotBeLazy.Core
         // Added 2026-11-07 (dnbl-architecture.md section 41). Default on.
         public bool cancelUnfinishedOnBillDone = true;
 
+        // Added 2026-11-15 (dnbl-architecture.md section 51). Default on. When on,
+        // unfinished items are finished by a capable pawn even if their bill is
+        // paused, suspended, complete or gone; and the cancel option above does nothing.
+        public bool forceFinishUnfinished = true;
+
         // Widgets.TextFieldNumeric and Widgets.TextFieldPercent both take a
         // "ref string buffer" next to the value, and it is not optional. The
         // buffer is what is currently TYPED, which a float or an int cannot
@@ -137,6 +142,7 @@ namespace DoNotBeLazy.Core
             Scribe_Values.Look(ref dropEverythingKeepsWeapons, "dropEverythingKeepsWeapons", true);
             Scribe_Values.Look(ref detectLeftoverBulk, "detectLeftoverBulk", true);
             Scribe_Values.Look(ref cancelUnfinishedOnBillDone, "cancelUnfinishedOnBillDone", true);
+            Scribe_Values.Look(ref forceFinishUnfinished, "forceFinishUnfinished", true);
 
             // the toggle only exists to drive this - keep them in sync on
             // load as well as on change, or a saved "on" reads as off until
@@ -219,6 +225,10 @@ namespace DoNotBeLazy.Core
             listing.Gap();
             listing.CheckboxLabeled("Cancel unfinished items when their bill is finished", ref cancelUnfinishedOnBillDone,
                 "When on (default), finishing a bill's last repeat cancels every unfinished item of that bill whose pawn is no longer on the map, returning 75% of the ingredients. An item whose pawn is on the map is left alone. A deleted bill cancels nothing.");
+
+            listing.Gap();
+            listing.CheckboxLabeled("Force-finish unfinished items", ref forceFinishUnfinished,
+                "When on (default), every unfinished item on a home map is finished by a capable pawn at its work table, even if its bill is incomplete, paused, suspended, finished or deleted. A deleted bill gets a temporary one-off bill. While this is on, the cancel option above does nothing. Every unfinished item also gets a 'Finish this' button.");
 
             listing.Gap();
             listing.CheckboxLabeled("Verbose logging (for bug reports)", ref verboseLogging,

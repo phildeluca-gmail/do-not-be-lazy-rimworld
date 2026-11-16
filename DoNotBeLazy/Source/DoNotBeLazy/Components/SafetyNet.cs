@@ -567,7 +567,7 @@ namespace DoNotBeLazy.Components
             JobDefOf.DeliverFood
         };
 
-        private static bool IsEmergencyJob(Job job)
+        internal static bool IsEmergencyJob(Job job)
         {
             WorkTypeDef workType = job.workGiverDef?.workType;
             return (job.workGiverDef != null && job.workGiverDef.emergency)

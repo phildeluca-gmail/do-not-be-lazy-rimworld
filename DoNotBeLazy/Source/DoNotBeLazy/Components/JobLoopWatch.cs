@@ -115,6 +115,16 @@ namespace DoNotBeLazy.Components
                 return;
             }
 
+            // 2026-11-10: a pawn or animal fighting back in melee is not a loop -
+            // JobGiver_ReactToCloseMeleeThreat issues one attack job per swing
+            // at the same attacker. Skipped by the issuing giver; the type name
+            // was verified present in lib\Assembly-CSharp.dll and is referenced
+            // directly, so a missing type fails the build.
+            if (jobGiver is JobGiver_ReactToCloseMeleeThreat)
+            {
+                return;
+            }
+
             Thing target = job.targetA.Thing;
             if (target == null)
             {

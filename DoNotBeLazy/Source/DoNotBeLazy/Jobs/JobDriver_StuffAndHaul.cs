@@ -129,6 +129,20 @@ namespace DoNotBeLazy.Jobs
         // the same zero-progress suppression a second time.
         private bool zeroProgressRecorded;
 
+        // Once-per-job guard: TryMakePreToilReservations runs twice for one
+        // job (2026-11-11), which wrote "stuffing job started" twice.
+        private bool startLogged;
+
+        // Item types skipped this trip because no storage accepts them (Q43).
+        private readonly HashSet<ThingDef> noStorageLogged = new HashSet<ThingDef>();
+
+        // Load-list entries this pawn has a VehicleClaims entry for, so
+        // RefreshClaims can clear one whose stacks are all gone (seeded with
+        // the primary target's entry when the job starts), and the vehicle
+        // they belong to.
+        private readonly HashSet<object> claimedKeys = new HashSet<object>();
+        private Thing claimVehicle;
+
         // Progress measure for the backstop above - re-armed 2026-09-22
         // for the third same-night defect (dnbl-architecture.md section
         // 18). Was keyed on carried.Count, which also changes when a
@@ -438,8 +452,13 @@ namespace DoNotBeLazy.Jobs
             // (haulMode == ToCellStorage) has no fixed destination yet - each
             // item's destination is looked up fresh at delivery time - so only
             // the fixed-destination mode names one.
-            if (reserved)
+            // The first of the two calls is made on a cached driver that is
+            // never the pawn's current one (TryTakeOrderedJob); only the
+            // call on the driver StartJob installs is the job starting.
+            if (reserved && !startLogged && pawn.jobs?.curDriver == this)
             {
+                startLogged = true;
+                RecordStartClaim();
                 string destination = job.haulMode == HaulMode.ToContainer && job.targetB.Thing != null
                     ? job.targetB.Thing.LabelShort
                     : "storage (destination chosen per item)";
@@ -511,6 +530,7 @@ namespace DoNotBeLazy.Jobs
             // pattern vanilla's own JobDriver_HaulToCell and PUAH's drivers
             // use.
             Toil deliver = new Toil();
+            Toil refreshClaims = RefreshClaimsToil();
             Toil moveToCarry = new Toil();
             Toil carryToCell = Toils_Haul.CarryHauledThingToCell(TargetIndex.B);
             Toil carryToContainer = Toils_Haul.CarryHauledThingToContainer();
@@ -674,7 +694,7 @@ namespace DoNotBeLazy.Jobs
                 // already-despawned) primary target and send the pawn
                 // walking back to it.
                 Toil nextTarget = Toils_JobTransforms.ExtractNextTargetFromQueue(TargetIndex.A, false);
-                yield return Toils_Jump.JumpIf(deliver, () => job.targetQueueA.NullOrEmpty());
+                yield return Toils_Jump.JumpIf(refreshClaims, () => job.targetQueueA.NullOrEmpty());
                 yield return nextTarget;
                 yield return Toils_Goto.GotoThing(TargetIndex.A, PathEndMode.ClosestTouch)
                     .FailOnDespawnedNullOrForbidden(TargetIndex.A);
@@ -682,6 +702,7 @@ namespace DoNotBeLazy.Jobs
                 yield return Toils_Jump.JumpIf(nextTarget, () => !job.targetQueueA.NullOrEmpty());
             }
 
+            yield return refreshClaims;
             yield return deliver;
             yield return moveToCarry;
             yield return Toils_Jump.JumpIf(carryToContainer, () => job.GetTarget(TargetIndex.B).HasThing);
@@ -722,6 +743,21 @@ namespace DoNotBeLazy.Jobs
                     return;
                 }
 
+                // Q44(a), 2026-11-15, by order: never take an item another pawn
+                // holds a reservation on. A forced job elsewhere can take our
+                // reservation (ReservationManager.Reserve ends the holder's job
+                // InterruptForced); if ours is gone, or another pawn also holds
+                // one, leave the item.
+                Pawn otherHolder = pawn.Map.reservationManager.FirstRespectedReserver(thing, pawn);
+                if (!pawn.Map.reservationManager.ReservedBy(thing, pawn, job) || (otherHolder != null && otherHolder != pawn))
+                {
+                    if (refused.Add(thing))
+                    {
+                        Logger.Message($"{pawn.LabelShort}: {thing.LabelCap} is reserved by {(otherHolder != null && otherHolder != pawn ? otherHolder.LabelShort : "another pawn")}, leaving it");
+                    }
+                    return;
+                }
+
                 int want = Mathf.Min(job.count > 0 ? job.count : thing.stackCount, thing.stackCount);
                 int can = MassUtility.CountToPickUpUntilOverEncumbered(pawn, thing);
                 int take = Mathf.Min(want, can);
@@ -733,13 +769,21 @@ namespace DoNotBeLazy.Jobs
                 if (take > 0 && vehicleCargo)
                 {
                     int stillWanted = VehicleCompat.StillWanted(job.targetB.Thing, thing, carried);
+                    int others = 0;
+                    if (stillWanted >= 0)
+                    {
+                        // Units other pawns were handed or carry for this
+                        // vehicle (VehicleClaims, section 45).
+                        others = VehicleClaims.OthersHold(pawn, job.targetB.Thing, VehicleCompat.EntryKey(job.targetB.Thing, thing));
+                        stillWanted = Mathf.Max(0, stillWanted - others);
+                    }
                     if (stillWanted >= 0 && stillWanted < take)
                     {
                         if (stillWanted <= 0)
                         {
                             if (notWanted.Add(thing))
                             {
-                                Logger.Message($"{pawn.LabelShort}: {job.targetB.Thing.LabelShort} wants no more {thing.def.label} beyond what this trip carries, leaving {thing.LabelCap}");
+                                Logger.Message($"{pawn.LabelShort}: {job.targetB.Thing.LabelShort} wants no more {thing.def.label} beyond what this trip carries and what other pawns already carry to it ({others}), leaving {thing.LabelCap}");
                             }
                             if (pawn.Map.reservationManager.ReservedBy(thing, pawn, job))
                             {
@@ -747,7 +791,7 @@ namespace DoNotBeLazy.Jobs
                             }
                             return;
                         }
-                        Logger.Message($"{pawn.LabelShort}: {job.targetB.Thing.LabelShort} still wants {stillWanted} {thing.def.label}, taking {stillWanted} instead of {take}");
+                        Logger.Message($"{pawn.LabelShort}: {job.targetB.Thing.LabelShort} still wants {stillWanted} {thing.def.label} (other pawns already carry {others}), taking {stillWanted} instead of {take}");
                         take = stillWanted;
                     }
                 }
@@ -785,6 +829,7 @@ namespace DoNotBeLazy.Jobs
                 pawn.inventory.GetDirectlyHeldThings().TryAdd(picked, false);
                 CargoComp?.Register(picked);
                 carried.Add(picked);
+                RefreshClaims();
                 ItemLedger.Added(pawn, picked, SweepManager.CurrentOrderIdOrNull(pawn));
                 if (!isPrimary)
                 {
@@ -879,6 +924,18 @@ namespace DoNotBeLazy.Jobs
                     }
                     if (MassUtility.WillBeOverEncumberedAfterPickingUp(pawn, candidate, 1))
                     {
+                        continue;
+                    }
+
+                    // Q43, 2026-11-15, by order: skip an item no storage accepts - it
+                    // would only be dropped at delivery and picked up again by the next
+                    // trip. One log line per item type per trip.
+                    if (!StoreUtility.TryFindBestBetterStorageFor(candidate, pawn, map, StoragePriority.Unstored, pawn.Faction, out IntVec3 _, out IHaulDestination _))
+                    {
+                        if (noStorageLogged.Add(candidate.def))
+                        {
+                            Logger.Message($"{pawn.LabelShort}: not picking up {candidate.def.label} on the way - no storage accepts it (one line per item type per trip)");
+                        }
                         continue;
                     }
 
@@ -1134,12 +1191,16 @@ namespace DoNotBeLazy.Jobs
 
         private void DropAndSkip(Thing thing, string reason)
         {
+            // Q43, 2026-11-15, by order: the label is read before the drop; a stack
+            // that merges into one on the ground reads as the smaller count after it
+            // (x100 was logged as x97).
+            string labelBeforeDrop = thing.LabelCap;
             LeftoverCargo.NoteForcedDrop(pawn, job, thing, reason);
             pawn.inventory.innerContainer.TryDrop(thing, pawn.Position, pawn.Map, ThingPlaceMode.Near, out _);
             ItemLedger.Dropped(pawn, thing, reason, true);
             CargoComp?.Unregister(thing);
             carried.Remove(thing);
-            Logger.Message($"{pawn.LabelShort}: {reason} - dropped {thing.LabelCap} near itself");
+            Logger.Message($"{pawn.LabelShort}: {reason} - dropped {labelBeforeDrop} near itself");
         }
 
         // Section 23, item 6. A stack the vehicle will not take (no longer
@@ -1168,6 +1229,7 @@ namespace DoNotBeLazy.Jobs
         private void SendToStorage(Thing thing, string reason)
         {
             toStorage.Add(thing);
+            RefreshClaims();
             Logger.Message($"{pawn.LabelShort}: not delivering {thing.LabelCap} to the vehicle - {reason}; taking it to storage");
         }
 
@@ -1215,8 +1277,81 @@ namespace DoNotBeLazy.Jobs
                     carried.Remove(item);
                     CargoComp?.Unregister(item);
                 }
+                RefreshClaims();
                 pawn.jobs.curDriver.JumpToToil(deliver);
             };
+            return toil;
+        }
+
+        // Rebuilds this pawn's claims on the job's vehicle from what it holds
+        // now: stacks still in the pack that are not headed for storage.
+        // Units delivered, dropped or sent to storage stop counting.
+        private void RefreshClaims()
+        {
+            Thing vehicle = job?.targetB.Thing;
+            if (!vehicleCargo || vehicle == null)
+            {
+                return;
+            }
+            claimVehicle = vehicle;
+            var held = new Dictionary<object, int>();
+            foreach (Thing t in carried)
+            {
+                if (t == null || t.Destroyed || toStorage.Contains(t) || pawn.inventory == null || !pawn.inventory.innerContainer.Contains(t))
+                {
+                    continue;
+                }
+                object key = VehicleCompat.EntryKey(vehicle, t);
+                if (key != null)
+                {
+                    held[key] = (held.TryGetValue(key, out int n) ? n : 0) + t.stackCount;
+                }
+            }
+            foreach (object key in claimedKeys.ToList())
+            {
+                if (!held.ContainsKey(key))
+                {
+                    VehicleClaims.Set(pawn, vehicle, key, 0);
+                    claimedKeys.Remove(key);
+                }
+            }
+            foreach (KeyValuePair<object, int> pair in held)
+            {
+                VehicleClaims.Set(pawn, vehicle, pair.Key, pair.Value);
+                claimedKeys.Add(pair.Key);
+            }
+        }
+
+        // The job really started (see TryMakePreToilReservations): record
+        // this pawn's share of the primary target's entry as a claim and seed
+        // claimedKeys with it, so a primary that is refused at pickup is
+        // cleared by the next RefreshClaims.
+        private void RecordStartClaim()
+        {
+            Thing vehicle = job?.targetB.Thing;
+            Thing primary = job?.targetA.Thing;
+            if (job == null || job.haulMode != HaulMode.ToContainer || primary == null || vehicle == null
+                || !VehicleCompat.IsCargoLoadingWork(job.workGiverDef) || !VehicleCompat.IsVehicle(vehicle))
+            {
+                return;
+            }
+            object key = VehicleCompat.EntryKey(vehicle, primary);
+            if (key == null)
+            {
+                return;
+            }
+            claimVehicle = vehicle;
+            claimedKeys.Add(key);
+            VehicleClaims.Set(pawn, vehicle, key, Mathf.Min(job.count > 0 ? job.count : primary.stackCount, primary.stackCount));
+        }
+
+        // Instant toil placed once, ahead of `deliver`: after a load a
+        // resumed job already holds cargo, which must be claimed again.
+        private Toil RefreshClaimsToil()
+        {
+            Toil toil = new Toil();
+            toil.defaultCompleteMode = ToilCompleteMode.Instant;
+            toil.initAction = RefreshClaims;
             return toil;
         }
 
@@ -1255,6 +1390,14 @@ namespace DoNotBeLazy.Jobs
         // them.
         private void ReleaseAnyStuckCargo(JobCondition condition)
         {
+            // Over-fetch tally (section 45): whatever this pawn was handed or
+            // carried for a vehicle stops counting the moment its job ends.
+            int claimReleased = VehicleClaims.ReleasePawn(pawn, claimVehicle);
+            if (claimReleased > 0)
+            {
+                Logger.Message($"{pawn.LabelShort}: stuffing job ended ({condition}), released its claim of {claimReleased} unit(s) on the vehicle's load");
+            }
+
             // Order 4.2, 2026-10-06 (dnbl-architecture.md section 23): an
             // ending that did not go through FinishTripAndEndJob (an
             // Incompletable from outside the toils) used to record no
@@ -1298,13 +1441,26 @@ namespace DoNotBeLazy.Jobs
             // stayed in the pawn unregistered, where nothing would ever take
             // it out again (~12 pawns kept 30-75 wood). A stack still held
             // stays registered for SweepManager.DropRegisteredCargoOnLeaving.
+            // Q44(b), 2026-11-15, by order: on an interrupt the cargo in the pack
+            // is kept (registered, so vanilla does not dump it) for the next job
+            // to deliver; KeptCargo guarantees it still leaves the pack - sent to
+            // storage after KeptCargo.DeliverAfterTicks, dropped after
+            // KeptCargo.DropAfterTicks. Other endings drop at once as before.
+            bool keepForNextJob = (condition == JobCondition.InterruptForced || condition == JobCondition.InterruptOptional)
+                && pawn.Spawned && !pawn.Dead && !pawn.Downed;
             int dropped = 0;
             int kept = 0;
+            int keptForLater = 0;
             foreach (Thing thing in stuck)
             {
                 int stackBeforeDrop = thing.stackCount;
                 bool inInventory = pawn.inventory != null && pawn.inventory.innerContainer.Contains(thing);
                 bool inHands = pawn.carryTracker != null && pawn.carryTracker.innerContainer.Contains(thing);
+                if (keepForNextJob && inInventory)
+                {
+                    keptForLater++;
+                    continue;
+                }
                 if (inInventory || inHands)
                 {
                     if (pawn.Spawned && pawn.Map != null)
@@ -1333,6 +1489,12 @@ namespace DoNotBeLazy.Jobs
             }
             carried.Clear();
             ItemLedger.JobEnded(pawn, job?.loadID ?? 0, condition.ToString());
+            string keptLaterNote = "";
+            if (keptForLater > 0)
+            {
+                KeptCargo.Keep(pawn, keptForLater, condition.ToString());
+                keptLaterNote = ", kept " + keptForLater + " in the pack for the next job to deliver";
+            }
 
             // Order 4.4, corrected 2026-10-11: where each item is NOW, read
             // after the drops. It used to be read before them, so a stack the
@@ -1353,7 +1515,7 @@ namespace DoNotBeLazy.Jobs
             }));
 
             string keptNote = kept == 0 ? "" : $", {kept} could not be dropped ({(pawn.Spawned ? "drop failed" : "pawn not spawned")}) and stay registered as DNBL cargo";
-            Logger.Message($"{pawn.LabelShort}: stuffing job ended ({condition}) in toil {toilIndex} ({toil}) with {names} still undelivered - dropped {dropped} near itself{keptNote}; item locations: {where}{suppressNote}");
+            Logger.Message($"{pawn.LabelShort}: stuffing job ended ({condition}) in toil {toilIndex} ({toil}) with {names} still undelivered - dropped {dropped} near itself{keptLaterNote}{keptNote}; item locations: {where}{suppressNote}");
         }
 
         // Shared trip-end logging and the zero-progress backstop - used by

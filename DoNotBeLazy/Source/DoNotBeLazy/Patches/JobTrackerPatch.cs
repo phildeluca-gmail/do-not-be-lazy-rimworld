@@ -58,16 +58,24 @@ namespace DoNotBeLazy.Patches
         {
             public Job job;
             public bool playerInterruptedForced;
+            // section 44: name of the automatic fight/flee response this job was, read before the job is pooled
+            public string automaticResponse;
         }
 
         [HarmonyPriority(Priority.First)]
-        public static void Prefix(Pawn_JobTracker __instance, out EndedJobState __state)
+        public static void Prefix(Pawn_JobTracker __instance, Pawn ___pawn, out EndedJobState __state)
         {
             Job cur = __instance.curJob;
+            // Section 44: only a pawn holding an order needs the name; the
+            // lookup is a dictionary read, the name is built after it.
+            Pawn holder = ___pawn;
+            SweepManager manager = holder?.Map?.GetComponent<SweepManager>();
+            bool holdsOrder = manager != null && manager.TryGetActiveSweep(holder, out _);
             __state = new EndedJobState
             {
                 job = cur,
-                playerInterruptedForced = cur != null && cur.playerInterruptedForced
+                playerInterruptedForced = cur != null && cur.playerInterruptedForced,
+                automaticResponse = holdsOrder ? SweepManager.AutomaticResponseName(cur) : null
             };
         }
 
@@ -128,7 +136,7 @@ namespace DoNotBeLazy.Patches
                 return;
             }
 
-            sweepManager.Notify_JobEnded(pawn, condition, endedJob, __state.playerInterruptedForced);
+            sweepManager.Notify_JobEnded(pawn, condition, endedJob, __state.playerInterruptedForced, __state.automaticResponse);
         }
     }
 }

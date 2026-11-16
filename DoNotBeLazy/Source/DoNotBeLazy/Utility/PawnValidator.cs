@@ -82,6 +82,36 @@ namespace DoNotBeLazy.Utility
             }
         }
 
+        // Group order rule, ordered 2026-11-15: "If * order includes pawns who
+        // are asleep or unable to walk or otherwise won't do work, job cannot
+        // be forced. Original rule was to let other members do job!"
+        // A pawn who can take a * order but cannot start it NOW is left out of
+        // the order (not woken, not struck off any order it is already on) so
+        // the targets go to pawns who will walk. Returns the reason in words,
+        // or null when the pawn can start work. Deliberately NOT part of
+        // CanSweep: that check also runs every assignment of a running sweep,
+        // and a pawn who dozes off mid-order must stay on it.
+        public static string GroupOrderBlock(Pawn pawn)
+        {
+            if (pawn == null)
+            {
+                return "is missing";
+            }
+            if (pawn.health?.capacities == null)
+            {
+                return "has no health state";
+            }
+            if (!pawn.Awake())
+            {
+                return "is asleep";
+            }
+            if (!pawn.health.capacities.CapableOf(PawnCapacityDefOf.Moving))
+            {
+                return "cannot move";
+            }
+            return null;
+        }
+
         // was the whole body of CanSweep - split out so the menu can name
         // which check tripped without the order of them drifting apart
         private static Refusal Check(Pawn pawn, WorkGiverDef workGiverDef)

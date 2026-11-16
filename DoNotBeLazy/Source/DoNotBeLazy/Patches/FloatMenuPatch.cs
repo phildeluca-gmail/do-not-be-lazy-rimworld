@@ -295,7 +295,11 @@ namespace DoNotBeLazy.Patches
                     // priority 0" and "the pawn is drafted" came out as
                     // silent nothing - the whole point of the greyed-out
                     // entries was to stop that
-                    if (feedback.Count < MaxFeedbackOptions && WantsSomethingHere(def, thingsHere, fireHere))
+                    if (WantsSomethingHere(def, thingsHere, fireHere) && feedback.Count >= MaxFeedbackOptions)
+                    {
+                        NoteOptionOff(def, cell, pawns, "left off", "too many greyed entries already shown (cap " + MaxFeedbackOptions + ")");
+                    }
+                    else if (feedback.Count < MaxFeedbackOptions && WantsSomethingHere(def, thingsHere, fireHere))
                     {
                         string why = FirstRefusal(pawns, map, def, out Pawn refused);
 
@@ -310,6 +314,11 @@ namespace DoNotBeLazy.Patches
                         if (why != null && !AllHopeless(pawns, map, def))
                         {
                             feedback.Add(DisabledOption(def, refused.LabelShort, why));
+                            NoteOptionOff(def, cell, pawns, "greyed", refused.LabelShort + ": " + why);
+                        }
+                        else if (why != null)
+                        {
+                            NoteOptionOff(def, cell, pawns, "left off", "no selected pawn can ever do it (" + refused.LabelShort + ": " + why + ")");
                         }
                     }
                     continue;
@@ -363,6 +372,11 @@ namespace DoNotBeLazy.Patches
                     if (failReason != null && feedback.Count < MaxFeedbackOptions)
                     {
                         feedback.Add(DisabledOption(def, failThing?.LabelShort, failReason));
+                        NoteOptionOff(def, cell, pawns, "greyed", (failThing?.LabelShort ?? "target") + ": " + failReason);
+                    }
+                    else if (failReason != null)
+                    {
+                        NoteOptionOff(def, cell, pawns, "left off", "too many greyed entries already shown (cap " + MaxFeedbackOptions + "): " + failReason);
                     }
                     continue;
                 }
@@ -378,6 +392,7 @@ namespace DoNotBeLazy.Patches
                 if (failReason != null && feedback.Count < MaxFeedbackOptions)
                 {
                     feedback.Add(DisabledOption(def, failThing?.LabelShort, failReason));
+                    NoteOptionOff(def, cell, pawns, "greyed (option itself is on offer)", (failThing?.LabelShort ?? "a thing here") + ": " + failReason);
                 }
 
                 // One WorkGiverDef can serve more than one player order -
@@ -596,6 +611,56 @@ namespace DoNotBeLazy.Patches
         //
         // Reason text comes from JobFailReason, so it's the game's own
         // wording, already translated.
+        // Q54, 2026-11-15, ordered ("q54 yes"): one log line each time a *
+        // option is greyed or left off the menu, with the reason. The menu is
+        // rebuilt many times per right-click, so a line is written once per
+        // distinct (pawn set, cell, option, kind, reason) and then not again
+        // for OptionOffQuietSeconds of real time; never per frame.
+        private const float OptionOffQuietSeconds = 5f;
+        private static readonly Dictionary<int, float> optionOffLogged = new Dictionary<int, float>();
+
+        private static void NoteOptionOff(WorkGiverDef def, IntVec3 cell, List<Pawn> pawns, string kind, string reason)
+        {
+            try
+            {
+                // Cheap check first: an int key, nothing allocated when throttled.
+                int key = def.shortHash;
+                key = key * 31 + cell.x * 7919 + cell.z;
+                key = key * 31 + kind.GetHashCode();
+                key = key * 31 + reason.GetHashCode();
+                int idSum = 0, idXor = 0;
+                foreach (Pawn p in pawns)
+                {
+                    if (p != null) { idSum += p.thingIDNumber; idXor ^= p.thingIDNumber * 16777619; }
+                }
+
+                key = key * 31 + idSum;
+                key = key * 31 + idXor;
+                float now = UnityEngine.Time.realtimeSinceStartup;
+                if (optionOffLogged.TryGetValue(key, out float until) && now < until)
+                {
+                    return;
+                }
+
+                if (optionOffLogged.Count > 200)
+                {
+                    optionOffLogged.Clear();
+                }
+
+                optionOffLogged[key] = now + OptionOffQuietSeconds;
+                var names = new List<string>();
+                foreach (Pawn p in pawns)
+                {
+                    if (p != null && names.Count < 6) names.Add(p.LabelShort);
+                }
+
+                Logger.Message($"menu: * {(def.label.NullOrEmpty() ? def.defName : def.label)} at {cell} {kind} for {pawns.Count} pawn(s) ({string.Join(", ", names.ToArray())}{(pawns.Count > names.Count ? ", ..." : "")}) - {reason}");
+            }
+            catch (Exception)
+            {
+            }
+        }
+
         private static FloatMenuOption DisabledOption(WorkGiverDef def, string subject, string reason)
         {
             string label = def.label.NullOrEmpty() ? def.defName : def.label.CapitalizeFirst();
@@ -1379,7 +1444,8 @@ namespace DoNotBeLazy.Patches
                 string reason;
                 try
                 {
-                    reason = PawnValidator.RefusalReason(pawn, def);
+                    reason = PawnValidator.RefusalReason(pawn, def)
+                        ?? (pawns.Count > 1 ? PawnValidator.GroupOrderBlock(pawn) : null);
                 }
                 catch (Exception ex)
                 {
@@ -1396,6 +1462,18 @@ namespace DoNotBeLazy.Patches
 
             who = null;
             return null;
+        }
+
+        // GroupOrderBlock, with a throw reported as a block so the menu and
+        // SweepManager.BeginSweep agree.
+        private static string GroupBlockOrThrow(Pawn pawn)
+        {
+            try { return PawnValidator.GroupOrderBlock(pawn); }
+            catch (Exception ex)
+            {
+                PawnExceptionCaught(pawn, "GroupOrderBlock", ex);
+                return "could not be checked";
+            }
         }
 
         private static List<Pawn> EligiblePawns(List<Pawn> pawns, Map map, WorkGiverDef def)
@@ -1420,7 +1498,13 @@ namespace DoNotBeLazy.Patches
                 // checked.
                 try
                 {
-                    if (PawnValidator.CanSweep(pawn, def))
+                    // Group rule, 2026-11-15: in a group a sleeping or immobile
+                    // pawn is left out so the others take the order. A lone
+                    // selected pawn is still allowed (vanilla wakes it).
+                    // an exception inside the block check counts as blocked,
+                    // the same as BeginSweep does
+                    if (PawnValidator.CanSweep(pawn, def)
+                        && (pawns.Count < 2 || GroupBlockOrThrow(pawn) == null))
                     {
                         result.Add(pawn);
                     }
