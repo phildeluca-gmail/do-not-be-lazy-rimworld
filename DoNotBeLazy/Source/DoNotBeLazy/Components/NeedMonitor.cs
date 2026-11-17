@@ -1123,5 +1123,173 @@ namespace DoNotBeLazy.Components
 
             return job;
         }
+
+        // 2026-11-16, order B: the safety net's fallback when mood is at the
+        // setting but Recreation is full. Same candidate sources and filter as
+        // TryFindBestFoodJob (inventory plus the map's food list, FoodFilter,
+        // reserve and reach), restricted to ready-made food with preferability
+        // MealFine or better (fine and lavish meals, and modded meals ranked
+        // there); never the nutrient paste dispenser. Highest mood effect
+        // wins, then nearest (straight-line). Carried cargo is put down only
+        // once a meal is found. Verified in lib\Assembly-CSharp.dll: with Food
+        // full, WillIngestStackCountOf still returns at least 1 and
+        // GetMaxAmountToPickup does not look at the need, so the Ingest job
+        // can be made and taken.
+        public static Job FindFineMealJob(Pawn pawn, out int candidateCount, out float bestMoodEffect, out string declineReason, out string choiceNote, out string dropped)
+        {
+            candidateCount = 0;
+            bestMoodEffect = 0f;
+            declineReason = null;
+            choiceNote = null;
+            dropped = "";
+            if (pawn?.needs?.food == null || pawn.Map == null)
+            {
+                declineReason = "no food need, or not spawned on a map";
+                return null;
+            }
+
+            JobDef curDef = pawn.jobs?.curJob?.def;
+            if (curDef == JobDefOf.FeedPatient || curDef == JobDefOf.DeliverFood)
+            {
+                declineReason = "carrying a meal to someone else (" + curDef.defName + ")";
+                return null;
+            }
+
+            Thing bestThing = null;
+            ThingDef bestDef = null;
+            float bestMood = float.NegativeInfinity;
+            int bestDist = int.MaxValue;
+            int candidates = 0, leftNotFine = 0, leftFiltered = 0, leftNotIngestible = 0, leftUnreachable = 0, leftNoGain = 0;
+            bool desperate = pawn.needs.food.CurCategory == HungerCategory.Starving;
+            FoodPreferability minPref = desperate ? FoodPreferability.DesperateOnly : FoodPreferability.RawBad;
+
+            void Consider(Thing candidate, bool inInventory)
+            {
+                ThingDef def = FoodUtility.GetFinalIngestibleDef(candidate);
+                if (def == null || candidate is Building_NutrientPasteDispenser || def.ingestible == null
+                    || def.ingestible.preferability < FoodPreferability.MealFine)
+                {
+                    leftNotFine++;
+                    return;
+                }
+
+                if (FoodFilter(pawn, candidate, def, desperate, minPref) != FoodFilterResult.Ok)
+                {
+                    leftFiltered++;
+                    return;
+                }
+
+                if (!candidate.IngestibleNow)
+                {
+                    leftNotIngestible++;
+                    return;
+                }
+
+                if (!inInventory && !pawn.CanReserveAndReach(candidate, PathEndMode.ClosestTouch, Danger.Some))
+                {
+                    leftUnreachable++;
+                    return;
+                }
+
+                // Mood gained now, not MoodFromIngesting: a meal thought the
+                // pawn already holds does not stack (stackLimit 1) and fine and
+                // lavish replace each other, so without this the pawn is sent
+                // to eat again after every quiet spell while mood stays low.
+                float mood = MoodGainFromIngesting(pawn, candidate, def);
+                if (mood <= 0f)
+                {
+                    leftNoGain++;
+                    return;
+                }
+
+                candidates++;
+                int dist = inInventory ? 0 : (pawn.Position - candidate.Position).LengthHorizontalSquared;
+                if (bestThing == null || mood > bestMood || (mood == bestMood && dist < bestDist))
+                {
+                    bestThing = candidate;
+                    bestDef = def;
+                    bestMood = mood;
+                    bestDist = dist;
+                }
+            }
+
+            if (pawn.inventory?.innerContainer != null)
+            {
+                foreach (Thing item in pawn.inventory.innerContainer)
+                {
+                    Consider(item, true);
+                }
+            }
+
+            foreach (Thing thing in pawn.Map.listerThings.ThingsMatching(ThingRequest.ForGroup(ThingRequestGroup.FoodSourceNotPlantOrTree)))
+            {
+                Consider(thing, false);
+            }
+
+            candidateCount = candidates;
+            if (bestThing == null)
+            {
+                declineReason = (candidates == 0 ? "no fine or lavish meal this pawn will eat, reach, reserve or gain mood from now" : "no viable fine meal scored")
+                    + $" (left out: {leftNotFine} not fine or lavish, {leftFiltered} will not eat, forbidden or rotting, {leftNotIngestible} not ingestible now, {leftUnreachable} cannot reserve or reach, {leftNoGain} no mood gain now)";
+                return null;
+            }
+
+            bestMoodEffect = bestMood;
+            bool carriedMeal = bestThing.holdingOwner != null && bestThing.holdingOwner == pawn.inventory?.innerContainer;
+            choiceNote = $"pawn at {pawn.Position}, meal at {(carriedMeal ? "own inventory" : bestThing.Position.ToString())}"
+                + (carriedMeal ? "" : $" ({Math.Sqrt(bestDist):F0} cells straight-line)") + ", best mood effect then nearest";
+            Thing carried = pawn.carryTracker?.CarriedThing;
+            if (carried != null && !(carried is Pawn))
+            {
+                dropped = SweepManager.DropCurrentJobCargo(pawn);
+            }
+
+            Job job = JobMaker.MakeJob(JobDefOf.Ingest, bestThing);
+            job.count = FoodUtility.WillIngestStackCountOf(pawn, bestDef, FoodUtility.GetNutrition(pawn, bestThing, bestDef));
+            return job;
+        }
+
+        // FindFineMealJob's score: the mood the pawn would gain now. A thought
+        // already held as a memory adds nothing (stackLimit 1), and a held
+        // memory the new thought replaces (AteFineMeal and AteLavishMeal
+        // replace each other) is subtracted. Verified in lib\Assembly-CSharp.dll:
+        // MemoryThoughtHandler.TryGainMemory removes replaceThoughts.
+        // ThoughtsFromIngesting returns a shared static list, read at once.
+        private static float MoodGainFromIngesting(Pawn pawn, Thing candidate, ThingDef def)
+        {
+            MemoryThoughtHandler memories = pawn.needs?.mood?.thoughts?.memories;
+            float gain = 0f;
+            foreach (FoodUtility.ThoughtFromIngesting t in FoodUtility.ThoughtsFromIngesting(pawn, candidate, def))
+            {
+                ThoughtDef thought = t.thought;
+                if (thought?.stages == null || thought.stages.Count == 0 || thought.stages[0] == null)
+                {
+                    continue;
+                }
+
+                float add = thought.stages[0].baseMoodEffect;
+                if (memories != null)
+                {
+                    if (thought.stackLimit <= 1 && memories.GetFirstMemoryOfDef(thought) != null)
+                    {
+                        add = 0f;
+                    }
+                    else if (thought.replaceThoughts != null)
+                    {
+                        foreach (ThoughtDef replaced in thought.replaceThoughts)
+                        {
+                            if (replaced?.stages != null && replaced.stages.Count > 0 && replaced.stages[0] != null && memories.GetFirstMemoryOfDef(replaced) != null)
+                            {
+                                add -= replaced.stages[0].baseMoodEffect;
+                            }
+                        }
+                    }
+                }
+
+                gain += add;
+            }
+
+            return gain;
+        }
     }
 }

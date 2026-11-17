@@ -1543,7 +1543,7 @@ namespace DoNotBeLazy.Components
                     }
                 }
 
-                Logger.Order($"HANDOFF {pawn?.LabelShort}: {kind} {givenText} - game {(threw ? "threw an exception" : took ? "accepted it" : "refused it")}, our job running now: {running}, our job in queue: {queuedNow}, pawn now on {DescribeJob(cur)}; before the call: {before}");
+                Logger.Order($"HANDOFF {pawn?.LabelShort}: {kind} {givenText} - game {(threw ? "threw an exception" : took ? "accepted it" : "refused it")}, our job running now: {running}, our job in queue: {queuedNow}, our job id {givenLoadID}, pawn now on {DescribeJob(cur)} (job id {(cur != null ? cur.loadID.ToString() : "none")}); before the call: {before}");
             }
             catch (Exception ex)
             {
@@ -4079,6 +4079,49 @@ namespace DoNotBeLazy.Components
         // NeedMonitor interval and only for a paused pawn. Guess: 2000 ticks.
         private const int IngestStallTicks = 2000;
 
+        // 2026-11-16 (user: "add the step and job id to the log"). Log text only.
+        // JobDriver.toils (private List<Toil>), CurToilIndex, and Toil.debugName /
+        // initAction / tickAction verified on Assembly-CSharp.dll. The toil is read
+        // from the list by index, not via the protected CurToil getter, because that
+        // getter calls Log.Error when the index is past the end (review 2026-11-16).
+        // debugName is usually empty, so fall back to the delegate's method name.
+        private static readonly System.Reflection.FieldInfo JobDriverToilsField =
+            typeof(JobDriver).GetField("toils", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic);
+
+        private static string DescribeDriverStep(Pawn pawn)
+        {
+            try
+            {
+                JobDriver driver = pawn?.jobs?.curDriver;
+                if (driver == null) return "no driver";
+                System.Collections.IList list = JobDriverToilsField?.GetValue(driver) as System.Collections.IList;
+                int count = list != null ? list.Count : -1;
+                int index = driver.CurToilIndex;
+                string name = "unknown";
+                Toil t = list != null && index >= 0 && index < count ? list[index] as Toil : null;
+                if (t != null)
+                {
+                    if (!string.IsNullOrEmpty(t.debugName))
+                    {
+                        name = t.debugName;
+                    }
+                    else
+                    {
+                        Delegate d = t.tickAction ?? t.initAction;
+                        System.Reflection.MethodInfo m = d?.Method;
+                        name = m == null ? "unnamed" : (m.DeclaringType?.FullName ?? "?") + "." + m.Name
+                            + (ReferenceEquals(d, t.tickAction) ? " (tick)" : " (init)");
+                    }
+                }
+
+                return $"toil {index} of {count} [{name}], driver {driver.GetType().FullName}";
+            }
+            catch (Exception ex)
+            {
+                return "step unreadable (" + ex.GetType().Name + ")";
+            }
+        }
+
         private void CheckIngestStall(Pawn pawn, Job curJob)
         {
             if (!pausedForNeed.TryGetValue(pawn, out PauseInfo paused))
@@ -4129,6 +4172,12 @@ namespace DoNotBeLazy.Components
                 paused.ingestWatchFood = food;
                 paused.ingestWatchToil = toil;
                 paused.ingestWatchDist = newJob || closer ? dist : paused.ingestWatchDist;
+                // 2026-11-16 (H1.1 order): real progress ends "judged stalled",
+                // so TryForceRestIfStuck leaves a recovering meal alone. Also
+                // cleared on a restarted watch, so a resumed job is not
+                // "stalled" before a full window has run.
+                paused.ingestLoggedId = 0;
+
                 pausedForNeed[pawn] = paused;
                 return;
             }
@@ -4153,7 +4202,7 @@ namespace DoNotBeLazy.Components
             if (paused.ingestLoggedId != curJob.loadID)
             {
                 paused.ingestLoggedId = curJob.loadID;
-                Logger.Message($"{pawn.LabelShort}: Ingest stalled - {watched} ticks without progress on toil {toil} of {DescribeJob(curJob)} from {DescribeJobSource(curJob)}, target {stalledOn?.LabelShort ?? "none"}, pawn at {pawn.Position} ({(pawn.pather != null && pawn.pather.Moving ? "still moving" : "not moving")}), meal at {stalledOn?.Position.ToString() ?? "none"}, {paused.ingestWatchDist:F0} cells from it at best, Food has not risen ({NeedMonitor.LevelsText(pawn)}) - trying to force another meal");
+                Logger.Message($"{pawn.LabelShort}: Ingest stalled - {watched} ticks without progress on {DescribeDriverStep(pawn)}, job id {curJob.loadID} {DescribeJob(curJob)} from {DescribeJobSource(curJob)}, target {stalledOn?.LabelShort ?? "none"}, pawn at {pawn.Position} ({(pawn.pather != null && pawn.pather.Moving ? "still moving" : "not moving")}), meal at {stalledOn?.Position.ToString() ?? "none"}, {paused.ingestWatchDist:F0} cells from it at best, Food has not risen ({NeedMonitor.LevelsText(pawn)}) - trying to force another meal");
             }
 
             pausedForNeed[pawn] = paused;
@@ -4173,6 +4222,27 @@ namespace DoNotBeLazy.Components
             {
                 Logger.Message($"{pawn.LabelShort}: forced meal ended because it stalled ({watched} ticks, target {stalledOn?.LabelShort ?? "none"}) - replaced by another forced meal");
             }
+        }
+
+        // Review fix 2026-11-16 (H1.1 order): CheckIngestStall runs after
+        // TryForceRestIfStuck in each poll, and not at all once Food is
+        // satisfied on a pause that began on another need, so ingestLoggedId
+        // alone can be stale. Re-check progress against the watch snapshot
+        // here, with the same tests CheckIngestStall uses.
+        private static bool IngestJudgedStalled(Pawn pawn, Job curJob, PauseInfo paused)
+        {
+            if (curJob == null || curJob.def != JobDefOf.Ingest || !paused.ingestWatching
+                || paused.ingestWatchId != curJob.loadID || paused.ingestLoggedId != curJob.loadID)
+            {
+                return false;
+            }
+
+            float food = pawn.needs?.food?.CurLevelPercentage ?? 1f;
+            int toil = pawn.jobs?.curDriver?.CurToilIndex ?? -1;
+            float dist = curJob.targetA.IsValid ? pawn.Position.DistanceTo(curJob.targetA.Cell) : 0f;
+            return toil == paused.ingestWatchToil
+                && food <= paused.ingestWatchFood + 0.01f
+                && dist >= paused.ingestWatchDist - 0.5f;
         }
 
         // Why TryForceEatIfStuck did not retry, once per distinct reason
@@ -4730,17 +4800,24 @@ namespace DoNotBeLazy.Components
             // job at all (eating, sleeping, joy, a lord's duty).
             // LOCKED (dnbl H1.1) - passed 5x in play 2026-10-05; do not change without the user's explicit order.
             // changed 2026-11-15 by order (Q56), re-test H1: IsOrdinaryWork now means any unprotected job.
-            bool ordinaryWork = IsOrdinaryWork(pawn, curJob);
+            // changed 2026-11-16 by order "Fix code H1.1.", re-test H1.1: an Ingest job that
+            // CheckIngestStall has already judged stalled (same job id as ingestLoggedId, which
+            // it clears again on real progress) also counts as interruptible, so Rest is no
+            // longer left unserved behind a meal that is going nowhere. A healthy Ingest is
+            // still protected.
+            bool ordinaryJob = IsOrdinaryWork(pawn, curJob);
+            bool stalledIngest = !ordinaryJob && IngestJudgedStalled(pawn, curJob, paused);
+            bool ordinaryWork = ordinaryJob || stalledIngest;
             // END LOCKED (dnbl H1.1)
             if (!idle && !ordinaryWork)
             {
-                if (curJob != null && curJob.def != JobDefOf.Ingest && curJob.def != JobDefOf.LayDown
+                if (curJob != null && curJob.def != JobDefOf.LayDown
                     && curJob.def.joyKind == null && paused.restBusyJob != curJob.def.defName)
                 {
                     paused.restBusyJob = curJob.def.defName;
                     pausedForNeed[pawn] = paused;
                     Logger.Message($"{pawn.LabelShort}: paused (began on {paused.need}), Rest holds it but the pawn is on {DescribeJob(curJob)}"
-                        + (curJob.playerForced ? " (player-forced)" : curJob.workGiverDef != null ? $" (emergency work, {curJob.workGiverDef.defName})" : " (not a work job)")
+                        + (curJob.def == JobDefOf.Ingest ? " (protected job: a meal not judged stalled)" : curJob.playerForced ? " (player-forced)" : curJob.workGiverDef != null ? $" (emergency work, {curJob.workGiverDef.defName})" : " (not a work job)")
                         + $" - not interrupting (now: {NeedMonitor.LevelsText(pawn)})");
                 }
                 return false;
@@ -4813,7 +4890,7 @@ namespace DoNotBeLazy.Components
             // periodic poll reads the forced LayDown as a foreign order and
             // ends the sweep.
             // LOCKED (dnbl H1.1) - passed 5x in play 2026-10-05; do not change without the user's explicit order.
-            string interrupted = idle ? "" : $" (pausing {DescribeJob(curJob)}, given back after)";
+            string interrupted = idle ? "" : stalledIngest ? $" (interrupting {DescribeJob(curJob)}, judged stalled; a meal is not given back)" : $" (pausing {DescribeJob(curJob)}, given back after)";
             Job layDown = JobMaker.MakeJob(JobDefOf.LayDown, bed);
             ourJob[pawn] = layDown;
             GiveNeedJob(pawn, layDown, "forced rest");

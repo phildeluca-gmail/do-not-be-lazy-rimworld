@@ -176,17 +176,20 @@ namespace DoNotBeLazy.Components
             // the pawn is not sent (manager's decision, section 34).
             bool moodAtBreak = NeedMonitor.MoodAtSetting(pawn);
             bool lowMood = moodAtBreak && NeedMonitor.RecreationCanHelpMood(pawn);
+            // 2026-11-16, order B: mood at the setting and Recreation full -
+            // recreation cannot help, so try a fine or lavish meal, then sleep.
+            bool moodFallback = moodAtBreak && !lowMood && pawn.needs.joy != null;
             if (!moodAtBreak)
             {
                 moodFutileLogged.Remove(pawn);
             }
             else if (!lowMood && pawn.needs.joy != null && moodFutileLogged.Add(pawn))
             {
-                Logger.Message($"safety net: {pawn.LabelShort} Mood {pawn.needs.mood.CurLevelPercentage:P0} is at or below the mood setting {DoNotBeLazyMod.Settings.moodThreshold:P0} but Recreation is already {pawn.needs.joy.CurLevelPercentage:P0} - recreation cannot help, not sending");
+                Logger.Message($"safety net: {pawn.LabelShort} Mood {pawn.needs.mood.CurLevelPercentage:P0} is at or below the mood setting {DoNotBeLazyMod.Settings.moodThreshold:P0} but Recreation is already {pawn.needs.joy.CurLevelPercentage:P0} - recreation cannot help, trying a fine or lavish meal, then sleep");
             }
 
             AlertIfDrafted(pawn, lowFood, lowRest, food, rest, settings);
-            if (!lowFood && !lowRest && !lowJoy && !lowMood)
+            if (!lowFood && !lowRest && !lowJoy && !lowMood && !moodFallback)
             {
                 lastDecline.Remove(pawn);
                 quietUntil.Remove(pawn);
@@ -316,6 +319,64 @@ namespace DoNotBeLazy.Components
             {
                 TrySendToCalmMood(pawn, levels, interrupted, now);
             }
+            else if (moodFallback)
+            {
+                TrySendToFineMealOrSleep(pawn, levels, interrupted, now);
+            }
+        }
+
+        // 2026-11-16, order B (verbatim: "Safety net should send to fine or
+        // lavish meal or to sleep in that order."). Mood is at the setting and
+        // Recreation is full. First a fine or lavish meal
+        // (NeedMonitor.FindFineMealJob), else the same sleep job as
+        // TrySendToSleep (vanilla's JobGiver_GetRest; H6 untouched), else a
+        // decline naming both reasons. Verified in lib\Assembly-CSharp.dll:
+        // Ingest can be given with Food full; LayDown can be given with high
+        // Rest, but Rest at 75% or more cannot fall asleep
+        // (RestUtility.CanFallAsleep), so the pawn lies awake until the
+        // think tree overrides the job. New method; H5, H6, H8 untouched.
+        private static bool TrySendToFineMealOrSleep(Pawn pawn, string levels, string interrupted, int now)
+        {
+            string moodText = $"Mood {pawn.needs.mood.CurLevelPercentage:P0} is at or below the mood setting {DoNotBeLazyMod.Settings.moodThreshold:P0} and Recreation is {pawn.needs.joy.CurLevelPercentage:P0}";
+            Job meal = NeedMonitor.FindFineMealJob(pawn, out int candidates, out float moodEffect, out string mealWhy, out string choiceNote, out string dropped);
+            if (meal != null)
+            {
+                if (SweepManager.GiveJob(pawn, meal, false, "safety net fine meal for mood"))
+                {
+                    Sent(pawn, now, "Mood", $"safety net: {pawn.LabelShort} {moodText} - recreation cannot help, sent to eat {meal.targetA.Thing?.LabelShort ?? meal.def.defName} (mood effect {moodEffect:F0}, {candidates} candidate{(candidates == 1 ? "" : "s")}; {choiceNote}){dropped}{interrupted} ({levels})");
+                    return true;
+                }
+
+                mealWhy = "the game refused the Ingest job";
+            }
+
+            string sleepWhy = RestRefusal(pawn);
+            Job sleepJob = null;
+            if (sleepWhy == null)
+            {
+                sleepJob = new JobGiver_GetRest().TryIssueJobPackage(pawn, default(JobIssueParams)).Job;
+                if (sleepJob == null)
+                {
+                    sleepWhy = "vanilla's rest giver found no bed, bedroll or ground spot";
+                }
+            }
+
+            if (sleepJob != null)
+            {
+                string where = sleepJob.targetA.Thing != null ? sleepJob.targetA.Thing.LabelShort
+                    : sleepJob.def == JobDefOf.LayDown ? "the ground at " + sleepJob.targetA.Cell
+                    : sleepJob.def.defName;
+                if (SweepManager.GiveJob(pawn, sleepJob, false, "safety net sleep for mood"))
+                {
+                    Sent(pawn, now, "Mood", $"safety net: {pawn.LabelShort} {moodText} - recreation cannot help and no fine or lavish meal ({mealWhy}), sent to {sleepJob.def.defName} on {where}{interrupted} ({levels})");
+                    return true;
+                }
+
+                sleepWhy = "the game refused the sleep job";
+            }
+
+            Decline(pawn, "Mood", $"recreation cannot help, no fine or lavish meal ({mealWhy}) and no sleep ({sleepWhy})", levels, now);
+            return false;
         }
 
         // Section 34 item 4.6. Not H5's TrySendToRecreation (locked): the same
