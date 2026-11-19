@@ -42,7 +42,16 @@ namespace DoNotBeLazy.Utility
             public Pawn Pawn;
             public Area AllowedArea;
             public bool HasWork;
+
+            // 2026-11-18: first failing check per target, counted, so the
+            // order's one summary line can say why this pawn was dropped
+            public Dictionary<string, int> FailCounts = new Dictionary<string, int>();
         }
+
+        // 2026-11-18: one text per FindTargetsForGroup call naming each
+        // pawn that could do nothing and its most common first-failing
+        // check. Read by SweepManager.BeginAreaSweep for the one log line.
+        public static string LastDropReasons = "";
 
         // Everything a per-pawn check needs, gathered once per scan.
         private sealed class ScanContext
@@ -176,13 +185,25 @@ namespace DoNotBeLazy.Utility
                 ScanThings(center, radiusSquared, context, results, limit, filter);
             }
 
+            var dropNotes = new List<string>();
             foreach (GroupMember member in context.Members)
             {
                 if (member.HasWork)
                 {
                     able.Add(member.Pawn);
                 }
+                else
+                {
+                    string top = null;
+                    int topCount = 0;
+                    foreach (KeyValuePair<string, int> kv in member.FailCounts)
+                    {
+                        if (kv.Value > topCount) { top = kv.Key; topCount = kv.Value; }
+                    }
+                    dropNotes.Add(member.Pawn.LabelShort + " - " + (top ?? "no target checked") + " (" + topCount + " targets)");
+                }
             }
+            LastDropReasons = string.Join("; ", dropNotes.ToArray());
 
             return results;
         }
@@ -210,8 +231,14 @@ namespace DoNotBeLazy.Utility
             {
                 foreach (GroupMember member in context.Members)
                 {
-                    if (member.HasWork || !PawnCanDo(context, member, target))
+                    if (member.HasWork)
                     {
+                        continue;
+                    }
+                    if (!PawnCanDo(context, member, target, out string why))
+                    {
+                        member.FailCounts.TryGetValue(why, out int n);
+                        member.FailCounts[why] = n + 1;
                         continue;
                     }
 
@@ -228,7 +255,7 @@ namespace DoNotBeLazy.Utility
 
             foreach (GroupMember member in context.Members)
             {
-                if (member.HasWork && PawnCanDo(context, member, target))
+                if (member.HasWork && PawnCanDo(context, member, target, out _))
                 {
                     return true;
                 }
@@ -242,8 +269,9 @@ namespace DoNotBeLazy.Utility
         // before the target got here. Within each kind the order is the one
         // the single-pawn scan already used; it is one conjunction, so the
         // order changes the cost of a rejection and never the answer.
-        private static bool PawnCanDo(ScanContext context, GroupMember member, LocalTargetInfo target)
+        private static bool PawnCanDo(ScanContext context, GroupMember member, LocalTargetInfo target, out string why)
         {
+            why = null;
             Pawn pawn = member.Pawn;
             Map map = context.Map;
             WorkGiver_Scanner scanner = context.Scanner;
@@ -254,6 +282,7 @@ namespace DoNotBeLazy.Utility
 
                 if (member.AllowedArea != null && !member.AllowedArea[cell])
                 {
+                    why = "outside its allowed area";
                     return false;
                 }
 
@@ -267,6 +296,7 @@ namespace DoNotBeLazy.Utility
                 // conflicts that only block the AI's own automatic scan)
                 if (!scanner.HasJobOnCell(pawn, cell, true))
                 {
+                    why = "HasJobOnCell false";
                     return false;
                 }
 
@@ -283,39 +313,54 @@ namespace DoNotBeLazy.Utility
                 // every pawn in the group.
                 if (!map.reservationManager.CanReserve(pawn, cell))
                 {
+                    why = "reserved by another pawn";
                     return false;
                 }
 
-                return GrowerCompat.CanReachTarget(pawn, cell, scanner);
+                if (!GrowerCompat.CanReachTarget(pawn, cell, scanner))
+                {
+                    why = "unreachable";
+                    return false;
+                }
+                return true;
             }
 
             Thing thing = target.Thing;
 
             if (member.AllowedArea != null && !member.AllowedArea[thing.Position])
             {
+                why = "outside its allowed area";
                 return false;
             }
 
             if (thing.IsForbidden(pawn))
             {
+                why = "forbidden";
                 return false;
             }
 
             if (!map.reservationManager.CanReserve(pawn, thing))
             {
+                why = "reserved by another pawn";
                 return false;
             }
 
             if (!GrowerCompat.CanReachTarget(pawn, thing, scanner))
             {
+                why = "unreachable";
                 return false;
             }
 
             // HasFireJob is vanilla's own check minus the home-area gate -
             // see FireCompat
-            return context.Firefighting
+            bool has = context.Firefighting
                 ? FireCompat.HasFireJob(pawn, thing, true)
                 : scanner.HasJobOnThing(pawn, thing, true);
+            if (!has)
+            {
+                why = "HasJobOnThing false";
+            }
+            return has;
         }
 
         // No global lister for "empty farmable cells" the way listerThings

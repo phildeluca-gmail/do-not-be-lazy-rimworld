@@ -354,7 +354,7 @@ namespace DoNotBeLazy.Components
             Job sleepJob = null;
             if (sleepWhy == null)
             {
-                sleepJob = new JobGiver_GetRest().TryIssueJobPackage(pawn, default(JobIssueParams)).Job;
+                sleepJob = FindRestJob(pawn);
                 if (sleepJob == null)
                 {
                     sleepWhy = "vanilla's rest giver found no bed, bedroll or ground spot";
@@ -657,6 +657,25 @@ namespace DoNotBeLazy.Components
             return false;
         }
 
+        // 2026-11-17, by order (verbatim: "fix H6, safety net finds a real bed
+        // first"). Use Bedrolls patches JobGiver_GetRest and sent pawns to
+        // PlaceBedroll while beds were free. RestUtility.FindBedFor(Pawn)
+        // (verified by reflection) is tried first; a found bed gets the vanilla
+        // LayDown job on it. Only with no bed is the giver called.
+        private static Job FindRestJob(Pawn pawn)
+        {
+            Building_Bed bed = RestUtility.FindBedFor(pawn);
+            if (bed != null)
+            {
+                Logger.Message($"[SafetyNet] {pawn.LabelShort}: rest path found bed {bed.LabelShort} at {bed.Position}");
+                return JobMaker.MakeJob(JobDefOf.LayDown, bed);
+            }
+
+            Job given = new JobGiver_GetRest().TryIssueJobPackage(pawn, default(JobIssueParams)).Job;
+            Logger.Message($"[SafetyNet] {pawn.LabelShort}: rest path no bed, giver used and returned {(given == null ? "nothing" : given.def.defName + (given.targetA.IsValid ? " on " + (given.targetA.Thing != null ? given.targetA.Thing.LabelShort : given.targetA.Cell.ToString()) : ""))}");
+            return given;
+        }
+
         // Answer 2c (2026-10-22): "carried bag or bed or ground". Vanilla's
         // JobGiver_GetRest, called through the public TryIssueJobPackage as
         // Be Lazy does (bl-architecture.md 3.7), returns a bed LayDown; where
@@ -666,13 +685,14 @@ namespace DoNotBeLazy.Components
         // TryFindGroundSleepSpotFor, the fallback TryGiveJob takes when no
         // bed is found). No other mod is named here.
         // LOCKED (dnbl H6) - passed 5x in play 2026-10-22; do not change without the user's explicit order.
+        // CHANGED 2026-11-17 by order (FindRestJob: real bed first); H6 needs a re-test.
         private static bool TrySendToSleep(Pawn pawn, Need rest, DoNotBeLazySettings settings, string levels, string interrupted, int now)
         {
             string why = RestRefusal(pawn);
             Job sleepJob = null;
             if (why == null)
             {
-                sleepJob = new JobGiver_GetRest().TryIssueJobPackage(pawn, default(JobIssueParams)).Job;
+                sleepJob = FindRestJob(pawn);
                 if (sleepJob == null)
                 {
                     why = "vanilla's rest giver found no bed, bedroll or ground spot";

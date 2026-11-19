@@ -13,8 +13,8 @@ namespace DoNotBeLazy.Patches
 {
     // dnbl-architecture.md section 51. Postfix on UnfinishedThing.GetGizmos (declared
     // on UnfinishedThing itself, so this is the exact method): adds "Finish this".
-    // The selected colonists are tried first (the capable one nearest the item); with
-    // none selected, the nearest capable colonist is sent. A player order ignores the
+    // The selected colonists are tried first (the most capable one); with
+    // none selected, the most capable colonist is sent (section 55). A player order ignores the
     // work-type priority and the bill's pawn restriction, nothing else.
     [HarmonyPatch(typeof(UnfinishedThing), nameof(UnfinishedThing.GetGizmos))]
     internal static class FinishThisGizmoPatch
@@ -45,7 +45,7 @@ namespace DoNotBeLazy.Patches
                 var cmd = new Command_Action
                 {
                     defaultLabel = "Finish this",
-                    defaultDesc = "Send the nearest capable colonist (or the selected colonists) to finish this unfinished item now, whatever state its bill is in.",
+                    defaultDesc = "Send the most capable colonist (or the most capable selected colonist) to finish this unfinished item now, whatever state its bill is in.",
                     icon = Icon,
                     action = delegate { Run(uft); }
                 };

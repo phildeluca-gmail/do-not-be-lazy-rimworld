@@ -120,7 +120,24 @@ namespace DoNotBeLazy.Utility
         // SweepManager) so the follow-up work actually happens.
         public static bool IsPreparatoryJob(Job job, LocalTargetInfo target)
         {
+            // The paint WorkGivers (PaintFloor, PaintBuilding, RemovePaint*)
+            // leave targetA empty and put every target, ours included, in
+            // targetQueueA. That is the work asked for, not a blocker -
+            // without this every paint target was handed out twice. Limited
+            // to the four paint jobs so no other WorkGiver's behaviour
+            // changes. Added 2026-11-18, architecture section 56.
+            if (job != null && job.targetQueueA != null && IsPaintJob(job.def) && job.targetQueueA.Contains(target))
+            {
+                return false;
+            }
             return job != null && job.targetA != target;
+        }
+
+        // The four vanilla paint jobs (RimWorld.JobDefOf, verified 2026-11-18).
+        public static bool IsPaintJob(JobDef def)
+        {
+            return def != null && (def == JobDefOf.PaintFloor || def == JobDefOf.PaintBuilding
+                || def == JobDefOf.RemovePaintFloor || def == JobDefOf.RemovePaintBuilding);
         }
     }
 }

@@ -71,6 +71,7 @@ namespace DoNotBeLazy.Components
             // constructs this component, so start it clean.
             SafetyNet.Reset();
             moodFutileLogged.Clear();
+            cravingBlockedUntil.Clear();
             lowNeedLogged.Clear();
             gatheringRetryAt.Clear();
         }
@@ -175,6 +176,9 @@ namespace DoNotBeLazy.Components
                             // setting is sent to recreation after food,
                             // rest and recreation itself.
                             sweepManager.TryForceMoodIfStuck(pawn);
+                            // 2026-11-17: a drug craving at or below its setting
+                            // is sent for its drug (section 54).
+                            sweepManager.TryForceCravingIfStuck(pawn);
                             sweepManager.WarnIfFoodStuck(pawn);
                             continue;
                         }
@@ -191,6 +195,12 @@ namespace DoNotBeLazy.Components
                         // 2026-11-15: a drafted, downed, mad or unspawned pawn is not newly paused or interrupted.
                         if (pawn.Drafted || pawn.Downed || pawn.InMentalState || !pawn.Spawned)
                         {
+                            // 2026-11-18: once per break, with the need levels.
+                            if (pawn.InMentalState)
+                            {
+                                SweepManager.LogMentalBreakOnce(pawn, "the need monitor skipping a critical need");
+                            }
+
                             continue;
                         }
 
@@ -438,6 +448,13 @@ namespace DoNotBeLazy.Components
                 return Describe("Food", pawn.needs.food);
             }
 
+            // 2026-11-17: a drug craving at or below its own setting.
+            Need_Chemical craving = LowCraving(pawn);
+            if (craving != null)
+            {
+                return DescribeCraving(craving);
+            }
+
             if (NeedIsCritical(pawn?.needs?.rest, restThreshold))
             {
                 return Describe("Rest", pawn.needs.rest);
@@ -456,6 +473,79 @@ namespace DoNotBeLazy.Components
             return null;
         }
 
+        // 2026-11-17, order "yes, build both I want drug craving % slider in
+        // DNBL." (dnbl-architecture.md section 54). Sheriff broke on psychite
+        // withdrawal while on a queued sweep order: vanilla's
+        // JobGiver_SatisfyChemicalNeed (priority 9.25) only runs when the
+        // think tree does, and a queued job comes first. The lowest
+        // Need_Chemical of the pawn at or below the setting, or null.
+        // Need_Chemical is verified in lib\Assembly-CSharp.dll: CurCategory
+        // Withdrawal at or below 1%, Desire at or below 10%; the need exists
+        // only while the matching Hediff_Addiction does (AddictionHediff).
+        // Need_Chemical_Any (Ideology) is a plain Need and is not counted.
+        // blocked: after a pause found no drug the craving is ignored for
+        // CravingBlockTicks so the order is not held on a drug that is not
+        // there; ignoreBlock reads the raw level (for the "served" lines).
+        public const int CravingBlockTicks = 2500;
+        private static readonly Dictionary<Pawn, int> cravingBlockedUntil = new Dictionary<Pawn, int>();
+
+        public static Need_Chemical LowCraving(Pawn pawn, bool ignoreBlock = false)
+        {
+            float threshold = DoNotBeLazyMod.Settings != null ? DoNotBeLazyMod.Settings.drugCravingThreshold : 0f;
+            List<Need> all = pawn?.needs?.AllNeeds;
+            if (threshold <= 0f || all == null)
+            {
+                return null;
+            }
+
+            Need_Chemical worst = null;
+            for (int i = 0; i < all.Count; i++)
+            {
+                if (all[i] is Need_Chemical chem && chem.CurLevelPercentage <= threshold
+                    && (worst == null || chem.CurLevel < worst.CurLevel) && chem.AddictionHediff != null)
+                {
+                    worst = chem;
+                }
+            }
+
+            if (worst == null)
+            {
+                cravingBlockedUntil.Remove(pawn);
+                return null;
+            }
+
+            if (!ignoreBlock && cravingBlockedUntil.TryGetValue(pawn, out int until) && Find.TickManager.TicksGame < until)
+            {
+                return null;
+            }
+
+            return worst;
+        }
+
+        public static void BlockCraving(Pawn pawn, int ticks)
+        {
+            cravingBlockedUntil[pawn] = Find.TickManager.TicksGame + ticks + 120;
+        }
+
+        public static string DescribeCraving(Need_Chemical need)
+        {
+            return Describe("Craving (" + (need.def.label ?? need.def.defName) + ")", need);
+        }
+
+        // The craving label alone, for a caller that wants no other need.
+        public static string CravingLabelFor(Pawn pawn)
+        {
+            Need_Chemical craving = LowCraving(pawn);
+            return craving == null ? null : DescribeCraving(craving);
+        }
+
+        // True when the job is an Ingest of a drug (a ThingDef with
+        // IsDrug, which is true for a psychite tea and a beer alike).
+        public static bool IsDrugIngest(Job job)
+        {
+            return job?.def == JobDefOf.Ingest && (job.targetA.Thing?.def?.IsDrug ?? false);
+        }
+
         // The four levels at once, for the line written at each forced-meal
         // retry. Added 2026-10-02 - a pause records only the need that
         // started it, and that is not what keeps the pawn paused.
@@ -470,7 +560,8 @@ namespace DoNotBeLazy.Components
             return (needs.food != null ? Describe("Food", needs.food) : "Food n/a")
                 + ", " + (needs.rest != null ? Describe("Rest", needs.rest) : "Rest n/a")
                 + ", " + (needs.joy != null ? Describe("Recreation", needs.joy) : "Recreation n/a")
-                + ", " + (needs.mood != null ? Describe("Mood", needs.mood) : "Mood n/a");
+                + ", " + (needs.mood != null ? Describe("Mood", needs.mood) : "Mood n/a")
+                + (LowCraving(pawn, true) is Need_Chemical craving ? ", " + DescribeCraving(craving) : "");
         }
 
         // Every need still under its resume threshold - what actually keeps
@@ -494,6 +585,8 @@ namespace DoNotBeLazy.Components
             if (NeedIsCritical(needs.rest, restThreshold)) parts.Add(Describe("Rest", needs.rest));
             if (NeedIsCritical(needs.joy, recreationThreshold)) parts.Add(Describe("Recreation", needs.joy));
             if (RecreationCanHelpMood(pawn) && NeedIsCritical(needs.mood, moodThreshold, false)) parts.Add(Describe("Mood", needs.mood));
+            Need_Chemical craving = LowCraving(pawn);
+            if (craving != null) parts.Add(DescribeCraving(craving));
             return string.Join(", ", parts.ToArray());
         }
 
@@ -642,6 +735,7 @@ namespace DoNotBeLazy.Components
             if (NeedIsCritical(pawn.needs.rest, s.safetySleepThreshold)) names.Add("Rest");
             if (NeedIsCritical(pawn.needs.joy, s.safetyRecreationThreshold)) names.Add("Recreation");
             if (RecreationCanHelpMood(pawn) && NeedIsCritical(pawn.needs.mood, EffectiveMoodThreshold(pawn, s.moodThreshold), false)) names.Add("Mood");
+            if (LowCraving(pawn) != null) names.Add("Craving");
             return names;
         }
 

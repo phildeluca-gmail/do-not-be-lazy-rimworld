@@ -60,6 +60,9 @@ namespace DoNotBeLazy.Patches
             public bool playerInterruptedForced;
             // section 44: name of the automatic fight/flee response this job was, read before the job is pooled
             public string automaticResponse;
+            // 2026-11-18 logging standard: what a DoBill job was (bill, counts,
+            // ingredient, product), read before the job is pooled.
+            public string benchInfo;
         }
 
         [HarmonyPriority(Priority.First)]
@@ -75,7 +78,8 @@ namespace DoNotBeLazy.Patches
             {
                 job = cur,
                 playerInterruptedForced = cur != null && cur.playerInterruptedForced,
-                automaticResponse = holdsOrder ? SweepManager.AutomaticResponseName(cur) : null
+                automaticResponse = holdsOrder ? SweepManager.AutomaticResponseName(cur) : null,
+                benchInfo = holdsOrder ? SweepManager.BenchJobInfo(cur) : null
             };
         }
 
@@ -137,6 +141,7 @@ namespace DoNotBeLazy.Patches
             }
 
             sweepManager.Notify_JobEnded(pawn, condition, endedJob, __state.playerInterruptedForced, __state.automaticResponse);
+            if (__state.benchInfo != null) sweepManager.LogBenchJobEnd(pawn, condition, __state.benchInfo);
         }
     }
 }

@@ -32,6 +32,13 @@ namespace DoNotBeLazy.Core
         public float safetyRecreationThreshold = 0.10f;
         public float safetySleepThreshold = 0.10f;
 
+        // Added 2026-11-17 (dnbl-architecture.md section 54). A * order pauses
+        // for a drug craving at or below this level of any chemical need
+        // (Need_Chemical) and lets the pawn take the drug. 10% is vanilla's
+        // own trigger (JobGiver_SatisfyChemicalNeed fires at 10% or below);
+        // 0 switches it off.
+        public float drugCravingThreshold = 0.10f;
+
         // Rest gets its own, higher threshold for the same reason mood does:
         // 5% rest is not "getting tired", it is a pawn about to collapse
         // where they stand. Added 2026-09-06 after a `* PackVehicle` sweep
@@ -102,6 +109,7 @@ namespace DoNotBeLazy.Core
         private string safetyRecreationBuffer;
         private string safetySleepBuffer;
         private string moodThresholdBuffer;
+        private string drugCravingBuffer;
 
         // Row geometry for a slider with a number box beside it. 22f is the
         // height Listing_Standard.Slider itself uses - verified by reading
@@ -134,6 +142,7 @@ namespace DoNotBeLazy.Core
             Scribe_Values.Look(ref safetyRecreationThreshold, "safetyRecreationThreshold", 0.10f);
             Scribe_Values.Look(ref safetySleepThreshold, "safetySleepThreshold", 0.10f);
             Scribe_Values.Look(ref moodThreshold, "moodThreshold", 0.10f);
+            Scribe_Values.Look(ref drugCravingThreshold, "drugCravingThreshold", 0.10f);
             Scribe_Values.Look(ref restThreshold, "restThreshold", 0.10f);
             Scribe_Values.Look(ref verboseLogging, "verboseLogging", true);
             Scribe_Values.Look(ref jobDiagnostics, "jobDiagnostics", false);
@@ -205,6 +214,13 @@ namespace DoNotBeLazy.Core
             listing.Gap();
             listing.Label($"Mood interrupt threshold: {moodThreshold:P0}");
             moodThreshold = SliderWithPercentBox(listing, moodThreshold, 0.01f, 0.30f, ref moodThresholdBuffer);
+
+            listing.Gap();
+            listing.Label($"Drug craving: {drugCravingThreshold:P0}");
+            drugCravingThreshold = SliderWithPercentBox(listing, drugCravingThreshold, 0f, 0.30f, ref drugCravingBuffer);
+            Text.Font = GameFont.Tiny;
+            listing.Label("A * order pauses when an addicted pawn's chemical need is at or below this, lets the pawn take its drug, then returns to the order. 10% is the game's own trigger; 0% switches it off.");
+            Text.Font = GameFont.Small;
 
             listing.Gap();
             listing.CheckboxLabeled("Stuff-first hauling and loading", ref stuffFirstHauling,

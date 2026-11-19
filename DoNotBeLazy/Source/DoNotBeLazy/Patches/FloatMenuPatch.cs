@@ -51,6 +51,11 @@ namespace DoNotBeLazy.Patches
             "Mining",
             "Growing",
             "PlantCutting",
+            // Art added 2026-11-18 ("Do those.") so PaintFloor (scanCells)
+            // gets a sweep; also admits PaintBuilding and RemovePaint*.
+            // Art bills (DoBill, sculpting) stay on the WorkGiver_DoBill
+            // path in IsSweepEligible, which returns before this set.
+            "Art",
             // Firefighting is a special case - FightFires is
             // directOrderable:false so IsSweepEligible short-circuits on
             // FireCompat.IsFirefighting before this set is ever consulted.
@@ -288,7 +293,7 @@ namespace DoNotBeLazy.Patches
                     continue;
                 }
 
-                List<Pawn> eligiblePawns = EligiblePawns(pawns, map, def);
+                List<Pawn> eligiblePawns = EligiblePawns(pawns, map, def, out string removedNote);
                 if (eligiblePawns.Count == 0)
                 {
                     // used to just continue here, which is how "Hauling is
@@ -451,6 +456,10 @@ namespace DoNotBeLazy.Patches
                         // (the Panna smelt order) is visible.
                         bool queueOrder = KeyBindingDefOf.QueueOrder.IsDownEvent;
                         string keys = Logger.Keys();
+                        if (removedNote != null)
+                        {
+                            Logger.Message($"order click: * {capturedDef.defName}: {removedNote}");
+                        }
                         Logger.Order($"order click: * {capturedDef.defName} on {capturedTarget} for {eligiblePawns.Count} pawn(s) - {keys}; "
                             + $"game's own read (IsDownEvent, includes the physical key) = {queueOrder}; decision: {(queueOrder ? "QUEUE behind each pawn's current order" : "REPLACE each pawn's current order")}");
                         SweepManager.LastClickKeys = keys;
@@ -1476,9 +1485,10 @@ namespace DoNotBeLazy.Patches
             }
         }
 
-        private static List<Pawn> EligiblePawns(List<Pawn> pawns, Map map, WorkGiverDef def)
+        private static List<Pawn> EligiblePawns(List<Pawn> pawns, Map map, WorkGiverDef def, out string removedNote)
         {
             var result = new List<Pawn>();
+            var removed = new List<string>();
             foreach (Pawn pawn in pawns)
             {
                 // same map only - BeginSweep runs against one map's component
@@ -1503,17 +1513,29 @@ namespace DoNotBeLazy.Patches
                     // selected pawn is still allowed (vanilla wakes it).
                     // an exception inside the block check counts as blocked,
                     // the same as BeginSweep does
+                    // block read once and reused for the reason, so a throwing
+                    // GroupOrderBlock is not run (and logged) twice
+                    string block = null;
                     if (PawnValidator.CanSweep(pawn, def)
-                        && (pawns.Count < 2 || GroupBlockOrThrow(pawn) == null))
+                        && (pawns.Count < 2 || (block = GroupBlockOrThrow(pawn)) == null))
                     {
                         result.Add(pawn);
+                    }
+                    else
+                    {
+                        string why = PawnValidator.RefusalReason(pawn, def) ?? block;
+                        removed.Add(pawn.LabelShort + " " + (why ?? "refused for an unknown reason"));
                     }
                 }
                 catch (Exception ex)
                 {
                     PawnExceptionCaught(pawn, "EligiblePawns/" + def.defName, ex);
+                    removed.Add(pawn.LabelShort + " check threw");
                 }
             }
+            // 2026-11-18: logged once, on the click, by the caller
+            removedNote = removed.Count == 0 ? null
+                : removed.Count + " of " + pawns.Count + " selected pawn(s) left out - " + string.Join("; ", removed.ToArray());
             return result;
         }
     }
