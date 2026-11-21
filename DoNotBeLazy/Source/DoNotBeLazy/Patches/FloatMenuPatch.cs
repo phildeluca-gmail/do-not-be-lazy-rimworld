@@ -1508,9 +1508,10 @@ namespace DoNotBeLazy.Patches
                 // checked.
                 try
                 {
-                    // Group rule, 2026-11-15: in a group a sleeping or immobile
-                    // pawn is left out so the others take the order. A lone
-                    // selected pawn is still allowed (vanilla wakes it).
+                    // Group rule, 2026-11-15: in a group an immobile pawn or one
+                    // close to a mental break is left out so the others take the
+                    // order. Sleepers are NOT left out (corrected 2026-11-19);
+                    // the order wakes them.
                     // an exception inside the block check counts as blocked,
                     // the same as BeginSweep does
                     // block read once and reused for the reason, so a throwing

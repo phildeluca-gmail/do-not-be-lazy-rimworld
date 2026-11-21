@@ -329,6 +329,10 @@ namespace DoNotBeLazy.Components
             // Section 28: the smallest distance (cells, straight-line) to the
             // meal seen so far; the window restarts only when it shrinks.
             public float ingestWatchDist;
+            // 2026-11-19 (Brinbustma): the driver's ticksLeftThisToil at the last
+            // progress, and whether the pawn was walking then. See IngestMeasure.
+            public int ingestWatchTicksLeft;
+            public bool ingestWatchMoving;
             public int ingestLoggedId;
             public Thing stalledFood;
 
@@ -4561,12 +4565,20 @@ namespace DoNotBeLazy.Components
             // something while "moving" now stalls.
             float food = pawn.needs?.food?.CurLevelPercentage ?? 1f;
             int toil = pawn.jobs?.curDriver?.CurToilIndex ?? -1;
-            float dist = curJob.targetA.IsValid ? pawn.Position.DistanceTo(curJob.targetA.Cell) : 0f;
+            IngestMeasure(pawn, curJob, out float dist, out int ticksLeft, out bool moving);
             bool newJob = !paused.ingestWatching || paused.ingestWatchId != curJob.loadID;
-            bool closer = !newJob && dist < paused.ingestWatchDist - 0.5f;
+            // Starting or stopping walking switches what the distance is
+            // measured to, so it only re-bases the distance; it does not
+            // restart the window, or a pawn flapping between walking and
+            // standing would never be judged stalled.
+            bool moveChanged = !newJob && moving != paused.ingestWatchMoving;
+            bool closer = !newJob && !moveChanged && dist < paused.ingestWatchDist - 0.5f;
+            bool chewing = !newJob && ticksLeft > 0 && paused.ingestWatchTicksLeft > 0 && ticksLeft < paused.ingestWatchTicksLeft;
+            bool toilChanged = !newJob && paused.ingestWatchToil != toil;
             if (newJob
                 || closer
-                || paused.ingestWatchToil != toil
+                || chewing
+                || toilChanged
                 || food > paused.ingestWatchFood + 0.01f)
             {
                 paused.ingestWatching = true;
@@ -4574,7 +4586,9 @@ namespace DoNotBeLazy.Components
                 paused.ingestWatchSince = now;
                 paused.ingestWatchFood = food;
                 paused.ingestWatchToil = toil;
-                paused.ingestWatchDist = newJob || closer ? dist : paused.ingestWatchDist;
+                paused.ingestWatchTicksLeft = ticksLeft;
+                paused.ingestWatchMoving = moving;
+                paused.ingestWatchDist = newJob || closer || moveChanged || toilChanged ? dist : paused.ingestWatchDist;
                 // 2026-11-16 (H1.1 order): real progress ends "judged stalled",
                 // so TryForceRestIfStuck leaves a recovering meal alone. Also
                 // cleared on a restarted watch, so a resumed job is not
@@ -4583,6 +4597,13 @@ namespace DoNotBeLazy.Components
 
                 pausedForNeed[pawn] = paused;
                 return;
+            }
+
+            if (moveChanged)
+            {
+                paused.ingestWatchMoving = moving;
+                paused.ingestWatchDist = dist;
+                pausedForNeed[pawn] = paused;
             }
 
             int watched = now - paused.ingestWatchSince;
@@ -4642,10 +4663,38 @@ namespace DoNotBeLazy.Components
 
             float food = pawn.needs?.food?.CurLevelPercentage ?? 1f;
             int toil = pawn.jobs?.curDriver?.CurToilIndex ?? -1;
-            float dist = curJob.targetA.IsValid ? pawn.Position.DistanceTo(curJob.targetA.Cell) : 0f;
+            IngestMeasure(pawn, curJob, out float dist, out int ticksLeft, out bool moving);
             return toil == paused.ingestWatchToil
                 && food <= paused.ingestWatchFood + 0.01f
-                && dist >= paused.ingestWatchDist - 0.5f;
+                && dist >= paused.ingestWatchDist - 0.5f
+                && !(ticksLeft > 0 && paused.ingestWatchTicksLeft > 0 && ticksLeft < paused.ingestWatchTicksLeft)
+                && moving == paused.ingestWatchMoving;
+        }
+
+        // 2026-11-19 (Brinbustma went from 8% to 0% Food while four forced meals
+        // were each cut off after 2040 ticks). Two progress signals the stall
+        // test could not see, both verified on Assembly-CSharp.dll:
+        // 1. Toils_Ingest.ChewIngestible is a Delay toil of baseIngestTicks /
+        //    EatingSpeed ticks; the toil index stays put, the pawn stands still
+        //    and Food only rises in FinalizeIngest afterwards, so a slow eater
+        //    looked stalled. The countdown is JobDriver.ticksLeftThisToil.
+        // 2. While the pawn holds the meal (carried or in the pack) the target's
+        //    cell is the pawn's own, so the distance to it was always 0 and
+        //    could never shrink - e.g. while walking to a chew spot or to an
+        //    extra meal (job.takeExtraIngestibles). While the pawn is walking
+        //    the distance is now measured to where the pather is taking it.
+        private static void IngestMeasure(Pawn pawn, Job curJob, out float dist, out int ticksLeft, out bool moving)
+        {
+            moving = pawn.pather != null && pawn.pather.Moving;
+            ticksLeft = pawn.jobs?.curDriver?.ticksLeftThisToil ?? -1;
+            if (moving && pawn.pather.Destination.IsValid)
+            {
+                dist = pawn.Position.DistanceTo(pawn.pather.Destination.Cell);
+            }
+            else
+            {
+                dist = curJob.targetA.IsValid ? pawn.Position.DistanceTo(curJob.targetA.Cell) : 0f;
+            }
         }
 
         // Why TryForceEatIfStuck did not retry, once per distinct reason
@@ -5323,8 +5372,9 @@ namespace DoNotBeLazy.Components
             }
 
             // Group rule, ordered 2026-11-15 (architecture section 9 and its
-            // 2026-11-15 addendum): in a group order a pawn who is asleep or
-            // cannot move is dropped, not woken, and the rest take the order.
+            // 2026-11-15 addendum): in a group order a pawn who cannot move or is
+            // close to a mental break is dropped and the rest take the order.
+            // Corrected 2026-11-19: sleepers are NOT dropped, the order wakes them.
             // The menu already filters; this repeats it at the click because a
             // pawn can fall asleep while the menu is open. One log line per
             // order names who was dropped and why.
@@ -5342,7 +5392,7 @@ namespace DoNotBeLazy.Components
                 }
                 if (droppedText.Count > 0)
                 {
-                    Logger.Message($"BeginSweep {workGiverDef?.defName}: {able.Count} of {eligiblePawns.Count} pawns can start now, left out of the order (not woken): {string.Join(", ", droppedText.ToArray())}");
+                    Logger.Message($"BeginSweep {workGiverDef?.defName}: {able.Count} of {eligiblePawns.Count} pawns take the order, left out: {string.Join(", ", droppedText.ToArray())}");
                     eligiblePawns = able;
                     if (able.Count == 0)
                     {

@@ -82,15 +82,19 @@ namespace DoNotBeLazy.Utility
             }
         }
 
-        // Group order rule, ordered 2026-11-15: "If * order includes pawns who
-        // are asleep or unable to walk or otherwise won't do work, job cannot
-        // be forced. Original rule was to let other members do job!"
-        // A pawn who can take a * order but cannot start it NOW is left out of
-        // the order (not woken, not struck off any order it is already on) so
-        // the targets go to pawns who will walk. Returns the reason in words,
-        // or null when the pawn can start work. Deliberately NOT part of
-        // CanSweep: that check also runs every assignment of a running sweep,
-        // and a pawn who dozes off mid-order must stay on it.
+        // Group order rule. 2026-11-15 first version dropped sleepers; the user
+        // corrected it 2026-11-19: "I never said to leave the sleepers out, you
+        // misunderstood. I want everyone capable of doing the work to do the
+        // work, unless they meet the criteria for not doing the work (incapable
+        // or mood close to break)." So a sleeper is NOT blocked - the order
+        // wakes it (Pawn_JobTracker.TryTakeOrderedJob replaces the LayDown job
+        // and starts ours with continueSleeping false; verified in
+        // Assembly-CSharp). Left out of a group order: a pawn who cannot move,
+        // and a pawn whose mood is at or below the mood setting
+        // (NeedMonitor.MoodAtSetting, DoNotBeLazySettings.moodThreshold).
+        // Returns the reason in words, or null when the pawn takes the order.
+        // Deliberately NOT part of CanSweep: that check also runs every
+        // assignment of a running sweep, and a pawn already on an order stays on it.
         public static string GroupOrderBlock(Pawn pawn)
         {
             if (pawn == null)
@@ -101,13 +105,13 @@ namespace DoNotBeLazy.Utility
             {
                 return "has no health state";
             }
-            if (!pawn.Awake())
-            {
-                return "is asleep";
-            }
             if (!pawn.health.capacities.CapableOf(PawnCapacityDefOf.Moving))
             {
                 return "cannot move";
+            }
+            if (DoNotBeLazy.Components.NeedMonitor.MoodAtSetting(pawn))
+            {
+                return "is close to a mental break (mood at or below the mood setting)";
             }
             return null;
         }
