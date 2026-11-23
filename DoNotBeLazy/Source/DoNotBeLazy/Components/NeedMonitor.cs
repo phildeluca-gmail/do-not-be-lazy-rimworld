@@ -894,7 +894,48 @@ namespace DoNotBeLazy.Components
             return j < 0 ? reason.Substring(0, i) : reason.Substring(0, i) + reason.Substring(j + 1);
         }
 
-        private enum FoodFilterResult { Ok, Rejected, Corpse, Drug, BelowFloor, Rotting }
+        // 2026-11-21, by order ("Build it"): what a food decline line says
+        // about where and what was searched. Runs only on a decline. No ')'
+        // may appear in the text: DeclineKey cuts at the first one after
+        // "(left out: " and the live counts here must stay inside that cut.
+        private static string DeclineSearched(Pawn pawn)
+        {
+            try
+            {
+                Map map = pawn.Map;
+                int inv = pawn.inventory?.innerContainer?.Count ?? 0;
+                int lister = map.listerThings.ThingsInGroup(ThingRequestGroup.FoodSourceNotPlantOrTree).Count;
+                // Player-named labels may hold ')', which would end DeclineKey's cut early.
+                string parent = (map.Parent?.LabelCap ?? "no parent").Replace(')', ']');
+                string policy = (pawn.foodRestriction?.CurrentFoodPolicy?.label ?? "none").Replace(')', ']');
+                return $"searched {inv + lister} things = {inv} carried + {lister} on map; map #{Find.Maps.IndexOf(map)} id {map.uniqueID} \"{parent}\", {(map.IsPlayerHome ? "player home" : "not a player home")}; food policy \"{policy}\"";
+            }
+            catch (Exception ex)
+            {
+                return "map details unavailable: " + ex.GetType().Name;
+            }
+        }
+
+        // Where a pawn with no map is: caravan, inside a vehicle, carried.
+        private static string DeclineWhere(Pawn pawn)
+        {
+            try
+            {
+                // Not holder.ToString(): WorldObject's carries "(tile=N)",
+                // which changes as a caravan moves and would make every
+                // line a new dedupe key in DeclineKey's callers.
+                IThingHolder holder = pawn.ParentHolder;
+                string name = holder is RimWorld.Planet.WorldObject wo ? " " + wo.LabelCap
+                    : holder is Thing t ? " " + t.LabelShort : "";
+                return " [holder: " + (holder == null ? "none" : holder.GetType().Name + name) + "; food policy \"" + (pawn.foodRestriction?.CurrentFoodPolicy?.label ?? "none") + "\"]";
+            }
+            catch (Exception ex)
+            {
+                return " [holder unavailable: " + ex.GetType().Name + "]";
+            }
+        }
+
+        private enum FoodFilterResult { Ok, Rejected, Corpse, Drug, BelowFloor, Rotting, Forbidden }
 
         // The filter shared by the meal search (Consider) and the carried-food
         // check in FindMealDroppingCargo, so a carried item is dropped only if
@@ -926,9 +967,14 @@ namespace DoNotBeLazy.Components
             bool willEat = isDispenser
                 ? pawn.WillEat(ThingDefOf.MealNutrientPaste, pawn)
                 : pawn.WillEat(candidate, pawn);
-            if (!willEat || candidate.IsForbidden(pawn))
+            if (!willEat)
             {
                 return FoodFilterResult.Rejected;
+            }
+
+            if (candidate.IsForbidden(pawn))
+            {
+                return FoodFilterResult.Forbidden;
             }
 
             CompRottable rot = candidate.TryGetComp<CompRottable>();
@@ -952,7 +998,7 @@ namespace DoNotBeLazy.Components
 
             if (pawn?.needs?.food == null || pawn.Map == null)
             {
-                declineReason = "no food need, or not spawned on a map";
+                declineReason = "no food need, or not spawned on a map" + DeclineWhere(pawn);
                 return null;
             }
 
@@ -985,7 +1031,8 @@ namespace DoNotBeLazy.Components
             int leftBelowFloor = 0;
             int leftRotting = 0;
             // Q45, 2026-11-15, by order: the other skip reasons are counted too.
-            int leftRejected = 0;      // will not eat, forbidden, or no ingestible def
+            int leftRejected = 0;      // will not eat, or no ingestible def
+            int leftForbidden = 0;     // pawn would eat it but it is forbidden to them
             int leftNotIngestible = 0; // not ingestible right now
             int leftUnreachable = 0;   // cannot reserve or reach (dispenser: foreign, unpowered, empty, blocked or unreachable)
 
@@ -1015,6 +1062,7 @@ namespace DoNotBeLazy.Components
                     case FoodFilterResult.BelowFloor: leftBelowFloor++; return;
                     case FoodFilterResult.Rotting: leftRotting++; return;
                     case FoodFilterResult.Rejected: leftRejected++; return;
+                    case FoodFilterResult.Forbidden: leftForbidden++; return;
                 }
 
                 if (inInventory)
@@ -1129,7 +1177,7 @@ namespace DoNotBeLazy.Components
                 {
                     declineReason += $" ({skipped} stalled target(s) skipped)";
                 }
-                declineReason += $" (left out: {leftCorpses} corpses, {leftDrugs} drugs, {leftBelowFloor} below floor, {leftRotting} rotting, {leftRejected} will not eat or forbidden, {leftNotIngestible} not ingestible now, {leftUnreachable} cannot reserve or reach)";
+                declineReason += $" (left out: {leftCorpses} corpses, {leftDrugs} drugs, {leftBelowFloor} below floor, {leftRotting} rotting, {leftRejected} will not eat or have no food value, {leftForbidden} forbidden, {leftNotIngestible} not ingestible now, {leftUnreachable} cannot reserve or reach; {DeclineSearched(pawn)})";
                 return null;
             }
 
@@ -1238,7 +1286,7 @@ namespace DoNotBeLazy.Components
             dropped = "";
             if (pawn?.needs?.food == null || pawn.Map == null)
             {
-                declineReason = "no food need, or not spawned on a map";
+                declineReason = "no food need, or not spawned on a map" + DeclineWhere(pawn);
                 return null;
             }
 
@@ -1324,7 +1372,7 @@ namespace DoNotBeLazy.Components
             if (bestThing == null)
             {
                 declineReason = (candidates == 0 ? "no fine or lavish meal this pawn will eat, reach, reserve or gain mood from now" : "no viable fine meal scored")
-                    + $" (left out: {leftNotFine} not fine or lavish, {leftFiltered} will not eat, forbidden or rotting, {leftNotIngestible} not ingestible now, {leftUnreachable} cannot reserve or reach, {leftNoGain} no mood gain now)";
+                    + $" (left out: {leftNotFine} not fine or lavish, {leftFiltered} will not eat, forbidden or rotting, {leftNotIngestible} not ingestible now, {leftUnreachable} cannot reserve or reach, {leftNoGain} no mood gain now; {DeclineSearched(pawn)})";
                 return null;
             }
 
