@@ -65,6 +65,174 @@ namespace DoNotBeLazy.Components
 
         private static readonly Dictionary<Thing, string> suspectBlame = new Dictionary<Thing, string>();
 
+        // 2026-11-23 order "2 yes 3 yes" (A): a short per-pawn history of job
+        // starts and ends, kept only so the one warning line can say how each
+        // repeated job ended and what came in between. Never logged per entry;
+        // read once, when the warning fires. Fixed size, no allocation per event.
+        private const int HistorySize = 24;
+
+        private struct HistoryEntry
+        {
+            public int tick;
+            public bool isEnd;
+            public JobDef def;
+            public LocalTargetInfo target;
+            public System.Type giver;
+            public JobCondition condition;
+        }
+
+        private class History
+        {
+            public readonly HistoryEntry[] entries = new HistoryEntry[HistorySize];
+            public int next;
+            public int count;
+        }
+
+        private static readonly Dictionary<Pawn, History> histories = new Dictionary<Pawn, History>();
+
+        // Clear() is never called, so the history would outlive a loaded game
+        // and keep every dead pawn. Dropped on a game change (reference compare
+        // per event) and pruned of dead, destroyed or non-player pawns when a
+        // new pawn is added past PruneAbove - never on the common path.
+        private const int PruneAbove = 64;
+        private static Game historyGame;
+        private static readonly List<Pawn> pruneScratch = new List<Pawn>();
+
+        private static void Record(Pawn pawn, HistoryEntry entry)
+        {
+            if (historyGame != Current.Game)
+            {
+                histories.Clear();
+                streaks.Clear();
+                historyGame = Current.Game;
+            }
+
+            if (!histories.TryGetValue(pawn, out History h))
+            {
+                if (histories.Count >= PruneAbove)
+                {
+                    Prune();
+                }
+
+                h = new History();
+                histories[pawn] = h;
+            }
+
+            h.entries[h.next] = entry;
+            h.next = (h.next + 1) % HistorySize;
+            if (h.count < HistorySize) h.count++;
+        }
+
+        private static void Prune()
+        {
+            pruneScratch.Clear();
+            foreach (Pawn p in histories.Keys)
+            {
+                if (IsStale(p)) pruneScratch.Add(p);
+            }
+
+            for (int i = 0; i < pruneScratch.Count; i++)
+            {
+                histories.Remove(pruneScratch[i]);
+            }
+
+            pruneScratch.Clear();
+        }
+
+        // Same treatment for streaks (keyed by pawn alone): dropped on a game
+        // change in Record, pruned here when a new pawn is added past PruneAbove.
+        private static void PruneStreaks()
+        {
+            pruneScratch.Clear();
+            foreach (Pawn p in streaks.Keys)
+            {
+                if (IsStale(p)) pruneScratch.Add(p);
+            }
+
+            for (int i = 0; i < pruneScratch.Count; i++)
+            {
+                streaks.Remove(pruneScratch[i]);
+            }
+
+            pruneScratch.Clear();
+        }
+
+        private static bool IsStale(Pawn p)
+        {
+            return p == null || p.Destroyed || p.Dead || p.Faction == null || !p.Faction.IsPlayer;
+        }
+
+        // Called from JobTrackerPatch.Prefix, before the ended job is pooled
+        // (Job.Clear nulls its def). Same hook EndCurrentJob already has; no new patch.
+        public static void Notify_JobEnding(Pawn pawn, Job job, JobCondition condition)
+        {
+            if (pawn == null || job == null || job.def == null || pawn.Faction == null || !pawn.Faction.IsPlayer)
+            {
+                return;
+            }
+
+            Record(pawn, new HistoryEntry
+            {
+                tick = Find.TickManager.TicksGame,
+                isEnd = true,
+                def = job.def,
+                target = job.targetA,
+                condition = condition
+            });
+        }
+
+        private static string DescribeHistory(Pawn pawn, int now)
+        {
+            if (!histories.TryGetValue(pawn, out History h) || h.count == 0)
+            {
+                return "no history";
+            }
+
+            var sb = new System.Text.StringBuilder();
+            int start = (h.next - h.count + HistorySize) % HistorySize;
+            for (int i = 0; i < h.count; i++)
+            {
+                HistoryEntry e = h.entries[(start + i) % HistorySize];
+                if (now - e.tick > WindowTicks)
+                {
+                    continue;
+                }
+
+                if (sb.Length > 0) sb.Append("; ");
+                sb.Append("t-").Append(now - e.tick).Append(' ');
+                sb.Append(e.isEnd ? "end " : "start ").Append(e.def?.defName ?? "?");
+                Thing t = e.target.Thing;
+                sb.Append(" -> ").Append(t != null ? t.ThingID : e.target.IsValid ? e.target.Cell.ToString() : "none");
+                if (e.isEnd) sb.Append(" ").Append(e.condition);
+                else if (e.giver != null) sb.Append(" from ").Append(e.giver.Name);
+            }
+
+            return sb.Length == 0 ? "no history in window" : sb.ToString();
+        }
+
+        private static string DescribeOwners(Thing target)
+        {
+            if (!(target is Building_Bed bed))
+            {
+                return null;
+            }
+
+            var owners = bed.OwnersForReading;
+            if (owners == null || owners.Count == 0)
+            {
+                return "bed owners: none";
+            }
+
+            var sb = new System.Text.StringBuilder("bed owners: ");
+            for (int i = 0; i < owners.Count; i++)
+            {
+                if (i > 0) sb.Append(", ");
+                sb.Append(owners[i]?.LabelShort ?? "?");
+            }
+
+            return sb.ToString();
+        }
+
         public static int SuspectCount => suspects.Count;
 
         public static IReadOnlyList<Thing> Suspects => suspects;
@@ -79,6 +247,7 @@ namespace DoNotBeLazy.Components
             suspects.Clear();
             suspectBlame.Clear();
             streaks.Clear();
+            histories.Clear();
         }
 
         // Called from JobLoopPatch on every job start. Must stay O(1) and must
@@ -125,6 +294,15 @@ namespace DoNotBeLazy.Components
                 return;
             }
 
+            Record(pawn, new HistoryEntry
+            {
+                tick = Find.TickManager.TicksGame,
+                isEnd = false,
+                def = job.def,
+                target = job.targetA,
+                giver = jobGiver?.GetType()
+            });
+
             Thing target = job.targetA.Thing;
             if (target == null)
             {
@@ -148,6 +326,11 @@ namespace DoNotBeLazy.Components
                 || s.target != target
                 || now - s.lastTick > WindowTicks)
             {
+                if (streaks.Count >= PruneAbove && !streaks.ContainsKey(pawn))
+                {
+                    PruneStreaks();
+                }
+
                 streaks[pawn] = new Streak { target = target, count = 1, lastTick = now, giver = giver };
                 return;
             }
@@ -170,6 +353,21 @@ namespace DoNotBeLazy.Components
             Logger.Warning($"job loop: {pawn.LabelShort} took {DescribeThing(target)} {s.count} times " +
                 $"in {WindowTicks} ticks, from {giver} ({AssemblyNameOf(jobGiver)}). " +
                 "Select any colonist and use \"Find job loop\" to jump to it.");
+
+            // Same event, second line: who owns the bed and how each recent job
+            // started and ended (oldest first, in the window).
+            // Guarded: this runs inside StartJob's postfix, and a bed without
+            // CompAssignableToPawn would throw from OwnersForReading.
+            try
+            {
+                string owners = DescribeOwners(target);
+                Logger.Warning($"job loop detail: {pawn.LabelShort}" + (owners != null ? $", {owners}" : "")
+                    + $". Recent jobs: {DescribeHistory(pawn, now)}");
+            }
+            catch (System.Exception ex)
+            {
+                Logger.Warning($"job loop detail: {pawn.LabelShort}: could not be built ({ex.GetType().Name}: {ex.Message})");
+            }
         }
 
         public static string DescribeThing(Thing thing)

@@ -66,9 +66,12 @@ namespace DoNotBeLazy.Patches
         }
 
         [HarmonyPriority(Priority.First)]
-        public static void Prefix(Pawn_JobTracker __instance, Pawn ___pawn, out EndedJobState __state)
+        public static void Prefix(Pawn_JobTracker __instance, Pawn ___pawn, JobCondition condition, out EndedJobState __state)
         {
             Job cur = __instance.curJob;
+            // 2026-11-23: job-loop history keeps how each job ended; read here
+            // because the job is pooled (def nulled) by the Postfix.
+            JobLoopWatch.Notify_JobEnding(___pawn, cur, condition);
             // Section 44: only a pawn holding an order needs the name; the
             // lookup is a dictionary read, the name is built after it.
             Pawn holder = ___pawn;

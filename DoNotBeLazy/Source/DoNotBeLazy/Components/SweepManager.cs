@@ -113,6 +113,10 @@ namespace DoNotBeLazy.Components
         public int NextWaitLogTick;
         public int WaitsNotLogged;
 
+        // * build orders only (section 58): ids of finished-with blueprints
+        // and frames already written up, so a retry never repeats the line.
+        public HashSet<int> BuildNoted { get; } = new HashSet<int>();
+
         public SweepOrder(WorkGiverDef workGiverDef, List<LocalTargetInfo> sharedPool, Thing workstationTarget = null,
             IntVec3 scanCenter = default(IntVec3), int scanRadius = 0, bool centerOut = true,
             Predicate<Thing> targetFilter = null, string orderKind = null)
@@ -3706,6 +3710,7 @@ namespace DoNotBeLazy.Components
             Job nowJob = pawn.jobs?.curJob;
             Logger.Message($"{pawn.LabelShort}: {string.Join(" and ", served.ToArray())} served (now: {NeedMonitor.LevelsText(pawn)}); "
                 + (next.Length > 0 ? $"next need to serve: {next}"
+                    : NeedMonitor.GatheringText(pawn) != null ? $"no need left at or below its threshold, but the {NeedMonitor.GatheringText(pawn)} holds the pause - the order stays paused until it ends"
                     : IsOwnNeedJob(paused, nowJob) ? $"waiting for {DescribeJob(nowJob)} to finish before resuming"
                     : "no need left at or below its threshold, the order resumes"));
         }
@@ -4305,11 +4310,39 @@ namespace DoNotBeLazy.Components
                 }
                 // END LOCKED (dnbl H3)
 
+                // 2026-11-23 order "3 yes 4 yes": a party or wedding holds the
+                // pause by design; name it instead of an empty need.
+                string gathering = NeedMonitor.GatheringText(pawn);
+                if (held.Length == 0 && gathering != null)
+                {
+                    Logger.Message($"{pawn.LabelShort}: {FoodStuckWarnTicks} ticks into a Food pause, Food is satisfied and no need is under its threshold; the pause is held by the {gathering} the pawn is attending ({NeedMonitor.LevelsText(pawn)})");
+                    return;
+                }
+
                 // Own nap or recreation job still running while the needs
                 // recover: nothing is wrong, the order waits for it.
                 if (IsOwnNeedJob(paused, curJob))
                 {
                     Logger.Message($"{pawn.LabelShort}: {FoodStuckWarnTicks} ticks into a Food pause, Food is satisfied; waiting for {DescribeJob(curJob)} to finish before resuming ({NeedMonitor.LevelsText(pawn)})");
+                    return;
+                }
+
+                if (held.Length == 0)
+                {
+                    Logger.Message($"{pawn.LabelShort}: {FoodStuckWarnTicks} ticks into a Food pause, Food is satisfied and no need is at or below its threshold, yet the pause is still held (on {(curJob != null ? curJob.def.defName : "no job")}; {NeedMonitor.LevelsText(pawn)})");
+                    return;
+                }
+
+                // 2026-11-23 order "2 yes 3 yes" (B): emergency work (BeatFire for
+                // InOut) is deliberately never interrupted - the same test as the
+                // "not interrupting" branch in TryForceJoyIfStuck (not player-forced,
+                // issued by a work giver, not IsOrdinaryWork). That is not a need
+                // that failed to be served, so say what it is waiting on. Served
+                // later: each job end re-checks NeedsSatisfied in Notify_JobEnded,
+                // and the NeedMonitor poll calls TryForceJoyIfStuck again.
+                if (curJob != null && !curJob.playerForced && curJob.workGiverDef != null && !IsOrdinaryWork(pawn, curJob))
+                {
+                    Logger.Message($"{pawn.LabelShort}: {FoodStuckWarnTicks} ticks into a Food pause, Food is satisfied and {held} is still at or below its threshold; the pawn is on emergency work ({DescribeJob(curJob)}, {curJob.workGiverDef.defName}) which is not interrupted - the need will be served when it ends ({NeedMonitor.LevelsText(pawn)})");
                     return;
                 }
 
@@ -7242,6 +7275,14 @@ namespace DoNotBeLazy.Components
             bool firefighting = FireCompat.IsFirefighting(order.WorkGiverDef);
             bool rescanned = false;
 
+            // Section 58: follow a blueprint to its frame and note a finished one
+            bool buildOrder = scanner is WorkGiver_DnblBuild;
+            string buildNoJobReason = null;
+            if (buildOrder)
+            {
+                NoteBuildProgress(pawn, order);
+            }
+
             // Targets this pawn has already been refused for on THIS call.
             // They stay in the shared pool now (see the RemoveAt note below),
             // so without this we'd hand the same rejected target straight
@@ -7330,9 +7371,22 @@ namespace DoNotBeLazy.Components
                 // and then fails them out on the walk over
                 GrowerCompat.ResetWantedPlantDef(scanner);
 
+                // Section 58: the vanilla construct workers say why they gave
+                // no job (missing materials, reserved by, no path) only in
+                // this static, so clear it first and keep the last one.
+                if (buildOrder)
+                {
+                    JobFailReason.Clear();
+                }
+
                 Job job = target.HasThing ? scanner.JobOnThing(pawn, target.Thing, true) : scanner.JobOnCell(pawn, target.Cell, true);
                 if (job == null)
                 {
+                    if (buildOrder && JobFailReason.HaveReason)
+                    {
+                        buildNoJobReason = JobFailReason.Reason;
+                    }
+
                     // transient nearly every time - WorkGiver_Haul comes back
                     // null when every destination cell is reserved by a
                     // teammate. Leave it for whoever's free next.
@@ -7569,14 +7623,16 @@ namespace DoNotBeLazy.Components
                         : $" (and {order.WaitsNotLogged} more wait{(order.WaitsNotLogged == 1 ? "" : "s")} on this order since the last such line)";
                     Logger.Message($"{pawn.LabelShort}: {waitingOn} ({order.WorkGiverDef.defName}), staying in the sweep, looking again in {AreaRetryTicks} ticks (try {tries})"
                         + unlogged
-                        + RefusalSummary(refusalCounts));
+                        + RefusalSummary(refusalCounts)
+                        + (buildNoJobReason != null ? $"; last refusal: {buildNoJobReason}" : ""));
 
                     order.NextWaitLogTick = now + AreaRetryTicks;
                     order.WaitsNotLogged = 0;
                     return;
                 }
 
-                RemoveSweep(pawn, $"pool still inert after {MaxAreaRetries} tries ({order.SharedPool.Count} targets)");
+                RemoveSweep(pawn, $"pool still inert after {MaxAreaRetries} tries ({order.SharedPool.Count} targets)"
+                    + (buildNoJobReason != null ? $"; last refusal: {buildNoJobReason}" : ""));
                 return;
             }
 
@@ -7972,6 +8028,87 @@ namespace DoNotBeLazy.Components
                 return target.HasThing && designations.DesignationOn(target.Thing, DesignationDefOf.RemovePaintBuilding) == null;
             }
             return false;
+        }
+
+        // Section 58. A * build pawn asking for its next task: if the target it
+        // was last sent to has since been destroyed, say what became of it. A
+        // blueprint that took a delivery is replaced by a Frame (a new Thing),
+        // so the frame is put into the pool now rather than waiting for a
+        // rescan; a frame that was finished is replaced by the building. One
+        // line per such event - BuildNoted stops a retry repeating it.
+        private void NoteBuildProgress(Pawn pawn, SweepOrder order)
+        {
+            try
+            {
+                if (!lastAssignedTarget.TryGetValue(pawn, out LocalTargetInfo last) || !last.HasThing)
+                {
+                    return;
+                }
+
+                Thing prev = last.Thing;
+                if (prev == null || !prev.Destroyed || !order.BuildNoted.Add(prev.thingIDNumber))
+                {
+                    return;
+                }
+
+                IntVec3 pos = prev.Position;
+                if (!pos.InBounds(map))
+                {
+                    return;
+                }
+
+                if (prev is Blueprint blueprint)
+                {
+                    Frame frame = null;
+                    foreach (Thing th in pos.GetThingList(map))
+                    {
+                        if (th is Frame f && f.def.entityDefToBuild == blueprint.def.entityDefToBuild)
+                        {
+                            frame = f;
+                            break;
+                        }
+                    }
+
+                    if (frame == null)
+                    {
+                        Logger.Message($"{pawn.LabelShort}: * build - blueprint {prev.LabelShort} at {pos} is gone and no frame stands there (cancelled, or built with no frame stage)");
+                        return;
+                    }
+
+                    AddNewTargets(order, new List<LocalTargetInfo> { frame });
+                    Logger.Message($"{pawn.LabelShort}: * build - blueprint {prev.LabelShort} at {pos} became a frame, followed to {frame.LabelShort} ({order.SharedPool.Count} in the pool)");
+                    return;
+                }
+
+                if (prev is Frame doneFrame)
+                {
+                    BuildableDef built = GenConstruct.BuiltDefOf(doneFrame.def);
+                    bool standing = false;
+                    if (built is TerrainDef terrain)
+                    {
+                        standing = map.terrainGrid.TerrainAt(pos) == terrain;
+                    }
+                    else
+                    {
+                        foreach (Thing th in pos.GetThingList(map))
+                        {
+                            if (th.def == built)
+                            {
+                                standing = true;
+                                break;
+                            }
+                        }
+                    }
+
+                    Logger.Message(standing
+                        ? $"{pawn.LabelShort}: * build - frame {prev.LabelShort} at {pos} is complete, {built?.label} stands"
+                        : $"{pawn.LabelShort}: * build - frame {prev.LabelShort} at {pos} is gone without a {built?.label} standing (construction failed or was cancelled)");
+                }
+            }
+            catch (Exception ex)
+            {
+                Logger.Warning($"{pawn?.LabelShort}: * build progress note threw, ignored: {ex.Message}");
+            }
         }
 
         // Only the target actually ceasing to exist. Everything else that

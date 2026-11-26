@@ -247,6 +247,8 @@ namespace DoNotBeLazy.Patches
             // disabled "here's why you can't" entries, collected as we go
             // and appended after the real options so they sort last
             var feedback = new List<FloatMenuOption>();
+            // one record per * entry added by the loop below, for the duplicate-label pass after it
+            var sweepEntries = new List<SweepEntry>();
 
             foreach (WorkGiverDef def in EligibleDefs())
             {
@@ -318,7 +320,7 @@ namespace DoNotBeLazy.Patches
                         // actionable. See PawnValidator.Hopeless.
                         if (why != null && !AllHopeless(pawns, map, def))
                         {
-                            feedback.Add(DisabledOption(def, refused.LabelShort, why));
+                            AddFeedback(feedback, sweepEntries, def, refused.LabelShort, why);
                             NoteOptionOff(def, cell, pawns, "greyed", refused.LabelShort + ": " + why);
                         }
                         else if (why != null)
@@ -376,7 +378,7 @@ namespace DoNotBeLazy.Patches
                 {
                     if (failReason != null && feedback.Count < MaxFeedbackOptions)
                     {
-                        feedback.Add(DisabledOption(def, failThing?.LabelShort, failReason));
+                        AddFeedback(feedback, sweepEntries, def, failThing?.LabelShort, failReason);
                         NoteOptionOff(def, cell, pawns, "greyed", (failThing?.LabelShort ?? "target") + ": " + failReason);
                     }
                     else if (failReason != null)
@@ -396,7 +398,7 @@ namespace DoNotBeLazy.Patches
                 // prevent.
                 if (failReason != null && feedback.Count < MaxFeedbackOptions)
                 {
-                    feedback.Add(DisabledOption(def, failThing?.LabelShort, failReason));
+                    AddFeedback(feedback, sweepEntries, def, failThing?.LabelShort, failReason);
                     NoteOptionOff(def, cell, pawns, "greyed (option itself is on offer)", (failThing?.LabelShort ?? "a thing here") + ": " + failReason);
                 }
 
@@ -414,7 +416,7 @@ namespace DoNotBeLazy.Patches
                 WorkGiverDef capturedDef = def;
                 LocalTargetInfo capturedTarget = target;
                 Map capturedMap = map;
-                options.Add(new FloatMenuOption(
+                var sweepOption = new FloatMenuOption(
                     "* " + label,
                     () =>
                     {
@@ -472,9 +474,12 @@ namespace DoNotBeLazy.Patches
                             SweepManager.LastClickKeys = null;
                         }
                     },
-                    MenuOptionPriority.Low));
+                    MenuOptionPriority.Low);
+                options.Add(sweepOption);
+                sweepEntries.Add(new SweepEntry { Option = sweepOption, Def = def, Key = "* " + label, Enabled = true });
             }
 
+            DropDuplicateLabels(sweepEntries, options, feedback, pawns, cell);
             options.AddRange(feedback);
 
             // eating off a burning tile is the same bad idea as everything
@@ -667,6 +672,94 @@ namespace DoNotBeLazy.Patches
             }
             catch (Exception)
             {
+            }
+        }
+
+        private class SweepEntry
+        {
+            public FloatMenuOption Option;
+            public WorkGiverDef Def;
+            public string Key;
+            public bool Enabled;
+            public bool Handled;
+        }
+
+        private static void AddFeedback(List<FloatMenuOption> feedback, List<SweepEntry> entries, WorkGiverDef def, string subject, string reason)
+        {
+            FloatMenuOption o = DisabledOption(def, subject, reason);
+            feedback.Add(o);
+            entries.Add(new SweepEntry { Option = o, Def = def, Key = "* " + (def.label.NullOrEmpty() ? def.defName : def.label.CapitalizeFirst()) + " until done", Enabled = false });
+        }
+
+        // 2026-11-25: two WorkGiverDefs from different mods can show the same
+        // label on one click (Vanilla Expanded Framework's Art-work-type
+        // "deliver resources to blueprints" next to vanilla's Construction
+        // one; "Art" is supported for floor painting). Keep one def per label:
+        // an enabled entry beats a greyed one, among enabled the first stays,
+        // among greyed the def whose work type most selected pawns have.
+        // Only OTHER defs are dropped - the kept def's own greyed "something
+        // here was refused although the option is on offer" entry shares its
+        // label by design and stays. No allocation unless a duplicate exists;
+        // runs per menu build, the log goes through NoteOptionOff's throttle.
+        private static void DropDuplicateLabels(List<SweepEntry> entries, List<FloatMenuOption> options, List<FloatMenuOption> feedback, List<Pawn> pawns, IntVec3 cell)
+        {
+            for (int i = 0; i < entries.Count; i++)
+            {
+                SweepEntry first = entries[i];
+                if (first.Handled)
+                {
+                    continue;
+                }
+
+                bool otherDef = false;
+                for (int j = i + 1; j < entries.Count; j++)
+                {
+                    SweepEntry e = entries[j];
+                    if (e.Key == first.Key)
+                    {
+                        e.Handled = true;
+                        if (e.Def != first.Def) otherDef = true;
+                    }
+                }
+                if (!otherDef)
+                {
+                    continue;
+                }
+
+                SweepEntry keep = null;
+                for (int j = i; j < entries.Count; j++)
+                {
+                    SweepEntry e = entries[j];
+                    if (e.Key == first.Key && e.Enabled) { keep = e; break; }
+                }
+                if (keep == null)
+                {
+                    int best = -1;
+                    for (int j = i; j < entries.Count; j++)
+                    {
+                        SweepEntry e = entries[j];
+                        if (e.Key != first.Key) continue;
+                        int have = 0;
+                        foreach (Pawn p in pawns)
+                        {
+                            try
+                            {
+                                if (p?.workSettings != null && e.Def.workType != null && p.workSettings.WorkIsActive(e.Def.workType)) have++;
+                            }
+                            catch (Exception) { }
+                        }
+                        if (have > best) { best = have; keep = e; }
+                    }
+                }
+
+                for (int j = i; j < entries.Count; j++)
+                {
+                    SweepEntry e = entries[j];
+                    if (e.Key != first.Key || e.Def == keep.Def) continue;
+                    options.Remove(e.Option);
+                    feedback.Remove(e.Option);
+                    NoteOptionOff(e.Def, cell, pawns, "dropped as duplicate label", e.Key + " also offered by " + keep.Def.defName + (keep.Enabled ? " (enabled)" : " (greyed)") + "; dropped " + e.Def.defName);
+                }
             }
         }
 

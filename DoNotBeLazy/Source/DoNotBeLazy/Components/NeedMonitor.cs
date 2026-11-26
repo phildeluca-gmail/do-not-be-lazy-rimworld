@@ -325,6 +325,15 @@ namespace DoNotBeLazy.Components
             return lord != null && IsGatheringLordJob(lord.LordJob);
         }
 
+        // Plain-English name of the gathering the pawn is in ("party", "wedding"),
+        // or null when not in one. Used by the pause log lines (2026-11-23 order
+        // "3 yes 4 yes": an order stays paused through a party, and the log says so).
+        public static string GatheringText(Pawn pawn)
+        {
+            Lord lord = pawn?.GetLord();
+            return lord != null && IsGatheringLordJob(lord.LordJob) ? GatheringKind(lord.LordJob) : null;
+        }
+
         // The lord (party or wedding) that wants this pawn and that it is
         // not yet in, or null. VoluntaryJoinPriorityFor is vanilla's own
         // invitation test (faction, forbidden spot, about to end, blocking
