@@ -23,7 +23,9 @@ namespace DoNotBeLazy.Core
         // are the single set. Still scribed so an old file loads cleanly.
         public float hungerThreshold = 0.05f;
         public float recreationThreshold = 0.05f;
-        public float moodThreshold = 0.10f;
+        // Sections 57/60 (2026-11-25): replaces moodThreshold. Points of mood above
+        // each pawn's own major break line at which the mood rules fire.
+        public float moodBuffer = 0.05f;
 
         // Section 28: the safety net, for colonists NOT on a `*` order.
         // Same three needs, own values. Level at or below the value sends
@@ -108,7 +110,7 @@ namespace DoNotBeLazy.Core
         private string safetyHungerBuffer;
         private string safetyRecreationBuffer;
         private string safetySleepBuffer;
-        private string moodThresholdBuffer;
+        private string moodBufferBuffer;
         private string drugCravingBuffer;
 
         // Row geometry for a slider with a number box beside it. 22f is the
@@ -141,7 +143,7 @@ namespace DoNotBeLazy.Core
             Scribe_Values.Look(ref safetyHungerThreshold, "safetyHungerThreshold", 0.10f);
             Scribe_Values.Look(ref safetyRecreationThreshold, "safetyRecreationThreshold", 0.10f);
             Scribe_Values.Look(ref safetySleepThreshold, "safetySleepThreshold", 0.10f);
-            Scribe_Values.Look(ref moodThreshold, "moodThreshold", 0.10f);
+            Scribe_Values.Look(ref moodBuffer, "moodBuffer", 0.05f);
             Scribe_Values.Look(ref drugCravingThreshold, "drugCravingThreshold", 0.10f);
             Scribe_Values.Look(ref restThreshold, "restThreshold", 0.10f);
             Scribe_Values.Look(ref verboseLogging, "verboseLogging", true);
@@ -212,8 +214,8 @@ namespace DoNotBeLazy.Core
             safetySleepThreshold = SliderWithPercentBox(listing, safetySleepThreshold, 0f, 0.30f, ref safetySleepBuffer);
 
             listing.Gap();
-            listing.Label($"Mood interrupt threshold: {moodThreshold:P0}");
-            moodThreshold = SliderWithPercentBox(listing, moodThreshold, 0.01f, 0.30f, ref moodThresholdBuffer);
+            listing.Label($"Mood buffer above each pawn's major break line: {moodBuffer:P0}");
+            moodBuffer = SliderWithPercentBox(listing, moodBuffer, 0f, 0.30f, ref moodBufferBuffer);
 
             listing.Gap();
             listing.Label($"Drug craving: {drugCravingThreshold:P0}");

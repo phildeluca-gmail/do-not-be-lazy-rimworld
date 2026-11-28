@@ -91,7 +91,7 @@ namespace DoNotBeLazy.Utility
         // and starts ours with continueSleeping false; verified in
         // Assembly-CSharp). Left out of a group order: a pawn who cannot move,
         // and a pawn whose mood is at or below the mood setting
-        // (NeedMonitor.MoodAtSetting, DoNotBeLazySettings.moodThreshold).
+        // (NeedMonitor.MoodAtSetting, DoNotBeLazySettings.moodBuffer).
         // Returns the reason in words, or null when the pawn takes the order.
         // Deliberately NOT part of CanSweep: that check also runs every
         // assignment of a running sweep, and a pawn already on an order stays on it.

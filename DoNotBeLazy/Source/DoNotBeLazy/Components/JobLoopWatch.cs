@@ -54,6 +54,7 @@ namespace DoNotBeLazy.Components
             public Thing target;
             public int count;
             public int lastTick;
+            public int firstTick;   // tick of the first start in this run, for the span in the warning
             public string giver;
         }
 
@@ -331,7 +332,7 @@ namespace DoNotBeLazy.Components
                     PruneStreaks();
                 }
 
-                streaks[pawn] = new Streak { target = target, count = 1, lastTick = now, giver = giver };
+                streaks[pawn] = new Streak { target = target, count = 1, lastTick = now, firstTick = now, giver = giver };
                 return;
             }
 
@@ -351,7 +352,7 @@ namespace DoNotBeLazy.Components
             // ONE line, on the transition only. A line per repeat would be
             // thousands - the exact defect this whole class exists to find.
             Logger.Warning($"job loop: {pawn.LabelShort} took {DescribeThing(target)} {s.count} times " +
-                $"in {WindowTicks} ticks, from {giver} ({AssemblyNameOf(jobGiver)}). " +
+                $"over {now - s.firstTick} ticks (each restart within {WindowTicks} ticks of the last), from {giver} ({AssemblyNameOf(jobGiver)}). " +
                 "Select any colonist and use \"Find job loop\" to jump to it.");
 
             // Same event, second line: who owns the bed and how each recent job

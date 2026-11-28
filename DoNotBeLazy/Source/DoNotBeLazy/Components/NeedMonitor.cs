@@ -61,6 +61,10 @@ namespace DoNotBeLazy.Components
         // threshold, and a rest or recreation job already under way is allowed
         // to finish (NeedsSatisfied) so the lack of a margin cannot thrash.
         // Mood is not served by anything here, so it keeps the margin.
+        // UNLOCKED 2026-11-25 by order (Q91.3), re-test H1/H1.1/H1.2: sections 57
+        // and 60. The mood line is now each pawn's own major break line plus
+        // the mood buffer (EffectiveMoodThreshold), and mood holds a pause
+        // whether or not recreation can help it. The margin itself is unchanged.
         // 5 percentage points of CurLevelPercentage.
         public const float ResumeMargin = 0.05f;
 
@@ -109,7 +113,7 @@ namespace DoNotBeLazy.Components
 
             float hungerThreshold = DoNotBeLazyMod.Settings.safetyHungerThreshold;
             float recreationThreshold = DoNotBeLazyMod.Settings.safetyRecreationThreshold;
-            float moodThreshold = DoNotBeLazyMod.Settings.moodThreshold;
+            float moodThreshold = 0f; // 2026-11-25: margin above each pawn's mood line (CriticalNeedLabel); 0 to pause
             float restThreshold = DoNotBeLazyMod.Settings.safetySleepThreshold;
 
             // Section 28: colonists not on a * order, at most once per
@@ -212,7 +216,15 @@ namespace DoNotBeLazy.Components
                         // than end", Q56): the job is paused, kept by
                         // SweepManager.PauseForNeed and given back on resume.
                         Job running = pawn.jobs?.curJob;
-                        bool needJob = SweepManager.IsProtectedFromNeedInterrupt(running);
+                        // Q91.1, 2026-11-25: emergency work is no longer exempt once a
+                        // need (not mood) is EmergencyCapPoints under its threshold.
+                        string capNeed = EmergencyCapNeed(pawn);
+                        bool needJob = SweepManager.IsProtectedFromNeedInterrupt(running, pawn);
+                        if (running != null && capNeed != null && !needJob && SweepManager.IsProtectedFromNeedInterrupt(running))
+                        {
+                            Logger.Message($"{pawn.LabelShort}: pulled off emergency work {running.def.defName} - {capNeed} is {EmergencyCapPoints * 100f:F0} points or more under its threshold (rule: emergency cap, section 60 b)");
+                        }
+
                         if (running != null)
                         {
                             Logger.Message($"{pawn.LabelShort}: {need} below threshold - " + (needJob ? $"not interrupting {running.def.defName} (a need, emergency or self-preservation job)" : $"pausing {running.def.defName}, given back once needs are served (on a * order job: {(sweepManager.IsOnOwnOrderJob(pawn) ? "yes" : "no")})"));
@@ -254,7 +266,7 @@ namespace DoNotBeLazy.Components
             CheckCrossing(pawn, sweepManager, "Food", n.food, s.safetyHungerThreshold, true);
             CheckCrossing(pawn, sweepManager, "Rest", n.rest, s.safetySleepThreshold, true);
             CheckCrossing(pawn, sweepManager, "Recreation", n.joy, s.safetyRecreationThreshold, true);
-            CheckCrossing(pawn, sweepManager, "Mood", n.mood, EffectiveMoodThreshold(pawn, s.moodThreshold), false);
+            CheckCrossing(pawn, sweepManager, "Mood", n.mood, EffectiveMoodThreshold(pawn, s.moodBuffer), false);
         }
 
         private static void CheckCrossing(Pawn pawn, SweepManager sweepManager, string label, Need need, float threshold, bool zeroIsOff)
@@ -272,7 +284,8 @@ namespace DoNotBeLazy.Components
             }
 
             Job cur = pawn.jobs?.curJob;
-            Logger.Message($"{pawn.LabelShort}: {label} reached its threshold - {need.CurLevelPercentage:P0} at/below {threshold:P0}; current job {(cur == null ? "none" : cur.def.defName)}; on a * order: yes, current job is {(sweepManager.IsOnOwnOrderJob(pawn) ? "the order's job" : "not the order's job")}");
+            string rule = label == "Mood" ? $" (rule: mood buffer - major break line {MajorBreakLine(pawn):P0} + buffer {DoNotBeLazyMod.Settings.moodBuffer:P0}; Food {FmtPct(NeedLevel(pawn, 0))}, Rest {FmtPct(NeedLevel(pawn, 1))}, Recreation {FmtPct(NeedLevel(pawn, 2))})" : " (rule: per-need threshold)";
+            Logger.Message($"{pawn.LabelShort}: {label} reached its threshold{rule} - {need.CurLevelPercentage:P0} at/below {threshold:P0}; current job {(cur == null ? "none" : cur.def.defName)}; on a * order: yes, current job is {(sweepManager.IsOnOwnOrderJob(pawn) ? "the order's job" : "not the order's job")}");
         }
 
         // Section 39 (2026-11-07): "Add to interrupt conditions wedding and
@@ -474,7 +487,11 @@ namespace DoNotBeLazy.Components
                 return Describe("Recreation", pawn.needs.joy);
             }
 
-            if (RecreationCanHelpMood(pawn) && NeedIsCritical(pawn?.needs?.mood, EffectiveMoodThreshold(pawn, moodThreshold), false))
+            // 2026-11-25 (Q76.5c): mood inside the buffer counts whether or not
+            // recreation can help; with every other need high the pawn idles.
+            // moodThreshold is the margin above the pawn's own mood line: 0 to
+            // pause, ResumeMargin from NeedsSatisfied (the lines differ per pawn).
+            if (NeedIsCritical(pawn?.needs?.mood, EffectiveMoodThreshold(pawn, 0f) + moodThreshold, false))
             {
                 return Describe("Mood", pawn.needs.mood);
             }
@@ -586,14 +603,14 @@ namespace DoNotBeLazy.Components
 
             float hungerThreshold = ResumeAt(DoNotBeLazyMod.Settings.safetyHungerThreshold);
             float recreationThreshold = ResumeAt(DoNotBeLazyMod.Settings.safetyRecreationThreshold);
-            float moodThreshold = EffectiveMoodThreshold(pawn, DoNotBeLazyMod.Settings.moodThreshold) + ResumeMargin;
+            float moodThreshold = EffectiveMoodThreshold(pawn, 0f) + ResumeMargin;
             float restThreshold = ResumeAt(DoNotBeLazyMod.Settings.safetySleepThreshold);
 
             var parts = new System.Collections.Generic.List<string>();
             if (NeedIsCritical(needs.food, hungerThreshold)) parts.Add(Describe("Food", needs.food));
             if (NeedIsCritical(needs.rest, restThreshold)) parts.Add(Describe("Rest", needs.rest));
             if (NeedIsCritical(needs.joy, recreationThreshold)) parts.Add(Describe("Recreation", needs.joy));
-            if (RecreationCanHelpMood(pawn) && NeedIsCritical(needs.mood, moodThreshold, false)) parts.Add(Describe("Mood", needs.mood));
+            if (NeedIsCritical(needs.mood, moodThreshold, false)) parts.Add(Describe("Mood", needs.mood));
             Need_Chemical craving = LowCraving(pawn);
             if (craving != null) parts.Add(DescribeCraving(craving));
             return string.Join(", ", parts.ToArray());
@@ -624,21 +641,136 @@ namespace DoNotBeLazy.Components
 
         // 2026-10-30, user: "The mood percentage should be a slider, and the
         // mood rules should use that setting." True when the pawn's mood is
-        // at or below the mood setting (DoNotBeLazySettings.moodThreshold).
+        // at or below its mood line (major break line + DoNotBeLazySettings.moodBuffer).
         // Replaces MoodAtMajorBreak / MajorBreakLevel, which read the pawn's
         // own BreakThresholdMajor.
         public static bool MoodAtSetting(Pawn pawn)
         {
             Need mood = pawn?.needs?.mood;
-            return mood != null && mood.CurLevelPercentage <= EffectiveMoodThreshold(pawn, DoNotBeLazyMod.Settings.moodThreshold);
+            return mood != null && mood.CurLevelPercentage <= EffectiveMoodThreshold(pawn, 0f);
         }
 
         // The mood level the order path pauses on: the mood setting only.
         // 2026-10-27, user: "10%." (answering whether Mood should use only
         // the setting). Was max(setting, major break level) under item 4.6.
+        // 2026-11-25, sections 57/60 (Q76.2/76.3 "just the buffer to major",
+        // "buffer is 5% to start"): the pawn's own major break line plus the
+        // mood buffer setting. moodSetting is ignored (kept so callers need no
+        // change). Verified by reflection on lib\Assembly-CSharp.dll:
+        // Verse.AI.MentalBreaker.BreakThresholdMajor is a public float property.
         public static float EffectiveMoodThreshold(Pawn pawn, float moodSetting)
         {
-            return moodSetting;
+            return MajorBreakLine(pawn) + (DoNotBeLazyMod.Settings != null ? DoNotBeLazyMod.Settings.moodBuffer : 0.05f);
+        }
+
+        // The pawn's major mental break line, 0 to 1 (0 when it has no mental breaker).
+        public static float MajorBreakLine(Pawn pawn)
+        {
+            MentalBreaker breaker = pawn?.mindState?.mentalBreaker;
+            return breaker != null ? breaker.BreakThresholdMajor : 0f;
+        }
+
+        private static string FmtPct(float f)
+        {
+            return f < 0f ? "n/a" : f.ToString("P0");
+        }
+
+        // 0 food, 1 rest, 2 joy level, or -1 when the pawn lacks the need.
+        private static float NeedLevel(Pawn pawn, int which)
+        {
+            Need n = which == 0 ? (Need)pawn?.needs?.food : which == 1 ? (Need)pawn?.needs?.rest : (Need)pawn?.needs?.joy;
+            return n == null ? -1f : n.CurLevelPercentage;
+        }
+
+        // Q91.1 (2026-11-25, "no": low mood alone does not pull a pawn off
+        // emergency work): emergency work is left only when Food, Rest or
+        // Recreation is this far under its own threshold. Mood is not counted.
+        public const float EmergencyCapPoints = 0.05f;
+
+        // "Rest 3%" for the first need under the cap, or null.
+        public static string EmergencyCapNeed(Pawn pawn)
+        {
+            var s = DoNotBeLazyMod.Settings;
+            Pawn_NeedsTracker n = pawn?.needs;
+            if (n == null || s == null)
+            {
+                return null;
+            }
+
+            if (UnderCap(n.food, s.safetyHungerThreshold)) return Describe("Food", n.food);
+            if (UnderCap(n.rest, s.safetySleepThreshold)) return Describe("Rest", n.rest);
+            if (UnderCap(n.joy, s.safetyRecreationThreshold)) return Describe("Recreation", n.joy);
+            return null;
+        }
+
+        private static bool UnderCap(Need need, float threshold)
+        {
+            return need != null && threshold > 0f && need.CurLevelPercentage <= threshold - EmergencyCapPoints;
+        }
+
+        // Q91.2 (2026-11-25): "the order from most to least likely to break
+        // with a severe result. If the same, food, rec, sleep in that order."
+        // Built as: each need's current vanilla mood-thought penalty (points;
+        // section 57 item 1.4, verified 2026-11-18): Food Hungry -6,
+        // UrgentlyHungry -12, Starving -20 to -44 by malnutrition stage; Rest below 28% -6,
+        // below 14% -12, below 1% -18 (exhausted); Recreation below 30% -5,
+        // below 15% -10, below 1% -20. Larger penalty = nearer a severe
+        // break or collapse = served first. Ties: Food, Recreation, Rest.
+        private static int SeverityPenalty(string label, Pawn pawn)
+        {
+            Pawn_NeedsTracker n = pawn.needs;
+            if (label == "Food")
+            {
+                switch (n.food.CurCategory)
+                {
+                    // ThoughtWorker_NeedFood: stage 2 + Malnutrition's stage index,
+                    // -20/-26/-32/-38/-44 (Thoughts_Situation_Needs.xml, re-verified 2026-11-25).
+                    case HungerCategory.Starving: return 20 + 6 * (pawn.health?.hediffSet?.GetFirstHediffOfDef(HediffDefOf.Malnutrition)?.CurStageIndex ?? 0);
+                    case HungerCategory.UrgentlyHungry: return 12;
+                    case HungerCategory.Hungry: return 6;
+                    default: return 0;
+                }
+            }
+
+            float p = label == "Rest" ? n.rest.CurLevelPercentage : n.joy.CurLevelPercentage;
+            if (label == "Rest")
+            {
+                return p < 0.01f ? 18 : p < 0.14f ? 12 : p < 0.28f ? 6 : 0;
+            }
+
+            return p < 0.01f ? 20 : p < 0.15f ? 10 : p < 0.30f ? 5 : 0;
+        }
+
+        // Food, Rest and Recreation that are at or below their resume
+        // threshold, most severe first (see SeverityPenalty).
+        public static List<string> RankedUnmetNeeds(Pawn pawn)
+        {
+            var result = new List<string>(3);
+            if (pawn?.needs == null)
+            {
+                return result;
+            }
+
+            // tie order: Food, Recreation, Rest
+            if (pawn.needs.food != null && !FoodSatisfied(pawn)) result.Add("Food");
+            if (pawn.needs.joy != null && !JoySatisfied(pawn)) result.Add("Recreation");
+            if (pawn.needs.rest != null && !RestSatisfied(pawn)) result.Add("Rest");
+            // stable insertion sort, descending penalty
+            for (int i = 1; i < result.Count; i++)
+            {
+                string cur = result[i];
+                int pen = SeverityPenalty(cur, pawn);
+                int j = i - 1;
+                while (j >= 0 && SeverityPenalty(result[j], pawn) < pen)
+                {
+                    result[j + 1] = result[j];
+                    j--;
+                }
+
+                result[j + 1] = cur;
+            }
+
+            return result;
         }
 
         // Mood alone, against the resume level (threshold plus ResumeMargin,
@@ -646,7 +778,7 @@ namespace DoNotBeLazy.Components
         public static bool MoodSatisfied(Pawn pawn)
         {
             Need mood = pawn?.needs?.mood;
-            return mood == null || !RecreationCanHelpMood(pawn) || !NeedIsCritical(mood, EffectiveMoodThreshold(pawn, DoNotBeLazyMod.Settings.moodThreshold) + ResumeMargin, false);
+            return mood == null || !NeedIsCritical(mood, EffectiveMoodThreshold(pawn, 0f) + ResumeMargin, false);
         }
 
         // Section 34, manager's decision 2026-10-25 (pending user
@@ -679,10 +811,17 @@ namespace DoNotBeLazy.Components
                 return;
             }
 
-            bool atThreshold = NeedIsCritical(mood, EffectiveMoodThreshold(pawn, DoNotBeLazyMod.Settings.moodThreshold), false);
-            if (!atThreshold)
+            // 2026-11-25 review: the episode ends only above the resume level
+            // (line + ResumeMargin), so mood hovering at the line logs once.
+            float line = EffectiveMoodThreshold(pawn, 0f);
+            if (!NeedIsCritical(mood, line + ResumeMargin, false))
             {
                 moodFutileLogged.Remove(pawn);
+                return;
+            }
+
+            if (!NeedIsCritical(mood, line, false))
+            {
                 return;
             }
 
@@ -694,7 +833,7 @@ namespace DoNotBeLazy.Components
 
             if (moodFutileLogged.Add(pawn))
             {
-                Logger.Message($"{pawn.LabelShort}: Mood {mood.CurLevelPercentage:P0} is at or below its mood threshold but Recreation is already {pawn.needs.joy.CurLevelPercentage:P0} - recreation cannot help, resuming the order");
+                Logger.Message($"{pawn.LabelShort}: Mood {mood.CurLevelPercentage:P0} is at or below its mood threshold but Recreation is already {pawn.needs.joy.CurLevelPercentage:P0} - recreation cannot help - the order stays paused and the pawn is left to vanilla until Mood is above {EffectiveMoodThreshold(pawn, 0f) + ResumeMargin:P0} (rule: mood buffer, Q76.5c)");
             }
         }
 
@@ -722,7 +861,7 @@ namespace DoNotBeLazy.Components
             return CriticalNeedLabel(pawn,
                 DoNotBeLazyMod.Settings.safetyHungerThreshold,
                 DoNotBeLazyMod.Settings.safetyRecreationThreshold,
-                DoNotBeLazyMod.Settings.moodThreshold,
+                0f,
                 DoNotBeLazyMod.Settings.safetySleepThreshold);
         }
 
@@ -743,7 +882,7 @@ namespace DoNotBeLazy.Components
             if (NeedIsCritical(pawn.needs.food, s.safetyHungerThreshold)) names.Add("Food");
             if (NeedIsCritical(pawn.needs.rest, s.safetySleepThreshold)) names.Add("Rest");
             if (NeedIsCritical(pawn.needs.joy, s.safetyRecreationThreshold)) names.Add("Recreation");
-            if (RecreationCanHelpMood(pawn) && NeedIsCritical(pawn.needs.mood, EffectiveMoodThreshold(pawn, s.moodThreshold), false)) names.Add("Mood");
+            if (NeedIsCritical(pawn.needs.mood, EffectiveMoodThreshold(pawn, s.moodBuffer), false)) names.Add("Mood");
             if (LowCraving(pawn) != null) names.Add("Craving");
             return names;
         }
@@ -759,7 +898,7 @@ namespace DoNotBeLazy.Components
 
             float hungerThreshold = ResumeAt(DoNotBeLazyMod.Settings.safetyHungerThreshold);
             float recreationThreshold = ResumeAt(DoNotBeLazyMod.Settings.safetyRecreationThreshold);
-            float moodThreshold = EffectiveMoodThreshold(pawn, DoNotBeLazyMod.Settings.moodThreshold) + ResumeMargin;
+            float moodThreshold = ResumeMargin; // margin above the pawn's mood line (CriticalNeedLabel)
             float restThreshold = ResumeAt(DoNotBeLazyMod.Settings.safetySleepThreshold);
 
             if (NeedIsCritical(pawn, hungerThreshold, recreationThreshold, moodThreshold, restThreshold))

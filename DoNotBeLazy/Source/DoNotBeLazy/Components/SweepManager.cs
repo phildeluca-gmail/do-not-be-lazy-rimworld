@@ -382,6 +382,14 @@ namespace DoNotBeLazy.Components
             // during this pause, so the moment it recovers is logged once.
             public int foodBlockedUntil;
             public int restBlockedUntil;
+            // 2026-11-25 (section 60): Recreation had no job, or was held behind a
+            // protected job; a lower-ranked need then may go first.
+            public int joyBlockedUntil;
+            // loadID of the last DNBL-issued nap this pause cut short for a meal or
+            // recreation, and the last rank decision written, so each is logged once.
+            public int modCutJobId;
+            public string rankYieldLogged;
+            public string restYieldLogged;
             public int eatHeldCheckTick;
             public bool seenLowFood;
             public bool seenLowRest;
@@ -2798,6 +2806,35 @@ namespace DoNotBeLazy.Components
             return cur != null && (AutomaticResponseName(cur) != null || SafetyNet.IsEmergencyJob(cur) || IsNeedOrEmergencyJob(cur) || IsSelfPreservationJob(cur) || NeedMonitor.IsDrugIngest(cur));
         }
 
+        // Q91.1, 2026-11-25 (section 60 b): same test, but emergency work (a
+        // doctoring, firefighting, rescue or other emergency work giver job) is
+        // not protected once Food, Rest or Recreation is NeedMonitor.
+        // EmergencyCapPoints under its threshold. Combat, fleeing, need jobs,
+        // self-preservation and a meal being carried to someone stay protected.
+        public static bool IsProtectedFromNeedInterrupt(Job cur, Pawn pawn)
+        {
+            if (!IsProtectedFromNeedInterrupt(cur))
+            {
+                return false;
+            }
+
+            if (pawn == null || cur.def == null || AutomaticResponseName(cur) != null || IsSelfPreservationJob(cur)
+                || NeedMonitor.IsDrugIngest(cur) || cur.def == JobDefOf.Ingest || cur.def == JobDefOf.LayDown
+                || cur.def.joyKind != null || cur.def == JobDefOf.FeedPatient || cur.def == JobDefOf.DeliverFood)
+            {
+                return true;
+            }
+
+            WorkTypeDef workType = cur.workGiverDef?.workType;
+            // The four defs cover the same work issued without a work giver
+            // (think tree or another mod), which has no workGiverDef.
+            bool emergencyWork = (cur.workGiverDef != null && cur.workGiverDef.emergency)
+                || workType == WorkTypeDefOf.Doctor || workType == WorkTypeDefOf.Firefighter
+                || cur.def == JobDefOf.BeatFire || cur.def == JobDefOf.ExtinguishFiresNearby
+                || cur.def == JobDefOf.Rescue || cur.def == JobDefOf.TendPatient;
+            return !(emergencyWork && NeedMonitor.EmergencyCapNeed(pawn) != null);
+        }
+
         private static bool IsSelfPreservationJob(Job job)
         {
             return job?.def != null && SelfPreservationDefNames.Contains(job.def.defName);
@@ -3617,7 +3654,15 @@ namespace DoNotBeLazy.Components
             Job copy = SnapshotInterruptible(pawn, cur);
             bool wasOrderStep = copy != null && IsOwnOrderStep(pawn, cur);
             int curLoadID = cur != null ? cur.loadID : -1;
+            // 2026-11-25 (section 60 item 7): emergency work cut by the cap, named before the hand-off.
+            string capCut = cur != null && IsProtectedFromNeedInterrupt(cur) && !IsProtectedFromNeedInterrupt(cur, pawn)
+                ? $"{pawn.LabelShort}: pulled off emergency work {DescribeJob(cur)} for {forcedKind} - {NeedMonitor.EmergencyCapNeed(pawn)} is {NeedMonitor.EmergencyCapPoints * 100f:F0} points or more under its threshold (rule: emergency cap, section 60 b)"
+                : null;
             bool took = GiveJob(pawn, job, false, forcedKind);
+            if (took && capCut != null && pawn.jobs?.curJob?.loadID != curLoadID)
+            {
+                Logger.Message(capCut);
+            }
             // TryTakeOrderedJob queues the job behind a current job that cannot
             // be interrupted; then nothing was paused and nothing is kept.
             bool interrupted = copy != null && pawn.jobs?.curJob?.loadID != curLoadID;
@@ -3656,6 +3701,57 @@ namespace DoNotBeLazy.Components
             pausedForNeed[pawn] = paused;
         }
 
+        // 2026-11-25 (section 60, Q91.2): Recreation has no available job now.
+        private static bool JoyBlocked(PauseInfo paused)
+        {
+            return Find.TickManager.TicksGame < paused.joyBlockedUntil;
+        }
+
+        // The highest-ranked unmet need (NeedMonitor.RankedUnmetNeeds: most severe
+        // first, ties Food, Recreation, Rest) that ranks ahead of self and has an
+        // available job, or null when self is first. self may be a label that is
+        // not unmet (Mood): then the first available unmet need is returned.
+        private static string HigherRankedUnmet(Pawn pawn, PauseInfo paused, string self)
+        {
+            foreach (string label in NeedMonitor.RankedUnmetNeeds(pawn))
+            {
+                if (label == self)
+                {
+                    return null;
+                }
+
+                if ((label == "Food" && FoodBlocked(paused)) || (label == "Rest" && RestBlocked(paused)) || (label == "Recreation" && JoyBlocked(paused)))
+                {
+                    continue;
+                }
+
+                return label;
+            }
+
+            return null;
+        }
+
+        // Section 60 (c): a nap this mod itself handed out (GiveJob records every
+        // such job, IsModIssued) is not a player order. A real player-forced
+        // LayDown is not recorded there and stays protected.
+        private static bool IsModIssuedNap(Job job)
+        {
+            return job != null && job.def == JobDefOf.LayDown && IsModIssued(job);
+        }
+
+        // One line per cut nap per pause: which need cut it, and that it was the mod's own.
+        private void NoteModNapCut(Pawn pawn, Job nap, string byNeed)
+        {
+            if (!pausedForNeed.TryGetValue(pawn, out PauseInfo paused) || paused.modCutJobId == nap.loadID)
+            {
+                return;
+            }
+
+            paused.modCutJobId = nap.loadID;
+            pausedForNeed[pawn] = paused;
+            Logger.Message($"{pawn.LabelShort}: {byNeed} is at its threshold - the nap this mod itself sent ({DescribeJob(nap)}) is not a player order, so it may be interrupted for {byNeed} (rule: section 60 c, {NeedMonitor.LevelsText(pawn)})");
+        }
+
         private static bool FoodBlocked(PauseInfo paused)
         {
             return Find.TickManager.TicksGame < paused.foodBlockedUntil;
@@ -3684,11 +3780,11 @@ namespace DoNotBeLazy.Components
             var served = new List<string>();
 
             if (foodLow && !paused.seenLowFood) { paused.seenLowFood = true; changed = true; }
-            else if (!foodLow && paused.seenLowFood) { paused.seenLowFood = false; paused.foodMealFails = 0; paused.foodServedTick = Find.TickManager.TicksGame; changed = true; served.Add("Food"); }
+            else if (!foodLow && paused.seenLowFood) { paused.seenLowFood = false; paused.foodMealFails = 0; paused.foodServedTick = Find.TickManager.TicksGame; paused.rankYieldLogged = null; changed = true; served.Add("Food"); }
             if (foodLow && paused.foodServedTick != 0) { paused.foodServedTick = 0; changed = true; }
             if (restLow && !paused.sawLowRest) { paused.sawLowRest = true; changed = true; }
             if (restLow && !paused.seenLowRest) { paused.seenLowRest = true; changed = true; }
-            else if (!restLow && paused.seenLowRest) { paused.seenLowRest = false; changed = true; served.Add("Rest"); }
+            else if (!restLow && paused.seenLowRest) { paused.seenLowRest = false; paused.restYieldLogged = null; changed = true; served.Add("Rest"); }
             if (joyLow && !paused.seenLowJoy) { paused.seenLowJoy = true; changed = true; }
             else if (!joyLow && paused.seenLowJoy) { paused.seenLowJoy = false; changed = true; served.Add("Recreation"); }
             bool cravingLow = NeedMonitor.LowCraving(pawn, true) != null;
@@ -4427,7 +4523,29 @@ namespace DoNotBeLazy.Components
             }
 
             bool idle = curJob == null || (IdleJobDefs.Contains(curJob.def) && !curJob.playerForced);
-            bool onNonForcedRestJob = curJob != null && !curJob.playerForced && curJob.def == JobDefOf.LayDown;
+            // 2026-11-25 (section 60 c): a nap this mod itself sent is not a player order.
+            bool onNonForcedRestJob = curJob != null && curJob.def == JobDefOf.LayDown && (!curJob.playerForced || IsModIssuedNap(curJob));
+            if (onNonForcedRestJob && curJob.playerForced)
+            {
+                NoteModNapCut(pawn, curJob, "Food");
+            }
+
+            // 2026-11-25 (Q91.2): a need ranked ahead of Food that has a job goes first.
+            // Food satisfied (a pause that began on Food) is not low: no yield line.
+            string foodYield = (curJob != null && curJob.def == JobDefOf.Ingest) || NeedMonitor.FoodSatisfied(pawn) ? null : HigherRankedUnmet(pawn, paused, "Food");
+            if (foodYield != null)
+            {
+                string yieldKey = "Food>" + foodYield;
+                if (paused.rankYieldLogged != yieldKey)
+                {
+                    paused.rankYieldLogged = yieldKey;
+                    pausedForNeed[pawn] = paused;
+                    Logger.Message($"{pawn.LabelShort}: Food is low but {foodYield} ranks ahead of it (nearer a severe result) - serving {foodYield} first (rule: Q91.2, {NeedMonitor.LevelsText(pawn)})");
+                }
+
+                return;
+            }
+
             // Section 33 fix 2-4: Food may also interrupt ordinary work (as
             // the rest and recreation steps do) and the recreation job this
             // pause issued. Never a player-forced or emergency job.
@@ -4845,13 +4963,12 @@ namespace DoNotBeLazy.Components
             // behaviour is the same as before - nothing is sent.
             // Section 33: a need with no available job (blocked) does not
             // hold Recreation back.
-            bool foodFirst = !NeedMonitor.FoodSatisfied(pawn) && !FoodBlocked(paused);
-            bool restFirst = !NeedMonitor.RestSatisfied(pawn) && !RestBlocked(paused);
-            if (foodFirst || restFirst)
+            // 2026-11-25 (Q91.2): the need nearest a severe result goes first;
+            // ties Food, Recreation, Rest (NeedMonitor.RankedUnmetNeeds).
+            string rankedFirst = HigherRankedUnmet(pawn, paused, "Recreation");
+            if (rankedFirst != null)
             {
-                string firstWhy = foodFirst
-                    ? "Recreation is low but Food is not satisfied yet - feeding comes first"
-                    : "Recreation is low but Rest is not satisfied yet - resting comes first";
+                string firstWhy = $"Recreation is low but {rankedFirst} ranks ahead of it (nearer a severe result) and is not satisfied yet - {rankedFirst} comes first";
                 if (paused.joyDeclineReason != firstWhy)
                 {
                     paused.joyDeclineReason = firstWhy;
@@ -4872,12 +4989,25 @@ namespace DoNotBeLazy.Components
             // is pulled off it and sent to recreation. A nap (LayDown), a
             // meal, joy, a player order, emergency work or any non-work job
             // is left alone.
-            // LOCKED (dnbl H1.1) - passed 5x in play 2026-10-05; do not change without the user's explicit order.
+            // UNLOCKED 2026-11-25 by order (Q91.3), re-test H1/H1.1/H1.2 (sections 57/60):
+            // a nap this mod itself issued is not a player order, so Recreation
+            // may interrupt it (section 60 c).
             // changed 2026-11-15 by order (Q56), re-test H1: IsOrdinaryWork now means any unprotected job.
-            bool ordinaryWork = IsOrdinaryWork(pawn, curJob);
-            // END LOCKED (dnbl H1.1)
+            bool modNap = IsModIssuedNap(curJob);
+            bool ordinaryWork = IsOrdinaryWork(pawn, curJob) || modNap;
+            if (modNap)
+            {
+                NoteModNapCut(pawn, curJob, "Recreation");
+            }
             if (!idle && !ordinaryWork)
             {
+                // 2026-11-25: held behind a job it cannot cut; Rest and Food may go first.
+                if (curJob != null && curJob.def != JobDefOf.LayDown && curJob.def != JobDefOf.Ingest && curJob.def.joyKind == null)
+                {
+                    paused.joyBlockedUntil = Find.TickManager.TicksGame + ForceJoyRetryTicks + 120;
+                    pausedForNeed[pawn] = paused;
+                }
+
                 if (curJob != null && curJob.def != JobDefOf.Ingest && curJob.def != JobDefOf.LayDown
                     && curJob.def.joyKind == null && paused.joyBusyJob != curJob.def.defName)
                 {
@@ -4887,14 +5017,14 @@ namespace DoNotBeLazy.Components
                         + (curJob.playerForced ? " (player-forced)" : curJob.workGiverDef != null ? $" (emergency work, {curJob.workGiverDef.defName})" : " (not a work job)")
                         + $" - not interrupting (now: {NeedMonitor.LevelsText(pawn)})");
                 }
-                // LOCKED (dnbl H1.2) - passed 5x in play 2026-10-05; do not change without the user's explicit order.
+                // UNLOCKED 2026-11-25 by order (Q91.3), re-test H1/H1.1/H1.2: only a nap this
+                // mod did not issue (a player's, vanilla's) is still left alone here.
                 else if (curJob != null && curJob.def == JobDefOf.LayDown && paused.joyBusyJob != curJob.def.defName)
                 {
                     paused.joyBusyJob = curJob.def.defName;
                     pausedForNeed[pawn] = paused;
                     Logger.Message($"{pawn.LabelShort}: paused (began on {paused.need}), Recreation holds it but the pawn is resting ({curJob.def.defName}) - not interrupting a nap (now: {NeedMonitor.LevelsText(pawn)})");
                 }
-                // END LOCKED (dnbl H1.2)
 
                 return false;
             }
@@ -4949,6 +5079,9 @@ namespace DoNotBeLazy.Components
 
             if (joyJob == null)
             {
+                // 2026-11-25: no recreation job now, so a lower-ranked need may go first.
+                paused.joyBlockedUntil = now + ForceJoyRetryTicks + 120;
+                pausedForNeed[pawn] = paused;
                 if (paused.joyDeclineReason != decline)
                 {
                     paused.joyDeclineReason = decline;
@@ -4961,7 +5094,7 @@ namespace DoNotBeLazy.Components
             }
 
             joyJob.ignoreJoyTimeAssignment = true;
-            // LOCKED (dnbl H1.1) - passed 5x in play 2026-10-05; do not change without the user's explicit order.
+            // UNLOCKED 2026-11-25 by order (Q91.3), re-test H1/H1.1/H1.2.
             string joyInterrupted = idle ? "" : $" (pausing {DescribeJob(curJob)}, given back after)";
             ourJob[pawn] = joyJob;
             GiveNeedJob(pawn, joyJob, "forced recreation");
@@ -4999,6 +5132,15 @@ namespace DoNotBeLazy.Components
                 return false;
             }
 
+            // 2026-11-25 (Q76.5c): Mood is inside the buffer but recreation is
+            // full enough that it cannot help, and Food and Rest are served: the
+            // order stays paused and the pawn is left to vanilla. NeedMonitor.
+            // NoteMoodFutileForOrder writes the one line per episode.
+            if (!NeedMonitor.RecreationCanHelpMood(pawn))
+            {
+                return false;
+            }
+
             bool foodFirst = !NeedMonitor.FoodSatisfied(pawn) && !FoodBlocked(paused);
             bool restFirst = !NeedMonitor.RestSatisfied(pawn) && !RestBlocked(paused);
             if ((foodFirst || restFirst) && !moodEmergency)
@@ -5013,7 +5155,7 @@ namespace DoNotBeLazy.Components
             // (unstamped, a vanilla Goto, a queued Clean) is interrupted.
             // 2026-11-15 by order ("Hungry pawn below 10% should go eat. Pause other jobs."): an order pawn is
             // interrupted off any job except a need job or emergency work, emergency or not.
-            bool holdsPawn = !idle && IsProtectedFromNeedInterrupt(curJob); // 2026-11-15 (Q56): protected jobs only
+            bool holdsPawn = !idle && IsProtectedFromNeedInterrupt(curJob, pawn); // 2026-11-15 (Q56): protected jobs only; 2026-11-25 emergency cap
             if (holdsPawn)
             {
                 if (paused.moodBusyJob != curJob.def.defName)
@@ -5074,7 +5216,7 @@ namespace DoNotBeLazy.Components
             ourJob[pawn] = joyJob;
             GiveNeedJob(pawn, joyJob, "forced recreation for mood");
             NoteOwnNeedJob(pawn, joyJob);
-            Logger.Message($"{pawn.LabelShort}: Mood is at or below the mood setting ({DoNotBeLazyMod.Settings.moodThreshold:P0}) - sent to {joyJob.def.defName} to avoid a break{emergency} ({NeedMonitor.LevelsText(pawn)})" + interrupted);
+            Logger.Message($"{pawn.LabelShort}: Mood is at or below its mood line ({NeedMonitor.EffectiveMoodThreshold(pawn, 0f):P0} = major break line + buffer) - sent to {joyJob.def.defName} to avoid a break{emergency} ({NeedMonitor.LevelsText(pawn)})" + interrupted);
             return true;
         }
 
@@ -5187,6 +5329,8 @@ namespace DoNotBeLazy.Components
         // counts, so TakeInventory, Clean and the like are paused too; the
         // job is kept and given back (GiveNeedJob). Everything below the
         // early return is the previous test, kept for reference.
+        // UNLOCKED 2026-11-25 by order (Q91.3), re-test H1/H1.1/H1.2: the test now
+        // uses the pawn-aware IsProtectedFromNeedInterrupt (emergency cap, Q91.1).
         private bool IsOrdinaryWork(Pawn pawn, Job job)
         {
             if (job == null)
@@ -5194,7 +5338,7 @@ namespace DoNotBeLazy.Components
                 return false;
             }
 
-            if (!IsProtectedFromNeedInterrupt(job))
+            if (!IsProtectedFromNeedInterrupt(job, pawn))
             {
                 return true;
             }
@@ -5246,8 +5390,17 @@ namespace DoNotBeLazy.Components
             bool restStart = paused.need.StartsWith("Rest");
             bool restHolds = !NeedMonitor.RestSatisfied(pawn);
             bool foodOk = NeedMonitor.FoodSatisfied(pawn);
-            bool restTurn = restHolds && (foodOk || FoodBlocked(paused));
+            // 2026-11-25 (Q91.2): Rest waits only for a need ranked ahead of it that has a job.
+            string restYield = restHolds ? HigherRankedUnmet(pawn, paused, "Rest") : null;
+            bool restTurn = restHolds && restYield == null;
             bool otherNeedCase = !restStart && restTurn;
+            if (restYield != null && paused.restYieldLogged != restYield)
+            {
+                paused.restYieldLogged = restYield;
+                pausedForNeed[pawn] = paused;
+                Logger.Message($"{pawn.LabelShort}: Rest is low but {restYield} ranks ahead of it (nearer a severe result) - serving {restYield} first (rule: Q91.2, {NeedMonitor.LevelsText(pawn)})");
+            }
+
             if (!restTurn)
             {
                 if (foodOk && !restHolds && NeedMonitor.JoySatisfied(pawn) && !paused.otherNeedLogged)
@@ -5283,7 +5436,7 @@ namespace DoNotBeLazy.Components
             // rescue are emergency WorkGivers and are left alone, as is
             // anything the player ordered and anything that is not a work
             // job at all (eating, sleeping, joy, a lord's duty).
-            // LOCKED (dnbl H1.1) - passed 5x in play 2026-10-05; do not change without the user's explicit order.
+            // UNLOCKED 2026-11-25 by order (Q91.3), re-test H1/H1.1/H1.2.
             // changed 2026-11-15 by order (Q56), re-test H1: IsOrdinaryWork now means any unprotected job.
             // changed 2026-11-16 by order "Fix code H1.1.", re-test H1.1: an Ingest job that
             // CheckIngestStall has already judged stalled (same job id as ingestLoggedId, which
@@ -5293,9 +5446,15 @@ namespace DoNotBeLazy.Components
             bool ordinaryJob = IsOrdinaryWork(pawn, curJob);
             bool stalledIngest = !ordinaryJob && IngestJudgedStalled(pawn, curJob, paused);
             bool ordinaryWork = ordinaryJob || stalledIngest;
-            // END LOCKED (dnbl H1.1)
             if (!idle && !ordinaryWork)
             {
+                // 2026-11-25: held behind a job it cannot cut; Food and Recreation may go first.
+                if (curJob != null && curJob.def != JobDefOf.LayDown && curJob.def != JobDefOf.Ingest && curJob.def.joyKind == null)
+                {
+                    paused.restBlockedUntil = Find.TickManager.TicksGame + ForceRestRetryTicks + 120;
+                    pausedForNeed[pawn] = paused;
+                }
+
                 if (curJob != null && curJob.def != JobDefOf.LayDown
                     && curJob.def.joyKind == null && paused.restBusyJob != curJob.def.defName)
                 {
@@ -5374,7 +5533,7 @@ namespace DoNotBeLazy.Components
             // Job.playerForced, so without this, TryReportForeignJob's
             // periodic poll reads the forced LayDown as a foreign order and
             // ends the sweep.
-            // LOCKED (dnbl H1.1) - passed 5x in play 2026-10-05; do not change without the user's explicit order.
+            // UNLOCKED 2026-11-25 by order (Q91.3), re-test H1/H1.1/H1.2.
             string interrupted = idle ? "" : stalledIngest ? $" (interrupting {DescribeJob(curJob)}, judged stalled; a meal is not given back)" : $" (pausing {DescribeJob(curJob)}, given back after)";
             Job layDown = JobMaker.MakeJob(JobDefOf.LayDown, bed);
             ourJob[pawn] = layDown;

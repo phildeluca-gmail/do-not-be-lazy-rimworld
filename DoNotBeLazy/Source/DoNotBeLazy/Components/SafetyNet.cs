@@ -185,7 +185,7 @@ namespace DoNotBeLazy.Components
             }
             else if (!lowMood && pawn.needs.joy != null && moodFutileLogged.Add(pawn))
             {
-                Logger.Message($"safety net: {pawn.LabelShort} Mood {pawn.needs.mood.CurLevelPercentage:P0} is at or below the mood setting {DoNotBeLazyMod.Settings.moodThreshold:P0} but Recreation is already {pawn.needs.joy.CurLevelPercentage:P0} - recreation cannot help, trying a fine or lavish meal, then sleep");
+                Logger.Message($"safety net: {pawn.LabelShort} Mood {pawn.needs.mood.CurLevelPercentage:P0} is at or below the mood setting {NeedMonitor.EffectiveMoodThreshold(pawn, 0f):P0} but Recreation is already {pawn.needs.joy.CurLevelPercentage:P0} - recreation cannot help, trying a fine or lavish meal, then sleep");
             }
 
             AlertIfDrafted(pawn, lowFood, lowRest, food, rest, settings);
@@ -337,7 +337,7 @@ namespace DoNotBeLazy.Components
         // think tree overrides the job. New method; H5, H6, H8 untouched.
         private static bool TrySendToFineMealOrSleep(Pawn pawn, string levels, string interrupted, int now)
         {
-            string moodText = $"Mood {pawn.needs.mood.CurLevelPercentage:P0} is at or below the mood setting {DoNotBeLazyMod.Settings.moodThreshold:P0} and Recreation is {pawn.needs.joy.CurLevelPercentage:P0}";
+            string moodText = $"Mood {pawn.needs.mood.CurLevelPercentage:P0} is at or below the mood setting {NeedMonitor.EffectiveMoodThreshold(pawn, 0f):P0} and Recreation is {pawn.needs.joy.CurLevelPercentage:P0}";
             Job meal = NeedMonitor.FindFineMealJob(pawn, out int candidates, out float moodEffect, out string mealWhy, out string choiceNote, out string dropped);
             if (meal != null)
             {
@@ -381,7 +381,7 @@ namespace DoNotBeLazy.Components
 
         // Section 34 item 4.6. Not H5's TrySendToRecreation (locked): the same
         // vanilla joy job, but sent because mood reached the mood setting
-        // (DoNotBeLazySettings.moodThreshold, 2026-10-30), not because recreation is low.
+        // (DoNotBeLazySettings.moodBuffer, 2026-10-30), not because recreation is low.
         private static bool TrySendToCalmMood(Pawn pawn, string levels, string interrupted, int now)
         {
             Job joyJob = SweepManager.FindVanillaJoyJob(pawn);
@@ -393,7 +393,7 @@ namespace DoNotBeLazy.Components
 
             if (SweepManager.GiveJob(pawn, joyJob, false, "safety net recreation for mood"))
             {
-                Sent(pawn, now, "Mood", $"safety net: {pawn.LabelShort} Mood {pawn.needs.mood.CurLevelPercentage:P0} is at or below the mood setting {DoNotBeLazyMod.Settings.moodThreshold:P0} - sent to {joyJob.def.defName} to avoid a break{interrupted} ({levels})");
+                Sent(pawn, now, "Mood", $"safety net: {pawn.LabelShort} Mood {pawn.needs.mood.CurLevelPercentage:P0} is at or below the mood setting {NeedMonitor.EffectiveMoodThreshold(pawn, 0f):P0} - sent to {joyJob.def.defName} to avoid a break{interrupted} ({levels})");
                 return true;
             }
 
